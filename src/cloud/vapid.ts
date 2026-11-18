@@ -80,10 +80,18 @@ export function vapidVerify(header: string): Record<string, unknown> | null {
     try {
       // Node's verify needs DER; rebuild it from the raw r‖s.
       const raw = b64uDecode(sig);
-      const r = raw.subarray(0, 32);
-      const s = raw.subarray(32, 64);
-      const tlv = (tag: number, b: Buffer): Buffer => Buffer.concat([Buffer.from([tag, b.length]), b]);
-      const der = tlv(0x30, Buffer.concat([tlv(0x02, r), tlv(0x02, s)]));
+      // Rebuild DER: a positive INTEGER whose high bit is set needs the 00 prefix
+      // back — without it OpenSSL reads the value as negative and verification fails.
+      const integer = (b: Buffer): Buffer => {
+        // Minimal DER: strip every leading 0x00, then re-add one iff the (now) top
+        // bit is set — otherwise OpenSSL reads the value as negative.
+        let x = b;
+        while (x.length > 1 && x[0] === 0x00) x = x.subarray(1);
+        if (x[0] & 0x80) x = Buffer.concat([Buffer.from([0x00]), x]);
+        return Buffer.concat([Buffer.from([0x02, x.length]), x]);
+      };
+      const body = Buffer.concat([integer(raw.subarray(0, 32)), integer(raw.subarray(32, 64))]);
+      const der = Buffer.concat([Buffer.from([0x30, body.length]), body]);
       return verify("sha256", Buffer.from(`${h}.${c}`), key, der);
     } catch {
       return false;

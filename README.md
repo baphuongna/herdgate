@@ -24,7 +24,7 @@ a PWA, an SSH leg for the Herdr phone app, **room-stream resume** — a phone th
 what it missed (frames + presence) instead of losing them — **end-to-end payloads** — Noise_XX between
 device and host inside the opaque channel, so the cloud routes ciphertext it cannot read — and **push
 wake**: VAPID-signed silent pings that raise a phone from its sleep when the host has news; 28 tests. All
-of it verified live through a real Cloudflare Tunnel (gate.phuongnb.io.vn), push subscription and all.
+of it verified live through a real Cloudflare Tunnel (gate.phuongnb.io.vn), push subscription and all, and systemd user units (gateway, tunnel, publisher) keeping it alive.
 
 The Herdr adapter is read-only: it runs `herdr api snapshot` and serves workspaces/tabs/panes/agents/status to
 paired devices. It never reads a pane, sends a keystroke, or prompts an agent. Terminal content is a later

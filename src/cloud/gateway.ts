@@ -16,7 +16,8 @@
  * Payload rule: `frame.payload` is routed, never parsed (see protocol/envelope.ts).
  */
 
-import { createServer, request, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { WebSocketServer, type WebSocket } from "ws";
 import {
   decode,
@@ -126,28 +127,34 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     const push = cfg.push;
     const endpoint = state.deviceById(deviceId)?.push?.endpoint;
     if (!push || !endpoint) return;
-    const u = new URL(endpoint);
-    const req = request(
-      {
-        protocol: u.protocol,
-        hostname: u.hostname,
-        port: u.port || (u.protocol === "https:" ? 443 : 80),
-        path: `${u.pathname}${u.search}`,
-        method: "POST",
-        headers: {
-          TTL: "60",
-          Urgency: "normal",
-          "content-length": "0",
-          Authorization: vapidHeader(endpoint, push.keys, push.sub),
+    try {
+      const u = new URL(endpoint);
+      const send = u.protocol === "https:" ? httpsRequest : httpRequest;
+      const req = send(
+        {
+          protocol: u.protocol,
+          hostname: u.hostname,
+          port: u.port || (u.protocol === "https:" ? 443 : 80),
+          path: `${u.pathname}${u.search}`,
+          method: "POST",
+          headers: {
+            TTL: "60",
+            Urgency: "normal",
+            "content-length": "0",
+            Authorization: vapidHeader(endpoint, push.keys, push.sub),
+          },
         },
-      },
-      (res) => {
-        res.resume();
-        if (res.statusCode && res.statusCode >= 400) log(`push: wake ${endpointTag(endpoint)} answered ${res.statusCode}`);
-      },
-    );
-    req.on("error", (e) => log(`push: wake ${endpointTag(endpoint)} failed (${e instanceof Error ? e.message : String(e)})`));
-    req.end();
+        (res) => {
+          res.resume();
+          if (res.statusCode && res.statusCode >= 400) log(`push: wake ${endpointTag(endpoint)} answered ${res.statusCode}`);
+        },
+      );
+      req.on("error", (e) => log(`push: wake ${endpointTag(endpoint)} failed (${e instanceof Error ? e.message : String(e)})`));
+      req.end();
+    } catch (e) {
+      // A bad endpoint must never take the gateway down.
+      log(`push: wake ${endpointTag(endpoint)} failed (${e instanceof Error ? e.message : String(e)})`);
+    }
   };
 
   const streamEmit = (roomId: string, msg: Record<string, unknown>): void => {

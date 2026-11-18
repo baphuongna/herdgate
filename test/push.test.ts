@@ -159,6 +159,19 @@ test("push: subscribe, wake an away device with a valid VAPID push, skip the con
   await new Promise((r) => setTimeout(r, 400));
   assert.equal(push.posts.length, 1, "no push for a connected device");
 
+  // An https push endpoint (the real-world shape, e.g. FCM) must not crash the
+  // gateway — a wrong `request()` module used to throw synchronously on https.
+  const subHttps = await fetch(`${base}/v1/device/push`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ device: granted.device.id, deviceSecret: granted.deviceSecret, endpoint: "https://127.0.0.1:9/fcm/send/x" }),
+  });
+  assert.equal(subHttps.status, 200);
+  agent.wake(granted.device.id);
+  await new Promise((r) => setTimeout(r, 500));
+  const alive = await fetch(`${base}/healthz`);
+  assert.equal(alive.status, 200, "the gateway survives a wake to an unreachable https endpoint");
+
   // Unsubscribe: the next wake delivers nothing.
   d2.close();
   await new Promise((r) => setTimeout(r, 200));
@@ -171,6 +184,7 @@ test("push: subscribe, wake an away device with a valid VAPID push, skip the con
   agent.wake(granted.device.id);
   await new Promise((r) => setTimeout(r, 400));
   assert.equal(push.posts.length, 1, "no push after unsubscribe");
+  void push.posts;
 
   agent.stop();
   await cloud.close();
