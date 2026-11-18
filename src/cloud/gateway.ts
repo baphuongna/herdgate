@@ -510,6 +510,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
             ...helloMsg,
             resumed: false,
             ...(s ? { stream: { gen: s.gen, seq: s.seq } } : {}),
+            ...(cfg.ssh ? { ssh: { port: cfg.ssh.port } } : {}),
           });
         }
         if (device) pushRoomUpdate(device.roomId);
