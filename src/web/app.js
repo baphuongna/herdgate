@@ -270,17 +270,49 @@ function renderRoom() {
   if (state.deviceSecret && state.deviceId) {
     const details = document.createElement("details");
     details.className = "ssh";
+    // Fresh from pairing: the section opens itself and STAYS open across the
+    // re-renders that follow (the view frame rebuilds this node) until the person
+    // closes it — the key is the one thing they must not miss.
+    if (state.showSecretOnce) details.open = true;
+    details.addEventListener("toggle", () => {
+      if (!details.open) state.showSecretOnce = false;
+    });
     const summary = document.createElement("summary");
     summary.textContent = "SSH for the Herdr app";
     const pre = document.createElement("pre");
     const host = location.hostname || "your-gate";
     // The port comes from the cloud's hello (its SSH leg); the host is whatever the
-    // person typed to reach this page — for the Herdr phone app that should be the
-    // gate machine's LAN address, since plain SSH does not cross a CDN.
+    // person typed to reach this page. The cloud advertises the SSH hostname it
+    // wants phones to use (bridge / AAAA name); only without one do we fall back
+    // to this page's host.
     const port = state.sshPort ?? 2222;
     const sshHost = state.sshHost || host;
-    pre.textContent = `ssh -p ${port} ${state.deviceId}@${sshHost}\npassword: the device key shown at pair time`;
+    pre.textContent = `ssh -p ${port} ${state.deviceId}@${sshHost}`;
     details.append(summary, pre);
+
+    // The device key lives in this browser's localStorage (the cloud returns it
+    // once and keeps only a hash). It IS the SSH password — show it, on demand.
+    // `keyShown` lives in state so the reveal survives the room re-renders that
+    // rebuild this whole node whenever a frame arrives.
+    const keyRow = document.createElement("div");
+    keyRow.className = "keyrow";
+    if (state.keyShown && state.deviceSecret) {
+      const keyEl = document.createElement("pre");
+      keyEl.textContent = state.deviceSecret;
+      keyEl.setAttribute("aria-label", "device key");
+      keyRow.append(keyEl);
+    } else {
+      const reveal = document.createElement("button");
+      reveal.type = "button";
+      reveal.className = "link";
+      reveal.textContent = "Show this device's key";
+      reveal.addEventListener("click", () => {
+        state.keyShown = true;
+        renderRoom();
+      });
+      keyRow.append(reveal);
+    }
+    details.append(keyRow);
     box.append(details);
   }
 }
@@ -641,6 +673,12 @@ $("settings-form").addEventListener("submit", () => {
 });
 
 $("signout").addEventListener("click", () => forgetToken());
+
+$("pair-back").addEventListener("click", () => {
+  closePair();
+  show("rooms", true);
+  renderRooms();
+});
 
 $("back").addEventListener("click", () => {
   state.roomId = null;

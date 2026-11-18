@@ -263,3 +263,23 @@ dialog::backdrop {
 .row button {
   flex: 1;
 }
+
+/* The SSH hint: command + key reveal, comfortable to tap on a phone. */
+#view details.ssh {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+#view details.ssh summary {
+  cursor: pointer;
+  font-weight: 500;
+}
+#view details.ssh pre {
+  margin: 10px 0 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+#view details.ssh .keyrow button.link {
+  font-size: 0.95em;
+}
