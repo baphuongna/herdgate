@@ -45,8 +45,22 @@ One JSON object per WS text frame: `{v:1, t:"…", …}`. Unknown `v` → close.
 - `GET /v1/agent/ws` — host leg. `hello {roomToken, info}` first (10s deadline, else close 4001). Then
   `frame {device, payload}` ⇄, `presence`, `pair.request`/`pair.response`, `ping`/`pong`, `room.update`.
   One live agent per room: a second connection supersedes the first (4000).
-- `GET /v1/device/ws` — device leg. `hello {accountToken, device?}` first. Then `frame {payload}` (routed to
-  the paired room's host), `pair.begin` → `pair.granted`/`pair.denied`, `presence`, `ping`/`pong`.
+- `GET /v1/device/ws` — device leg. `hello {accountToken | device+deviceSecret, resume?}` first. Then `frame {payload}`
+  (routed to the paired room's host), `pair.begin` → `pair.granted`/`pair.denied`, `presence`, `ping`/`pong`.
+
+### Room streams and resume (v0.6.0)
+
+Every host→device message that matters while a phone is away (frames, presence) carries a
+room-scoped `seq` and is buffered briefly (last 256 KiB / 120 s per room). Device hello
+responses carry a `stream {gen, seq}` header; a reconnecting device adds
+`resume {room, gen, seq}` to its hello and receives `resumed:true` plus the buffered tail
+in order. `gen` changes on every gateway process start, so stale bookkeeping from a
+previous life invalidates in one comparison — the device gets a fresh hello (`resumed:false`)
+and re-requests state. A resume from before what was kept answers `stream.gap:true`
+(replay what survived; the device re-requests its view). Frames with an `ssh.*` op are
+**ephemeral**: sent raw, unstamped, never buffered — they belong to an SSH channel that
+died with the drop, and replaying them into a new SSH session would corrupt its wire
+protocol. `pair.granted` (carries the one-time device secret) is likewise never replayed.
 
 HTTP: `GET /healthz`, `POST /v1/agent/code`, `POST /v1/agent/approve` (bearer account token),
 `GET /v1/agent/code/:code/status`.
@@ -57,7 +71,8 @@ strikes per IP (5/min → 60s block), protocol-level pings every 30s with termin
 ## 4. State
 
 `state.json` (atomic tmp+rename, 0600): rooms (token hashed) + devices. In-memory pending pairing codes never
-touch disk. v0 loses open sockets on restart; resume is roadmap (§6).
+touch disk. v0 loses open sockets on restart; the room stream resumes devices after a drop (§3), and the `gen`
+header makes a restart a clean re-sync rather than a wrong replay.
 
 ## 5. Threat model — what the cloud promises
 
@@ -71,14 +86,14 @@ touch disk. v0 loses open sockets on restart; resume is roadmap (§6).
 | Cloud reading content | **opaque payloads rule** — nothing to read; E2E (§6) removes even the possibility |
 | Host confusion via cloudflared | optional `expectedHost` pin; nothing else about the edge is trusted |
 
-What v0 does **not** promise: per-device secrets (account token = device identity today — roadmap), session
-resume after reconnect, payload confidentiality on the wire beyond TLS (E2E roadmap), multi-account isolation.
+What v0 does **not** promise: per-device secrets (account token = device identity today — roadmap), payload confidentiality on the wire beyond TLS (E2E roadmap), multi-account isolation.
 
 ## 6. Roadmap
 
-1. **Per-device secrets** — `pair.granted` returns a device token; hello uses it; account token stays in the
-   dashboard only.
-2. **Resume** — session ids + seq + a per-session ring buffer of frames in the cloud (ciphertext-friendly).
+1. ~~**Per-device secrets**~~ — **done (v0.5.0)**: `pair.granted` returns a device secret once; hello uses it;
+   the account token stays in the dashboard only (and is never an SSH credential).
+2. ~~**Resume**~~ — **done (v0.6.0)**: room streams with `seq`/`gen`, a bounded replay buffer, gap declaration;
+   see §3. Ciphertext-friendly by construction (the buffer stores opaque envelopes).
 3. **E2E payloads** — Noise_XX at pair time (device ↔ host key exchange), `payload` becomes a ciphertext
    string; the cloud is already a dumb router, so nothing changes server-side.
 4. ~~**Official Herdr adapter**~~ — **done (v0.1.0)**, read-only. `src/host/herdr.ts` runs

@@ -85,6 +85,71 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
   const deviceConns = new Set<DeviceConn>();
   const pendingPairs = new Map<string, (ok: boolean) => void>(); // requestId → resolve
 
+  // ---- room streams (resume support) ----
+  // Messages a phone must not lose while it is away (host frames, presence) are
+  // stamped with a room-scoped `seq` and buffered briefly. A reconnecting device
+  // says how far it read (`resume: { room, gen, seq }`) and gets the tail back;
+  // `gen` changes whenever the gateway process is (re)started, which invalidates
+  // stale bookkeeping in one comparison. `ssh.*` frames are ephemeral by
+  // contract — they belong to an SSH channel that died with the drop — so they
+  // are sent raw and never buffered or replayed.
+  const STREAM_KEEP_MS = 120_000;
+  const STREAM_MAX_BYTES = 256 * 1024;
+  interface StreamMsg {
+    seq: number;
+    msg: Record<string, unknown>;
+    bytes: number;
+    at: number;
+  }
+  interface RoomStream {
+    gen: string;
+    seq: number;
+    buf: StreamMsg[];
+    bytes: number;
+    /** Everything at or below this was evicted: resuming from earlier = gap. */
+    evictedUpTo: number;
+  }
+  const streams = new Map<string, RoomStream>();
+  const streamOf = (roomId: string): RoomStream => {
+    let s = streams.get(roomId);
+    if (!s) {
+      s = { gen: randomId("g"), seq: 0, buf: [], bytes: 0, evictedUpTo: 0 };
+      streams.set(roomId, s);
+    }
+    return s;
+  };
+  const streamEmit = (roomId: string, msg: Record<string, unknown>): void => {
+    const s = streamOf(roomId);
+    s.seq += 1;
+    const stamped = { ...msg, seq: s.seq };
+    const text = encode(stamped);
+    const bytes = Buffer.byteLength(text);
+    const at = Date.now();
+    const evict = (): void => {
+      const old = s.buf.shift();
+      if (!old) return;
+      s.bytes -= old.bytes;
+      if (old.seq > s.evictedUpTo) s.evictedUpTo = old.seq;
+    };
+    while (s.buf.length && s.buf[0].at < at - STREAM_KEEP_MS) evict();
+    if (bytes > STREAM_MAX_BYTES) {
+      // Too big to ever keep: a hole for anyone not connected right now.
+      if (s.seq > s.evictedUpTo) s.evictedUpTo = s.seq;
+    } else {
+      while (s.bytes + bytes > STREAM_MAX_BYTES) evict();
+      s.buf.push({ seq: s.seq, msg: stamped, bytes, at });
+      s.bytes += bytes;
+    }
+    for (const c of deviceConns) {
+      if (c.device?.roomId !== roomId) continue;
+      try {
+        c.ws.send(text);
+      } catch {
+        /* closing */
+      }
+    }
+  };
+
   // ---- rate limiting: failed hellos per IP ----
   const fails = new Map<string, { n: number; until: number }>();
   const ipOf = (req: IncomingMessage): string => req.socket.remoteAddress ?? "?";
@@ -128,9 +193,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
   };
 
   const pushPresence = (roomId: string, online: boolean): void => {
-    for (const c of deviceConns) {
-      if (c.device?.roomId === roomId) send(c.ws, { t: "presence", roomId, online });
-    }
+    streamEmit(roomId, { t: "presence", roomId, online });
   };
 
   const agentViews = (accountId: string) =>
@@ -231,21 +294,29 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         case "frame": {
           const device = typeof m.device === "string" ? m.device : null;
           if (!device) return fail(ws, "bad-message", "frame.device");
+          const payload = m.payload;
+          const isSsh = typeof payload === "object" && payload !== null && typeof (payload as { op?: unknown }).op === "string" && String((payload as { op: string }).op).startsWith("ssh.");
           // Host→device ssh.* frames also feed the sshd, which writes them into the
           // phone's SSH channel; the payload stays opaque to this layer either way.
-          if (typeof m.payload === "object" && m.payload !== null && typeof (m.payload as { op?: unknown }).op === "string" && String((m.payload as { op: string }).op).startsWith("ssh.")) {
-            sshd?.onHostFrame(device, m.payload as Record<string, unknown>);
+          if (isSsh) {
+            sshd?.onHostFrame(device, payload as Record<string, unknown>);
+            // Ephemeral: raw, unstamped, never buffered (see room streams above).
+            const text = encode({ t: "frame", payload });
+            for (const c of deviceConns) {
+              if (c.device?.id !== device) continue;
+              try {
+                c.ws.send(text);
+              } catch {
+                /* closing */
+              }
+            }
+            return;
           }
-          for (const c of deviceConns) {
-            if (c.device?.id === device) send(c.ws, { t: "frame", payload: m.payload });
-          }
+          streamEmit(room.id, { t: "frame", payload });
           return;
         }
         case "presence": {
-          const online = m.online === true;
-          for (const c of deviceConns) {
-            if (c.device?.roomId === room.id) send(c.ws, { t: "presence", roomId: room.id, online });
-          }
+          pushPresence(room.id, m.online === true);
           return;
         }
         case "pair.response": {
@@ -336,13 +407,60 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
           const mine = device && device.roomId === r.id ? device.scope : null;
           return { roomId: r.id, name: r.name, online: agentByRoom.has(r.id), scope: mine };
         });
-        send(ws, {
+        const helloMsg: Record<string, unknown> = {
           t: "hello",
           session: randomId("s"),
-          resumed: false,
           device: device ? { id: device.id, name: device.name, scope: device.scope, roomId: device.roomId } : null,
           agents,
-        });
+        };
+
+        // Resume: a returning device replays what it missed (bounded, best effort).
+        // No match (no resume, wrong room, stale gen, seq from another life) falls
+        // through to a fresh hello — the device re-requests state on its own.
+        const wantResume = ((): { room: string; gen: string; seq: number } | null => {
+          if (!device) return null;
+          const r = m.resume;
+          if (typeof r !== "object" || r === null) return null;
+          const room = (r as { room?: unknown }).room;
+          const gen = (r as { gen?: unknown }).gen;
+          const seq = (r as { seq?: unknown }).seq;
+          if (room !== device.roomId || typeof gen !== "string") return null;
+          if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) return null;
+          return { room, gen, seq };
+        })();
+        const resuming = ((): { replay: StreamMsg[]; gap: boolean } | null => {
+          if (!wantResume) return null;
+          const s = streams.get(wantResume.room);
+          if (!s || s.gen !== wantResume.gen || wantResume.seq > s.seq) return null;
+          const replay = s.buf.filter((b) => b.seq > wantResume.seq);
+          // Missed more than we kept: say so, the device re-syncs its state.
+          const gap = replay.length < s.seq - wantResume.seq;
+          return { replay, gap };
+        })();
+
+        if (resuming && device) {
+          const s = streamOf(device.roomId);
+          send(ws, {
+            ...helloMsg,
+            resumed: true,
+            stream: { gen: s.gen, seq: s.seq, gap: resuming.gap },
+          });
+          for (const b of resuming.replay) {
+            try {
+              ws.send(encode(b.msg));
+            } catch {
+              /* closing */
+            }
+          }
+          if (resuming.gap) log(`device ${device.id} resumed with a gap (re-requests state)`);
+        } else {
+          const s = device ? streamOf(device.roomId) : null;
+          send(ws, {
+            ...helloMsg,
+            resumed: false,
+            ...(s ? { stream: { gen: s.gen, seq: s.seq } } : {}),
+          });
+        }
         if (device) pushRoomUpdate(device.roomId);
         return;
       }

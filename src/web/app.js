@@ -17,6 +17,27 @@ const CLOUD_KEY = "herdgate.cloud";
 const DEVICE_KEY = "herdgate.device";
 const DEVICE_SECRET_KEY = "herdgate.deviceSecret";
 
+// Resume bookkeeping: where this device stopped reading each room's stream, so a
+// reconnect can replay what it missed. Keyed per room; cleared when the cloud
+// says the stream's generation moved (gateway restart) or the state went stale.
+const streamKey = (roomId) => `herdgate.stream.${roomId}`;
+function loadStream(roomId) {
+  if (!roomId) return null;
+  try {
+    const v = JSON.parse(localStorage.getItem(streamKey(roomId)) ?? "null");
+    return v && typeof v.gen === "string" && typeof v.seq === "number" && v.seq >= 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+function saveStream(roomId, gen, seq) {
+  if (!roomId || typeof gen !== "string" || typeof seq !== "number" || seq < 0) return;
+  localStorage.setItem(streamKey(roomId), JSON.stringify({ gen, seq }));
+}
+function clearStream(roomId) {
+  if (roomId) localStorage.removeItem(streamKey(roomId));
+}
+
 const state = {
   token: localStorage.getItem(TOKEN_KEY) ?? "",
   cloud: localStorage.getItem(CLOUD_KEY) ?? "",
@@ -209,11 +230,19 @@ function connect() {
 
   ws.addEventListener("open", () => {
     // A paired device re-attaches with its own key; the account token is the owner path
-    // (first sign-in, pairing, management).
+    // (first sign-in, pairing, management). A device that knows where it stopped reading
+    // also asks to resume its room's stream.
     const hello = state.deviceSecret && state.deviceId
       ? { device: state.deviceId, deviceSecret: state.deviceSecret }
       : { accountToken: state.token, ...(state.deviceId ? { device: state.deviceId } : {}) };
-    ws.send(JSON.stringify({ v: 1, t: "hello", ...hello, name: deviceName() }));
+    const resume = state.deviceSecret && state.deviceId ? loadStream(state.roomId) : null;
+    ws.send(JSON.stringify({
+      v: 1,
+      t: "hello",
+      ...hello,
+      name: deviceName(),
+      ...(resume ? { resume: { room: state.roomId, gen: resume.gen, seq: resume.seq } } : {}),
+    }));
   });
 
   ws.addEventListener("message", (event) => {
@@ -246,6 +275,12 @@ function connect() {
 }
 
 function onMessage(m, ws) {
+  // Track the room stream so the next reconnect resumes from here.
+  if (typeof m.seq === "number" && (m.t === "frame" || m.t === "presence")) {
+    const rid = m.t === "presence" ? m.roomId : state.roomId;
+    const cur = loadStream(rid);
+    if (cur && m.seq > cur.seq) saveStream(rid, cur.gen, m.seq);
+  }
   switch (m.t) {
     case "hello": {
       state.retry = 0;
@@ -257,6 +292,15 @@ function onMessage(m, ws) {
       }
       // Keep the chosen room only while it is still visible to this account/device.
       if (state.roomId && !state.hello.agents.some((r) => r.roomId === state.roomId)) state.roomId = null;
+      // Resume outcome: the stream header carries the cloud's position; when the
+      // replay had a hole (too long away), askView() below re-fetches the state.
+      const rid = m.device?.roomId ?? null;
+      if (m.resumed === true && m.stream && typeof m.stream.seq === "number") {
+        saveStream(rid, m.stream.gen, m.stream.seq);
+      } else if (rid) {
+        if (m.stream && typeof m.stream.seq === "number") saveStream(rid, m.stream.gen, m.stream.seq);
+        else clearStream(rid);
+      }
       setStatus("online", "good");
       render();
       if (state.roomId) askView();
