@@ -11,6 +11,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node
 import { join, dirname } from "node:path";
 import { hostname } from "node:os";
 import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize } from "./common.mjs";
+import { createSshBridge } from "./ssh.mjs";
 
 const D = dirs();
 const NAME = process.env.HERDGATE_HOST_NAME || hostname();
@@ -163,6 +164,14 @@ async function publisherLoop() {
     return { op: "view", view: { v: 1, source: "herdr", takenAt: new Date().toISOString(), summary } };
   };
 
+  let wsRef = null;
+  const ssh = createSshBridge({
+    send: (device, payload) => {
+      if (wsRef && wsRef.readyState === 1) wsRef.send(JSON.stringify({ v: 1, t: "frame", device, payload }));
+    },
+    scopeOf: (device) => devices.find((d) => d.id === device)?.scope ?? null,
+    log,
+  });
   const publish = async (ws) => {
     if (ws.readyState !== 1 || devices.length === 0) return;
     const payload = await snapshotPayload();
@@ -172,6 +181,7 @@ async function publisherLoop() {
 
   const connect = () => {
     const ws = new WebSocket(wsUrl);
+    wsRef = ws;
     let helloed = false;
     ws.onopen = () => {
       ws.send(JSON.stringify({ v: 1, t: "hello", roomToken: token, info: { name: NAME, version: "0.1.0", capabilities: ["dev.herdgate.host", "read-only"] } }));
@@ -200,8 +210,12 @@ async function publisherLoop() {
         return;
       }
       if (m.t === "frame") {
-        // A device asked for something. Read-only plugin: only `view` and `ping` exist.
+        // SSH-leg ops are the bridge's; everything else: only `view` and `ping` exist.
         const op = m.payload && typeof m.payload === "object" ? m.payload.op : undefined;
+        if (typeof op === "string" && op.startsWith("ssh.")) {
+          ssh.handle(m.device, m.payload);
+          return;
+        }
         const replyTo = (payload) => ws.send(JSON.stringify({ v: 1, t: "frame", device: m.device, payload }));
         if (op === "ping") return replyTo({ op: "pong", n: m.payload.n ?? null, at: new Date().toISOString() });
         if (op === "view") {
@@ -222,6 +236,7 @@ async function publisherLoop() {
     ws.onclose = () => {
       if (timer) clearInterval(timer);
       timer = null;
+      ssh.closeAll();
       devices = [];
       const wait = Math.min(30_000, backoff) + Math.random() * 500;
       backoff *= 2;

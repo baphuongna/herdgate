@@ -13,6 +13,9 @@
 import { hostname } from "node:os";
 import { HerdGateAgent, provision } from "../agent/index.ts";
 import { HerdrAdapter } from "./herdr.ts";
+import { createSshBridge } from "./ssh.ts";
+import type { AgentAdapter, PairAsk } from "../agent/adapter.ts";
+import type { DeviceView } from "../protocol/agent.ts";
 
 const env = process.env;
 const url = env.HERDGATE_URL;
@@ -47,10 +50,34 @@ const adapter = new HerdrAdapter({
   log,
 });
 
+// The SSH leg (phones → herdr-core through the gate). The bridge owns every `ssh.*`
+// op; the Herdr adapter never sees them. Scope is enforced inside the bridge.
+const sshBridge = createSshBridge({
+  send: (device, payload) => agent.send(device, payload),
+  scopeOf: (device) => agent.scopeOf(device),
+  log,
+});
+let knownDevices = new Set<string>();
+const adapterWithSsh: AgentAdapter = {
+  info: () => adapter.info(),
+  onFrame: (device: string, payload: unknown): void => {
+    if (sshBridge.handle(device, payload)) return;
+    adapter.onFrame(device, payload);
+  },
+  onDevices: (devices: DeviceView[]) => {
+    // A device that left the room must not keep an SSH channel running.
+    const fresh = new Set(devices.map((d) => d.id));
+    for (const gone of knownDevices) if (!fresh.has(gone)) sshBridge.dropDevice(gone);
+    knownDevices = fresh;
+    adapter.onDevices(devices);
+  },
+  onPairAsk: (ask: PairAsk) => adapter.onPairAsk(ask),
+};
+
 const agent = new HerdGateAgent({
   endpoint: `${base.replace(/^http/, "ws")}/v1/agent/ws`,
   roomToken,
-  adapter,
+  adapter: adapterWithSsh,
   log,
 });
 
@@ -70,6 +97,7 @@ log(`connected; serving Herdr metadata read-only (${name})`);
 const bye = (): void => {
   log("shutting down");
   adapter.stop();
+  sshBridge.closeAll();
   agent.stop();
   process.exit(0);
 };

@@ -9,6 +9,10 @@
  *   HERDGATE_PUBLIC_URL    shown in pairing URLs  (e.g. https://herd.example.com)
  *   HERDGATE_WEB_ROOT      the PWA directory      (default: src/web beside this file)
  *   HERDGATE_NO_WEB        "1" disables the PWA (API only)
+ *   HERDGATE_SSH_PORT      the SSH leg for phones (default 2222; 0 disables)
+ *   HERDGATE_SSH_BIND      its bind address       (default 127.0.0.1; 0.0.0.0 for LAN)
+ *   HERDGATE_SSH_KEY       host key file          (default: beside the state file)
+ *   HERDGATE_HC_BIN        herdr-core binary on hosts (hosts resolve hc themselves)
  */
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,6 +30,10 @@ const here = dirname(fileURLToPath(import.meta.url));
 const defaultWebRoot = join(here, "..", "web");
 const webRoot = env.HERDGATE_NO_WEB === "1" ? undefined : (env.HERDGATE_WEB_ROOT ?? defaultWebRoot);
 
+const sshPort = Number(env.HERDGATE_SSH_PORT ?? 2222);
+const sshKeyPath =
+  env.HERDGATE_SSH_KEY ?? (env.HERDGATE_STATE ? join(dirname(env.HERDGATE_STATE), "ssh_host_ed25519.json") : undefined);
+
 const cloud = await startCloud({
   bind: env.HERDGATE_BIND ?? "127.0.0.1",
   port: Number(env.HERDGATE_PORT ?? 8787),
@@ -33,6 +41,11 @@ const cloud = await startCloud({
   expectedHost: env.HERDGATE_PUBLIC_HOST,
   publicUrl: env.HERDGATE_PUBLIC_URL ?? null,
   webRoot,
+  ssh: {
+    port: sshPort,
+    bind: env.HERDGATE_SSH_BIND ?? "127.0.0.1",
+    keyPath: sshKeyPath,
+  },
   accounts: [{ id: "a_owner", name: env.HERDGATE_ACCOUNT_NAME ?? "owner", token }],
   log: (l) => console.error(`herdgate: ${l}`),
 });

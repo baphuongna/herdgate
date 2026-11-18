@@ -13,9 +13,11 @@ import type { Scope } from "./envelope.ts";
 
 export interface DeviceHello {
   t: "hello";
-  accountToken: string;
-  /** The device id from a previous `pair.granted`, to re-attach identity. */
+  /** The account token: the owner, who can pair devices and manage rooms. */
+  accountToken?: string;
+  /** A paired device re-attaching with the secret `pair.granted` issued once. */
   device?: string;
+  deviceSecret?: string;
   name?: string;
   /** "phone" | "tablet-portrait" | ... — opaque to the cloud, passed to the host. */
   deviceClass?: string;
@@ -66,6 +68,8 @@ export interface CloudFrameDevice {
 export interface PairGranted {
   t: "pair.granted";
   device: DeviceSelfView;
+  /** This device's own credential (SSH leg + reconnect). Shown/stored once. */
+  deviceSecret?: string;
 }
 export interface PairDenied {
   t:"pair.denied";

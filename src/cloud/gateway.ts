@@ -34,6 +34,7 @@ import { AgentCodes } from "./pairing.ts";
 import { type Account, type DeviceRecord, type RoomRecord, State } from "./stores.ts";
 import { readJsonBody, randomId, sameSecret, sha256Hex } from "./util.ts";
 import { serveStatic } from "./static.ts";
+import { startSshd, type SshHandle, type SshConfig } from "./sshd.ts";
 
 export interface CloudConfig {
   accounts: { id: string; name: string; token: string }[];
@@ -47,6 +48,8 @@ export interface CloudConfig {
   publicUrl?: string | null;
   /** Directory of the PWA (src/web). Served on `/`; omit to serve no UI. */
   webRoot?: string;
+  /** The SSH leg phones dial. `port: 0` disables. */
+  ssh?: SshConfig;
   log?: (line: string) => void;
 }
 
@@ -60,11 +63,15 @@ interface DeviceConn {
   account: Account;
   device: DeviceRecord | null;
   alive: boolean;
+  /** True when this socket authenticated with a device secret, not the account token. */
+  viaDeviceSecret: boolean;
 }
 
 export interface Cloud {
   server: Server;
   port: number;
+  /** The SSH leg, when enabled. */
+  ssh: SshHandle | null;
   close(): Promise<void>;
 }
 
@@ -72,6 +79,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
   const log = cfg.log ?? (() => {});
   const state = new State(cfg.accounts, cfg.statePath);
   const codes = new AgentCodes(Date.now, cfg.publicUrl ?? null);
+  let sshd: SshHandle | null = null;
 
   const agentByRoom = new Map<string, AgentConn>(); // roomId → conn
   const deviceConns = new Set<DeviceConn>();
@@ -223,6 +231,11 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         case "frame": {
           const device = typeof m.device === "string" ? m.device : null;
           if (!device) return fail(ws, "bad-message", "frame.device");
+          // Host→device ssh.* frames also feed the sshd, which writes them into the
+          // phone's SSH channel; the payload stays opaque to this layer either way.
+          if (typeof m.payload === "object" && m.payload !== null && typeof (m.payload as { op?: unknown }).op === "string" && String((m.payload as { op: string }).op).startsWith("ssh.")) {
+            sshd?.onHostFrame(device, m.payload as Record<string, unknown>);
+          }
           for (const c of deviceConns) {
             if (c.device?.id === device) send(c.ws, { t: "frame", payload: m.payload });
           }
@@ -281,27 +294,45 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       if (!m) return fail(ws, "bad-message", "not a v1 envelope");
 
       if (!conn) {
-        if (m.t !== "hello" || typeof m.accountToken !== "string") {
+        if (m.t !== "hello") {
           strike(ip);
           return ws.close(4001, "bad hello");
         }
-        const account = state.accountByToken(m.accountToken);
-        if (!account) {
+        // Two identities: the owner (account token) or a paired device (id + its own secret).
+        const wantsDevice = typeof m.device === "string" && typeof m.deviceSecret === "string";
+        if (!wantsDevice && typeof m.accountToken !== "string") {
           strike(ip);
-          return ws.close(4001, "unknown account token");
+          return ws.close(4001, "bad hello");
         }
+        let account: Account | null = null;
         let device: DeviceRecord | null = null;
-        if (typeof m.device === "string" && m.device) {
-          const d = state.deviceById(m.device);
-          device = d && d.accountId === account.id ? d : null;
-          if (!device) return fail(ws, "unknown-device", "device id does not belong to this account");
+        let viaDeviceSecret = false;
+        if (wantsDevice) {
+          device = state.deviceByCredentials(m.device as string, m.deviceSecret as string);
+          if (!device) {
+            strike(ip);
+            return ws.close(4001, "unknown device credentials");
+          }
+          account = state.accountById(device.accountId);
+          viaDeviceSecret = true;
+        } else {
+          account = state.accountByToken(m.accountToken as string);
+          if (!account) {
+            strike(ip);
+            return ws.close(4001, "unknown account token");
+          }
+          if (typeof m.device === "string" && m.device) {
+            const d = state.deviceById(m.device);
+            device = d && d.accountId === account.id ? d : null;
+            if (!device) return fail(ws, "unknown-device", "device id does not belong to this account");
+          }
         }
         done = true;
         clearTimeout(helloTimer);
-        conn = { ws, account, device, alive: true };
+        conn = { ws, account: account!, device, alive: true, viaDeviceSecret };
         deviceConns.add(conn);
-        log(`device ${device ? device.id : "?"} (${account.name}) connected`);
-        const agents = state.roomsOfAccount(account.id).map((r) => {
+        log(`device ${device ? device.id : "?"} (${account!.name}${viaDeviceSecret ? ", device key" : ""}) connected`);
+        const agents = state.roomsOfAccount(account!.id).map((r) => {
           const mine = device && device.roomId === r.id ? device.scope : null;
           return { roomId: r.id, name: r.name, online: agentByRoom.has(r.id), scope: mine };
         });
@@ -326,6 +357,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
           return;
         }
         case "pair.begin": {
+          if (conn.viaDeviceSecret) return fail(ws, "owner-only", "pairing uses the account token");
           const roomId = typeof m.roomId === "string" ? m.roomId : null;
           const name = typeof m.name === "string" ? m.name.trim().slice(0, 64) : "";
           const scope = m.scope;
@@ -355,10 +387,15 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
   /** `read` pairs at once; `act` needs the host's answer while this socket waits. */
   const grantPair = (conn: DeviceConn, room: RoomRecord, name: string, scope: "read" | "act"): void => {
     const finish = (): void => {
-      const rec = state.addDevice(room, name, scope);
+      const { device: rec, secret } = state.addDevice(room, name, scope);
       conn.device = rec;
       deviceConns.add(conn);
-      send(conn.ws, { t: "pair.granted", device: { id: rec.id, name: rec.name, scope: rec.scope, roomId: rec.roomId } });
+      send(conn.ws, {
+        t: "pair.granted",
+        device: { id: rec.id, name: rec.name, scope: rec.scope, roomId: rec.roomId },
+        // One-time: the device stores it (PWA keeps it locally) and re-attaches with it.
+        deviceSecret: secret,
+      });
       pushRoomUpdate(room.id);
       log(`device ${rec.id} paired to ${room.id} (${scope})`);
     };
@@ -467,15 +504,47 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     server.listen(cfg.port ?? 0, cfg.bind ?? "127.0.0.1", () => {
       const addr = server.address();
       const port = typeof addr === "object" && addr ? addr.port : 0;
-      resolve({
+
+      // The SSH leg shares this process (state + device sockets). Disabled when ssh is
+      // false or its port is 0.
+      // `ssh` unset = disabled (tests and API-only runs); main.ts turns it on by default.
+      // The cloud resolves only once the leg is up or has failed, so callers see the truth.
+      const sshPromise: Promise<SshHandle | null> = cfg.ssh
+        ? startSshd({
+            config: cfg.ssh,
+            state,
+            log,
+            sendAsDevice: (deviceId, payload) => {
+              const dev = state.deviceById(deviceId);
+              if (!dev) return false;
+              const agent = agentByRoom.get(dev.roomId);
+              if (!agent) return false;
+              send(agent.ws, { t: "frame", device: deviceId, payload });
+              return true;
+            },
+            deviceOnline: (deviceId) => [...deviceConns].some((c) => c.device?.id === deviceId),
+          }).catch((e) => {
+            log(`ssh: failed to start (${e instanceof Error ? e.message : String(e)})`);
+            return null;
+          })
+        : Promise.resolve(null);
+
+      void sshPromise.then((h) => {
+        sshd = h;
+        resolve({
         server,
         port,
-        close: () =>
-          new Promise<void>((done) => {
-            for (const a of agentByRoom.values()) a.ws.close(1001, "server shutdown");
-            for (const d of deviceConns) d.ws.close(1001, "server shutdown");
-            server.close(() => done());
-          }),
+          get ssh() {
+            return sshd;
+          },
+          close: () =>
+            new Promise<void>((done) => {
+              for (const a of agentByRoom.values()) a.ws.close(1001, "server shutdown");
+              for (const d of deviceConns) d.ws.close(1001, "server shutdown");
+              void sshd?.close();
+              server.close(() => done());
+            }),
+        });
       });
     });
   });

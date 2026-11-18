@@ -86,9 +86,8 @@ resume after reconnect, payload confidentiality on the wire beyond TLS (E2E road
    `agents[]` and the focused ids into a versioned view. Device ops are `view` and `ping`; every other op is
    refused on the host with `read-only`. Next in this line: an `act` op set once per-op policy and audit exist.
 5. **Device PWA** — pairing page + dashboard + frame UI (static files served by the cloud).
-5b. **SSH leg through the gate** — so the Herdr phone app can "add a machine" that points at herdgate, keeping
-   its native SSH flow while herdgate supplies identity and reachability. Needs a transport bridge in front of
-   `hc` and per-device keys; see §8.
+5b. ~~**SSH leg through the gate**~~ — **done (v0.5.0)**; see §8. Follow-ups: publickey auth, framed/live
+   terminals for `read` devices via an observe-only proxy.
 6. **Push wake** — VAPID keys in the cloud; hosts send opaque wake pings.
 7. Multi-account signup, quotas, Postgres state, audit log.
 
@@ -151,18 +150,33 @@ The mod and the TUI plugin share one publisher: the mod owns the pairing convers
 write the token 0600) and shells out to `plugin/server/index.mjs serve` for the long-lived connection. One
 implementation, two surfaces.
 
-### Mobile: over SSH, through herdgate (planned)
+### Mobile: over SSH, through herdgate (v0.5.0)
 
-The Herdr phone app is closed source and has no extension surface. It talks to `herdr-core` **over SSH** and
-that is the supported path — herdgate does not try to replace it. The intended shape is an **SSH leg through
-the gate**: the phone's SSH target becomes a herdgate endpoint, herdgate authenticates the device with the same
-room/scope model it already has, and forwards the session to `hc` on the host. That keeps the phone on its
-native flow (add a machine, done) while herdgate supplies the identity and the public reachability the phone
-otherwise gets from Tailscale.
+The Herdr phone app is closed source and has no extension surface. It talks to `herdr-core` **over SSH** —
+`ssh <machine> hc connect`, JSON-RPC one message per line — and that is the supported path. herdgate now
+**terminates that SSH leg itself** (`src/cloud/sshd.ts`, ssh2):
 
-This is a **new leg** (`ssh`), not a change to the WebSocket legs: it needs a transport bridge in front of
-`hc` plus per-device keys, and it is scoped after the mod and the PWA (see §6 roadmap). Until it exists, the
-phone reaches a host the way Herdr documents: SSH or a VPN.
+- the phone's "add a machine" points at the gate: username = the device id, password = the device secret
+  `pair.granted` issued once (per-device secrets, roadmap §6 item 1, landed with this leg — the PWA stores
+  its key locally and re-attaches with it; the account token is no longer a device credential and is NOT an
+  SSH credential);
+- each SSH exec session is one bridge channel: the cloud relays `ssh.*` payloads opaquely, and the host-side
+  bridge (`src/host/ssh.ts`, mirrored in `plugin/server/ssh.mjs`) spawns exactly the requested `hc …` command
+  (argv, `shell: false`) and pipes it byte by byte;
+- **scope is enforced at the host bridge** — the trusted decision point, since the cloud cannot see payloads:
+  a `read` device gets a filtered plain-mode channel (mutating JSON-RPC methods are refused with a real
+  error and never reach herdr-core; a `framed: true` hello is downgraded so live terminals — which are
+  write streams — cannot be typed into; garbage is cut off), while an `act` device, approved by a human on
+  the host, gets byte-transparent access;
+- the SSH host key is minted once (Ed25519, mode 0600) and its fingerprint is printed at boot.
+
+Verified against real herdr-core 0.1.21: a `read` device authenticated with its key, listed terminals, read a
+terminal, subscribed to events; `terminal.send` and `file.write` were refused at the gate and nothing was
+written. An `act` device passes `framed: true` through untouched.
+
+Scope of this slice: `password` auth only (no publickey yet), plain mode for `read` (framed/live terminal is
+act-only), and no session resume. Reachability: on the LAN or via VPN/Tailscale to the machine running the
+gate; the SSH listener binds loopback by default and needs `HERDGATE_SSH_BIND=0.0.0.0` for LAN phones.
 
 ## 9. Herdr-relay comparison (why a new project)
 

@@ -15,11 +15,13 @@ const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = "herdgate.token";
 const CLOUD_KEY = "herdgate.cloud";
 const DEVICE_KEY = "herdgate.device";
+const DEVICE_SECRET_KEY = "herdgate.deviceSecret";
 
 const state = {
   token: localStorage.getItem(TOKEN_KEY) ?? "",
   cloud: localStorage.getItem(CLOUD_KEY) ?? "",
   deviceId: localStorage.getItem(DEVICE_KEY) ?? "",
+  deviceSecret: localStorage.getItem(DEVICE_SECRET_KEY) ?? "",
   ws: null,
   hello: null,
   roomId: null,
@@ -167,6 +169,21 @@ function renderRoom() {
     p.textContent = `as of ${new Date(v.takenAt).toLocaleTimeString()}`;
     box.append(p);
   }
+
+  // The SSH leg: this device's own key dials the gate. In the Herdr phone app, add a
+  // machine with this host/port and the key shown once at pair time.
+  if (state.deviceSecret && state.deviceId) {
+    const details = document.createElement("details");
+    details.className = "ssh";
+    const summary = document.createElement("summary");
+    summary.textContent = "SSH for the Herdr app";
+    const pre = document.createElement("pre");
+    const host = location.hostname || "your-gate";
+    // The gate's SSH listener is a separate port the cloud operator publishes (default 2222).
+    pre.textContent = `ssh -p 2222 ${state.deviceId}@${host}\npassword: the device key shown at pair time`;
+    details.append(summary, pre);
+    box.append(details);
+  }
 }
 
 function note(message, kind) {
@@ -191,15 +208,12 @@ function connect() {
   setStatus("connecting", "wait");
 
   ws.addEventListener("open", () => {
-    ws.send(
-      JSON.stringify({
-        v: 1,
-        t: "hello",
-        accountToken: state.token,
-        ...(state.deviceId ? { device: state.deviceId } : {}),
-        name: deviceName(),
-      }),
-    );
+    // A paired device re-attaches with its own key; the account token is the owner path
+    // (first sign-in, pairing, management).
+    const hello = state.deviceSecret && state.deviceId
+      ? { device: state.deviceId, deviceSecret: state.deviceSecret }
+      : { accountToken: state.token, ...(state.deviceId ? { device: state.deviceId } : {}) };
+    ws.send(JSON.stringify({ v: 1, t: "hello", ...hello, name: deviceName() }));
   });
 
   ws.addEventListener("message", (event) => {
@@ -264,6 +278,12 @@ function onMessage(m, ws) {
     case "pair.granted": {
       state.deviceId = m.device?.id ?? state.deviceId;
       if (state.deviceId) localStorage.setItem(DEVICE_KEY, state.deviceId);
+      // Shown once and kept only on this device: it is this phone's SSH key on the gate.
+      if (typeof m.deviceSecret === "string" && m.deviceSecret) {
+        state.deviceSecret = m.deviceSecret;
+        localStorage.setItem(DEVICE_SECRET_KEY, m.deviceSecret);
+        state.showSecretOnce = true;
+      }
       state.roomId = m.device?.roomId ?? state.roomId;
       closePair();
       render();
@@ -405,6 +425,8 @@ $("back").addEventListener("click", () => {
 function forgetToken() {
   state.token = "";
   state.deviceId = "";
+  state.deviceSecret = "";
+  localStorage.removeItem(DEVICE_SECRET_KEY);
   state.roomId = null;
   state.hello = null;
   localStorage.removeItem(TOKEN_KEY);

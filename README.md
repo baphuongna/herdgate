@@ -97,6 +97,26 @@ HERDGATE_URL=https://herd.example.com HERDGATE_ROOM_TOKEN=… npm run host
 ```
 
 Devices pair into the room and ask for `{op:"view"}`; the host answers with the current Herdr metadata.
+
+## The SSH leg (the Herdr phone app)
+
+The phone app adds machines over SSH — herdgate terminates that SSH itself, so "add a machine" points at the
+gate and the session lands on the host's real `herdr-core`:
+
+```sh
+ssh -p 2222 d_xxxxxxxx@your-gate        # password = the device key shown once at pair time
+# then the phone speaks the hc API: hello, terminal.list, terminal.read, events.subscribe…
+```
+
+- Auth is **per device** (id + its one-time key), never the account token; wrong keys strike the IP out.
+- `read` devices get a filtered channel: mutating calls (`terminal.send`, `file.write`, …) are refused **on
+  the host** with a real JSON-RPC error, and live-terminal mode is downgraded. `act` devices (approved on the
+  host) get byte-transparent access.
+- Only `hc …` runs — no shell, no sftp, no port forwarding.
+- The host needs `herdr-core` (`hc`) on PATH or `HERDGATE_HC_BIN`.
+
+Gateway flags: `HERDGATE_SSH_PORT` (default 2222, `0` disables), `HERDGATE_SSH_BIND` (loopback; `0.0.0.0` for
+LAN phones), `HERDGATE_SSH_KEY` (host key file). Verified against real herdr-core 0.1.21.
 Anything that is not `view`/`ping` is refused **on the host** with `read-only` — the cloud cannot see payloads,
 so the host is the last trusted decision point. `act` scope is denied unless `HERDGATE_ALLOW_ACT=1`.
 

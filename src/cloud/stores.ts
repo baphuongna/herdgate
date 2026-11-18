@@ -10,7 +10,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Scope } from "../protocol/envelope.ts";
-import { randomId, randomToken, sha256Hex } from "./util.ts";
+import { randomId, randomToken, sameSecret, sha256Hex } from "./util.ts";
 
 export interface Account {
   id: string;
@@ -34,6 +34,8 @@ export interface DeviceRecord {
   name: string;
   scope: Scope;
   created: string;
+  /** sha256 of the device's own secret; the plaintext exists only at pair time. */
+  secretHash?: string;
 }
 
 interface StateFile {
@@ -111,7 +113,20 @@ export class State {
     return this.devices.find((d) => d.id === id) ?? null;
   }
 
-  addDevice(room: RoomRecord, name: string, scope: Scope): DeviceRecord {
+  /** A paired device presenting its own secret (not the account token). */
+  deviceByCredentials(id: string, secret: string): DeviceRecord | null {
+    const d = this.deviceById(id);
+    if (!d || !d.secretHash) return null;
+    return sameSecret(d.secretHash, sha256Hex(secret)) ? d : null;
+  }
+
+  accountById(id: string): Account | null {
+    return this.accounts.find((a) => a.id === id) ?? null;
+  }
+
+  /** Mints the device and its one-time secret (returned plaintext, stored hashed). */
+  addDevice(room: RoomRecord, name: string, scope: Scope): { device: DeviceRecord; secret: string } {
+    const secret = randomToken(32);
     const d: DeviceRecord = {
       id: randomId("d"),
       roomId: room.id,
@@ -119,9 +134,10 @@ export class State {
       name,
       scope,
       created: new Date().toISOString(),
+      secretHash: sha256Hex(secret),
     };
     this.devices.push(d);
     this.#save();
-    return d;
+    return { device: d, secret };
   }
 }
