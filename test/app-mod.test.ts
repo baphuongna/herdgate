@@ -8,11 +8,11 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, mkdtempSync, cpSync, rmSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 
 const run = promisify(execFile);
 const MOD = new URL("../app-mod/herdgate/", import.meta.url).pathname;
@@ -65,6 +65,15 @@ test("main.js: the token never leaves the config dir, and never in the plugin ro
 const herdrApp = ["herdr-app", join(homedir(), ".local/bin/herdr-app")].find((p) => existsSync(p));
 
 test("herdr-app check: Herdr's own validator accepts the mod", { skip: !herdrApp && "herdr-app is not installed" }, async () => {
-  const { stdout, stderr } = await run(herdrApp!, ["check", MOD], { timeout: 120_000 });
-  assert.match(`${stdout}${stderr}`, /check passed/);
+  // Herdr writes generated files (jsconfig.json, *.d.ts) into the folder it checks, so run
+  // it on a copy: the source tree stays exactly what a person would copy into mods/.
+  const dir = mkdtempSync(join(tmpdir(), "herdgate-appmod-"));
+  try {
+    const copy = join(dir, "herdgate");
+    cpSync(MOD, copy, { recursive: true });
+    const { stdout, stderr } = await run(herdrApp!, ["check", copy], { timeout: 120_000 });
+    assert.match(`${stdout}${stderr}`, /check passed/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
