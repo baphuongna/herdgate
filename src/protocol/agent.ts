@@ -1,6 +1,5 @@
 /**
- * The host-agent leg: one outbound WebSocket per host (a desktop app such as
- * bom-herdr, or an adapter over anything else) → `POST`-none, `GET /v1/agent/ws`.
+ * The host-agent leg: one outbound WebSocket per host via `GET /v1/agent/ws`.
  *
  * The agent authenticates with a long-lived **room token** (minted by the
  * device-flow in `provision`, see the agent SDK). One live agent connection per

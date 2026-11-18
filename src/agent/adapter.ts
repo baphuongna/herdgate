@@ -1,6 +1,6 @@
 /**
- * What a host app (bom-herdr, or an adapter over anything else) implements to
- * sit behind herdgate. The SDK owns the connection, reconnection and envelope;
+ * What a local host adapter implements to sit behind herdgate. The first
+ * integration target is official Herdr (herdr.dev). The SDK owns the connection and envelope;
  * the adapter owns everything the cloud cannot see.
  */
 import type { DeviceView } from "../protocol/agent.ts";

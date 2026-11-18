@@ -5,9 +5,10 @@ wins and this file gets fixed.
 
 ## 1. What herdgate is
 
-A relay hub between **host apps** (desktop agents — bom-herdr first) and **devices** (browsers, PWAs). The hub is
-identity provider + router + presence; everything about the content (trees, terminals, commands) lives in the
-host and its adapter. Payloads crossing the cloud are **opaque by rule**: the cloud never parses, logs or
+A relay hub between **host apps** and **devices** (browsers, PWAs). The first host target is official
+[Herdr](https://herdr.dev). A herdgate-owned local adapter will use a verified upstream interface; the adapter
+runs on the host and the agent connects outbound to the gateway. No fork, third-party plugin, or relay project
+is required. The hub handles identity, routing, and presence; content and policy stay in the host adapter. Payloads crossing the cloud are **opaque by rule**: the cloud never parses, logs or
 persists them.
 
 Three deployment properties:
@@ -80,12 +81,34 @@ resume after reconnect, payload confidentiality on the wire beyond TLS (E2E road
 2. **Resume** — session ids + seq + a per-session ring buffer of frames in the cloud (ciphertext-friendly).
 3. **E2E payloads** — Noise_XX at pair time (device ↔ host key exchange), `payload` becomes a ciphertext
    string; the cloud is already a dumb router, so nothing changes server-side.
-4. **bom-herdr adapter** — implement `AgentAdapter` in `bom-pi/apps/bom-herdr`, render trees per device class.
+4. ~~**Official Herdr adapter**~~ — **done (v0.1.0)**, read-only. `src/host/herdr.ts` runs
+   `herdr api snapshot` (verified on Herdr 0.9.5, protocol 22) and maps `workspaces[]`, `tabs[]`, `panes[]`,
+   `agents[]` and the focused ids into a versioned view. Device ops are `view` and `ping`; every other op is
+   refused on the host with `read-only`. Next in this line: an `act` op set once per-op policy and audit exist.
 5. **Device PWA** — pairing page + dashboard + frame UI (static files served by the cloud).
 6. **Push wake** — VAPID keys in the cloud; hosts send opaque wake pings.
 7. Multi-account signup, quotas, Postgres state, audit log.
 
-## 7. Herdr-relay comparison (why a new project)
+## 7. Host payload contract (herdgate.herdr.v1)
+
+The cloud routes `payload` blind, so the host and its devices own their own schema. Current ops:
+
+| Direction | Message | Reply |
+|---|---|---|
+| device → host | `{op:"view"}` | `{op:"view", view}` (lazy read if none yet) |
+| device → host | `{op:"ping", n?}` | `{op:"pong", n, at}` |
+| host → device | `{op:"view", view}` | pushed when the view changes, and to a newly paired device |
+| host → device | `{op:"error", code, message}` | `read-only` for any other op; `host-unavailable` when Herdr cannot be read |
+
+`view` = `{v:1, source:"herdr", herdrVersion, protocol, takenAt, focused{workspaceId,tabId,paneId},
+workspaces[{id,label,number,tabs,panes,agentStatus,focused}], agents[{name,kind,status,workspaceId,tabId,paneId,cwd,title}]}`.
+A new Herdr version that adds keys keeps working (every field is read defensively); a missing key degrades to an
+empty/honest value rather than throwing.
+
+Pairing `act` is off unless the operator sets `HERDGATE_ALLOW_ACT=1`; the read-only op set means even an `act`
+device has nothing to cause an effect with yet.
+
+## 8. Herdr-relay comparison (why a new project)
 
 herdr-relay: Mac-local bridge, Tailscale identity, renders Herdr's mods in sandboxed processes, diffs trees
 bridge-side. herdgate: the cloud in the middle, own identity, host renders, cloud routes opaque frames. The

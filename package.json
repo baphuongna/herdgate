@@ -1,13 +1,14 @@
 {
   "name": "herdgate",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "A cloud relay hub: desktop host agents and mobile devices meet behind one gate.",
   "type": "module",
   "private": true,
   "engines": { "node": ">=22.18" },
   "scripts": {
     "start": "node src/cloud/main.ts",
-    "test": "node --test test/e2e.test.ts",
+    "host": "node src/host/main.ts",
+    "test": "node --test test/*.test.ts",
     "check": "tsc -p tsconfig.json"
   },
   "dependencies": {
