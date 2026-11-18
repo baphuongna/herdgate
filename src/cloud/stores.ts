@@ -1,0 +1,127 @@
+/**
+ * Cloud state: accounts (config-provided), rooms (one host) and devices.
+ * Persisted to one JSON file with an atomic tmp+rename write; room tokens are
+ * stored **hashed** (sha256), the plaintext exists only at mint time.
+ *
+ * v0 is a single JSON file — the interfaces are shaped so a Postgres/Redis
+ * implementation can replace it without touching the gateway.
+ */
+
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import type { Scope } from "../protocol/envelope.ts";
+import { randomId, randomToken, sha256Hex } from "./util.ts";
+
+export interface Account {
+  id: string;
+  name: string;
+  /** Config-provided; the only plaintext secret the cloud holds. */
+  token: string;
+}
+
+export interface RoomRecord {
+  id: string;
+  accountId: string;
+  name: string;
+  tokenHash: string;
+  created: string;
+}
+
+export interface DeviceRecord {
+  id: string;
+  roomId: string;
+  accountId: string;
+  name: string;
+  scope: Scope;
+  created: string;
+}
+
+interface StateFile {
+  v: 1;
+  rooms: RoomRecord[];
+  devices: DeviceRecord[];
+}
+
+export class State {
+  readonly accounts: Account[];
+  rooms: RoomRecord[] = [];
+  devices: DeviceRecord[] = [];
+  readonly #path: string | null;
+
+  constructor(accounts: Account[], path?: string) {
+    this.accounts = accounts;
+    this.#path = path ?? null;
+    if (this.#path) this.#load();
+  }
+
+  #load(): void {
+    try {
+      const f = JSON.parse(readFileSync(this.#path!, "utf8")) as StateFile;
+      if (f.v === 1) {
+        this.rooms = f.rooms ?? [];
+        this.devices = f.devices ?? [];
+      }
+    } catch (e) {
+      if (!(e instanceof Error && "code" in e && (e as { code?: string }).code === "ENOENT")) {
+        throw e;
+      }
+    }
+  }
+
+  #save(): void {
+    if (!this.#path) return;
+    const file: StateFile = { v: 1, rooms: this.rooms, devices: this.devices };
+    const tmp = `${this.#path}.tmp-${Math.random().toString(36).slice(2)}`;
+    mkdirSync(dirname(this.#path), { recursive: true });
+    writeFileSync(tmp, JSON.stringify(file), { mode: 0o600 });
+    renameSync(tmp, this.#path);
+  }
+
+  accountByToken(token: string): Account | null {
+    return this.accounts.find((a) => a.token === token) ?? null;
+  }
+
+  roomByTokenHash(hash: string): RoomRecord | null {
+    return this.rooms.find((r) => r.tokenHash === hash) ?? null;
+  }
+
+  roomsOfAccount(accountId: string): RoomRecord[] {
+    return this.rooms.filter((r) => r.accountId === accountId);
+  }
+
+  addRoom(accountId: string, name: string): { room: RoomRecord; token: string } {
+    const token = randomToken(32);
+    const room: RoomRecord = {
+      id: randomId("r"),
+      accountId,
+      name,
+      tokenHash: sha256Hex(token),
+      created: new Date().toISOString(),
+    };
+    this.rooms.push(room);
+    this.#save();
+    return { room, token };
+  }
+
+  devicesOfRoom(roomId: string): DeviceRecord[] {
+    return this.devices.filter((d) => d.roomId === roomId);
+  }
+
+  deviceById(id: string): DeviceRecord | null {
+    return this.devices.find((d) => d.id === id) ?? null;
+  }
+
+  addDevice(room: RoomRecord, name: string, scope: Scope): DeviceRecord {
+    const d: DeviceRecord = {
+      id: randomId("d"),
+      roomId: room.id,
+      accountId: room.accountId,
+      name,
+      scope,
+      created: new Date().toISOString(),
+    };
+    this.devices.push(d);
+    this.#save();
+    return d;
+  }
+}
