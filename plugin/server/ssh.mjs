@@ -39,6 +39,20 @@ export function resolveHc(env = process.env) {
   return existsSync("/usr/bin/hc") ? "/usr/bin/hc" : "hc";
 }
 
+
+/** Extract `hc <verb>` from herdr-core's known machine-add probes (null = not one). */
+export function translateBootstrap(cmd) {
+  const posix = cmd.match(/exec "\$p"\s+([^'"\n]+?)['"]?\s*$/);
+  if (posix) {
+    const args = posix[1].trim();
+    // Strict whitelist: flags, words, equals — never shell metacharacters.
+    if (/^[-a-z0-9][-a-z0-9 =]*$/i.test(args)) return `hc ${args}`;
+  }
+  const win = cmd.match(/herdr-core\.exe\)?\s+\(?([a-z][a-z0-9-]*)\)/);
+  if (win) return `hc ${win[1]}`;
+  return null;
+}
+
 export function createSshBridge({ send, scopeOf, log = () => {}, resolve = resolveHc, spawnImpl = spawn }) {
   const channels = new Map();
   const key = (device, ch) => `${device}:${ch}`;
@@ -132,7 +146,17 @@ export function createSshBridge({ send, scopeOf, log = () => {}, resolve = resol
           return true;
         }
         const cmd = typeof payload.cmd === "string" ? payload.cmd.trim() : "";
-        const parts = cmd.split(/\s+/).filter(Boolean);
+        // herdr-core's `machine add` probes with shell wrappers that locate a binary
+        // named `herdr-core` and `exec` it. We never run shell lines: translate the
+        // KNOWN templates to `hc <verb>`; anything else shell-shaped is refused below.
+        const bootstrap = cmd.includes("herdr-core") ? translateBootstrap(cmd) : null;
+        const parts = (bootstrap ?? cmd).split(/\s+/).filter(Boolean);
+        if (parts.length > 0 && parts[0] === "exit" && (parts.length === 1 || parts[1] === "0")) {
+          // SSH clients end probe sessions with `exit` — acknowledge and close clean.
+          send(device, { op: "ssh.granted", ch, scope });
+          send(device, { op: "ssh.closed", ch, code: 0 });
+          return true;
+        }
         if (parts.length === 0 || parts[0] !== "hc") {
           send(device, { op: "ssh.denied", ch, reason: `herdgate bridges "hc …" only, got "${cmd.slice(0, 60) || "(empty)"}"` });
           return true;

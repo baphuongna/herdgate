@@ -293,3 +293,16 @@ async function roomIdOf(base: string, token: string): Promise<string> {
   ws.close();
   return (hello.agents as { roomId: string }[])[0].roomId;
 }
+
+test("translateBootstrap maps herdr-core probes to hc, refuses shell tricks", async () => {
+  const { translateBootstrap } = await import("../src/host/ssh.ts");
+  const posix = `sh -c 'p=$(command -v herdr-core) || p=$HOME/.local/bin/herdr-core; [ -x "$p" ] || { echo "herdr-core is not installed here" >&2; exit 127; }; exec "$p" connect'`;
+  const sess = `sh -c 'p=$(command -v herdr-core); exec "$p" --session work connect'`;
+  const win = `cmd /d /c "if exist .\\AppData\\Local\\Programs\\herdr-core\\herdr-core.exe (.\\AppData\\Local\\Programs\\herdr-core\\herdr-core.exe connect) else (echo herdr-core is not installed here 1>&2 & exit /b 127)"`;
+  assert.equal(translateBootstrap(posix), "hc connect");
+  assert.equal(translateBootstrap(sess), "hc --session work connect");
+  assert.equal(translateBootstrap(win), "hc connect");
+  assert.equal(translateBootstrap(`sh -c 'exec "$p" connect; rm -rf /'`), null);
+  assert.equal(translateBootstrap(`sh -c 'rm -rf /'`), null);
+  assert.equal(translateBootstrap(`hc connect`), null); // not a wrapper — normal path
+});

@@ -72,6 +72,22 @@ export interface SshBridge {
   closeAll(): void;
 }
 
+
+/** Extract `hc <verb>` from herdr-core's known machine-add probes (null = not one). */
+export function translateBootstrap(cmd: string): string | null {
+  // POSIX: sh -c 'p=$(command -v herdr-core) …; exec "$p" connect'
+  const posix = cmd.match(/exec "\$p"\s+([^'"\n]+?)['"]?\s*$/);
+  if (posix) {
+    const args = posix[1].trim();
+    // Strict whitelist: flags, words, equals — never shell metacharacters.
+    if (/^[-a-z0-9][-a-z0-9 =]*$/i.test(args)) return `hc ${args}`;
+  }
+  // Windows: cmd /d /c "…herdr-core.exe connect) …"
+  const win = cmd.match(/herdr-core\.exe\)?\s+\(?([a-z][a-z0-9-]*)\)/);
+  if (win) return `hc ${win[1]}`;
+  return null;
+}
+
 export function createSshBridge(o: SshBridgeOptions): SshBridge {
   const log = o.log ?? (() => {});
   const spawnFn = o.spawnImpl ?? spawn;
@@ -191,7 +207,18 @@ export function createSshBridge(o: SshBridgeOptions): SshBridge {
         return true;
       }
       const cmd = typeof p.cmd === "string" ? p.cmd.trim() : "";
-      const parts = cmd.split(/\s+/).filter(Boolean);
+      // herdr-core's `machine add` probes with shell wrappers that locate a binary
+      // named `herdr-core` and `exec` it (POSIX and Windows templates). We never run
+      // shell lines: translate the KNOWN templates to the equivalent `hc <verb>` and
+      // let the normal path spawn it. Anything else shell-shaped is refused below.
+      const bootstrap = cmd.includes("herdr-core") ? translateBootstrap(cmd) : null;
+      const parts = (bootstrap ?? cmd).split(/\s+/).filter(Boolean);
+      if (parts.length > 0 && parts[0] === "exit" && (parts.length === 1 || parts[1] === "0")) {
+        // SSH clients end probe sessions with `exit` — acknowledge and close clean.
+        o.send(device, { op: "ssh.granted", ch, scope });
+        o.send(device, { op: "ssh.closed", ch, code: 0 });
+        return true;
+      }
       if (parts.length === 0 || parts[0] !== "hc") {
         // One command family only: the phone speaks herdr-core through this leg.
         o.send(device, { op: "ssh.denied", ch, reason: `herdgate bridges "hc …" only, got "${cmd.slice(0, 60) || "(empty)"}"` });

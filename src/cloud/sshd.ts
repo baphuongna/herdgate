@@ -145,6 +145,10 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
         const session = accept();
         session.on("sftp", (acceptSftp, rejectSftp) => rejectSftp());
         session.on("shell", (acceptShell, rejectShell) => rejectShell());
+        // Clients like herdr-core's `machine add` ask for a PTY while probing; the
+        // real process runs on the host leg over pipes regardless, so accepting the
+        // request (without allocating anything) is honest and keeps exec-only policy.
+        session.on("pty", (accept) => accept());
         session.on("exec", (acceptExec, rejectExec, info) => {
           const dvc = dev;
           if (!dvc) return rejectExec();
