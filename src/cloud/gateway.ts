@@ -33,6 +33,7 @@ import {
 import { AgentCodes } from "./pairing.ts";
 import { type Account, type DeviceRecord, type RoomRecord, State } from "./stores.ts";
 import { readJsonBody, randomId, sameSecret, sha256Hex } from "./util.ts";
+import { serveStatic } from "./static.ts";
 
 export interface CloudConfig {
   accounts: { id: string; name: string; token: string }[];
@@ -44,6 +45,8 @@ export interface CloudConfig {
   expectedHost?: string;
   /** Shown in pairing-code responses; e.g. `https://herd.example.com`. */
   publicUrl?: string | null;
+  /** Directory of the PWA (src/web). Served on `/`; omit to serve no UI. */
+  webRoot?: string;
   log?: (line: string) => void;
 }
 
@@ -436,6 +439,12 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       const st = codes.status(statusMatch[1]);
       if (st.status === "unknown") return json(res, 404, { status: st.status });
       return json(res, 200, st);
+    }
+
+    // The PWA, same-origin with the WS legs. Only GET/HEAD, and only after the API
+    // routes above, so `/v1/*` can never be shadowed by a file.
+    if ((req.method === "GET" || req.method === "HEAD") && cfg.webRoot) {
+      return void serveStatic(res, cfg.webRoot, path);
     }
 
     res.writeHead(404);

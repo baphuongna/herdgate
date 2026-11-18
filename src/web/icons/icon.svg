@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="herdgate">
+  <rect width="64" height="64" rx="14" fill="#11131a"/>
+  <!-- a gate: two posts and a lintel, with a terminal caret inside -->
+  <path d="M18 46V20h5v26zM41 46V20h5v26zM18 18h28v4H18z" fill="#7aa2f7"/>
+  <path d="M26 32l6 5-6 5" fill="none" stroke="#e7e9ee" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

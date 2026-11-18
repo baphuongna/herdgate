@@ -34,6 +34,7 @@ src/agent/      HerdGateAgent SDK + AgentAdapter (what a host app implements)
 src/host/       standalone host CLI (no Herdr needed) + the `herdr api snapshot` adapter
 plugin/         the Herdr TUI plugin: herdr-plugin.toml + server/ (what `herdr plugin link` loads)
 app-mod/        the Herdr app mod: mods/herdgate/ (what `herdr-app check` validates)
+src/web/        the PWA a device opens — served by the cloud, same origin as the WS legs
 test/           e2e relay, the adapter, and the plugin's own commands
 ```
 
@@ -98,6 +99,27 @@ HERDGATE_URL=https://herd.example.com HERDGATE_ROOM_TOKEN=… npm run host
 Devices pair into the room and ask for `{op:"view"}`; the host answers with the current Herdr metadata.
 Anything that is not `view`/`ping` is refused **on the host** with `read-only` — the cloud cannot see payloads,
 so the host is the last trusted decision point. `act` scope is denied unless `HERDGATE_ALLOW_ACT=1`.
+
+## The PWA (the device side)
+
+The cloud serves the PWA itself (`src/web/`, `HERDGATE_WEB_ROOT`, `HERDGATE_NO_WEB=1` to disable). A phone
+opens the public hostname, pastes the account token once, sees its machines, pairs into one, and reads the
+view the host publishes.
+
+```sh
+HERDGATE_ACCOUNT_TOKEN=… npm start      # → http://127.0.0.1:8787/ is the app
+```
+
+Safety properties, all asserted in `test/web.test.ts`:
+
+- **no HTML from the wire** — every string is `textContent`; no `innerHTML`, no `document.write`;
+- **one op** — the client only ever asks a host for `{op:"view"}`; the host, not the cloud, decides the rest;
+- **a locked-down CSP** — `default-src 'self'`, no inline script or style, `frame-ancestors 'none'`;
+- **static can't escape** — `realpath`-pinned root, dotfiles and traversal refused (including `%2e%2e`);
+- **API precedence** — `/v1/*` and `/healthz` are routed before static, so no file can shadow them.
+
+Verified live: real Herdr → publisher → cloud → **headless Chrome** signed in, saw the machine, paired
+`read`, and rendered the view (7 spaces, 1 agent, 0 page errors).
 
 Going public: [DEPLOY.md](DEPLOY.md) (cloudflared, on this machine).
 
