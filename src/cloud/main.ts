@@ -13,6 +13,7 @@
  *   HERDGATE_SSH_BIND      its bind address       (default 127.0.0.1; 0.0.0.0 for LAN)
  *   HERDGATE_SSH_KEY       host key file          (default: beside the state file)
  *   HERDGATE_NO_PUSH       "1" disables the push-wake endpoints and VAPID keys
+ *   HERDGATE_SSH_HOST      the hostname phones dial for SSH (a DNS-only name)
  *   HERDGATE_HC_BIN        herdr-core binary on hosts (hosts resolve hc themselves)
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -70,6 +71,7 @@ const cloud = await startCloud({
     keyPath: sshKeyPath,
   },
   push,
+  sshHost: env.HERDGATE_SSH_HOST,
   accounts: [{ id: "a_owner", name: env.HERDGATE_ACCOUNT_NAME ?? "owner", token }],
   log: (l) => console.error(`herdgate: ${l}`),
 });

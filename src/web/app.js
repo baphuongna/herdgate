@@ -278,7 +278,8 @@ function renderRoom() {
     // person typed to reach this page — for the Herdr phone app that should be the
     // gate machine's LAN address, since plain SSH does not cross a CDN.
     const port = state.sshPort ?? 2222;
-    pre.textContent = `ssh -p ${port} ${state.deviceId}@${host}\npassword: the device key shown at pair time`;
+    const sshHost = state.sshHost || host;
+    pre.textContent = `ssh -p ${port} ${state.deviceId}@${sshHost}\npassword: the device key shown at pair time`;
     details.append(summary, pre);
     box.append(details);
   }
@@ -373,7 +374,10 @@ async function onMessage(m, ws) {
       // Resume outcome: the stream header carries the cloud's position; when the
       // replay had a hole (too long away), askView() below re-fetches the state.
       const rid = m.device?.roomId ?? null;
-      if (m.ssh && typeof m.ssh.port === "number") state.sshPort = m.ssh.port;
+      if (m.ssh && typeof m.ssh.port === "number") {
+        state.sshPort = m.ssh.port;
+        if (typeof m.ssh.host === "string") state.sshHost = m.ssh.host;
+      }
       if (m.resumed === true && m.stream && typeof m.stream.seq === "number") {
         saveStream(rid, m.stream.gen, m.stream.seq);
       } else if (rid) {

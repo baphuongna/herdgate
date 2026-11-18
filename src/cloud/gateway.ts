@@ -52,6 +52,8 @@ export interface CloudConfig {
   webRoot?: string;
   /** The SSH leg phones dial. `port: 0` disables. */
   ssh?: SshConfig;
+  /** The hostname phones should dial for the SSH leg (e.g. an AAAA/DNS-only name). */
+  sshHost?: string;
   /** VAPID keys for silent wake pushes; omit to disable the push endpoints. */
   push?: { keys: VapidKeys; /** mailto contact required by the VAPID spec. */ sub: string } | null;
   log?: (line: string) => void;
@@ -510,7 +512,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
             ...helloMsg,
             resumed: false,
             ...(s ? { stream: { gen: s.gen, seq: s.seq } } : {}),
-            ...(cfg.ssh ? { ssh: { port: cfg.ssh.port } } : {}),
+            ...(cfg.ssh ? { ssh: { port: cfg.ssh.port, ...(cfg.sshHost ? { host: cfg.sshHost } : {}) } } : {}),
           });
         }
         if (device) pushRoomUpdate(device.roomId);
