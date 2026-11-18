@@ -11,6 +11,8 @@
 //   - the token lives in localStorage on this device and is never sent anywhere but the
 //     cloud's own WS endpoint.
 
+const BUILD = "v0.9.2";
+
 const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = "herdgate.token";
 const CLOUD_KEY = "herdgate.cloud";
@@ -674,19 +676,23 @@ $("settings-form").addEventListener("submit", () => {
 
 $("signout").addEventListener("click", () => forgetToken());
 
-$("pair-back").addEventListener("click", () => {
-  closePair();
-  show("rooms", true);
-  renderRooms();
-});
-
-$("back").addEventListener("click", () => {
+/** Back to the machine list — from the pair screen or the room screen.
+ * Delegated at the document level so it works no matter what rebuilt the DOM
+ * (and with a generous tap target; see .backbtn in the CSS). */
+const goMachines = () => {
   state.roomId = null;
   state.view = null;
   state.viewError = null;
+  state.keyShown = false;
   closePair();
+  show("pair", false);
+  show("room", false);
   render();
   if (state.hello) renderRooms();
+};
+document.addEventListener("click", (event) => {
+  const target = event.target instanceof Element ? event.target.closest("#back, #pair-back") : null;
+  if (target) goMachines();
 });
 
 function forgetToken() {
@@ -707,6 +713,13 @@ function forgetToken() {
 }
 
 // ---- boot ------------------------------------------------------------------
+
+// Which build is this? Shown in the machine list so a stale phone install is
+// obvious at a glance (the service worker updates on the second launch).
+{
+  const el = document.getElementById("build");
+  if (el) el.textContent = "herdgate " + BUILD;
+}
 
 render();
 if (state.token) connect();

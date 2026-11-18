@@ -175,6 +175,22 @@ button.link {
   font-weight: 500;
 }
 
+/* Back-to-machines: a real tap target (44px), not a hair-thin text link. */
+#back,
+#pair-back {
+  display: block;
+  min-height: 44px;
+  padding: 0 16px;
+  margin: 4px 0 12px;
+  width: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--accent);
+  font-weight: 600;
+  text-align: left;
+}
+
 .list {
   list-style: none;
   margin: 0;
