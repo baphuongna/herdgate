@@ -1,6 +1,6 @@
 {
   "name": "herdgate",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "description": "A cloud relay hub: desktop host agents and mobile devices meet behind one gate.",
   "type": "module",
   "private": true,

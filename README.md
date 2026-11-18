@@ -117,6 +117,10 @@ ssh -p 2222 d_xxxxxxxx@your-gate        # password = the device key shown once a
 ```
 
 - Auth is **per device** (id + its one-time key), never the account token; wrong keys strike the IP out.
+- **Public keys too**: `hc machine add` uses the system `ssh`, which prefers keys/agent and answers no
+  prompts without a terminal. Register the adding machine's `~/.ssh/id_ed25519.pub` in the PWA (SSH →
+  *Public keys*, or `POST /v1/device/sshkey`) and the add is passwordless — Ed25519/RSA/ECDSA, signatures
+  verified per RFC 4252 §7.
 - `read` devices get a filtered channel: mutating calls (`terminal.send`, `file.write`, …) are refused **on
   the host** with a real JSON-RPC error, and live-terminal mode is downgraded. `act` devices (approved on the
   host) get byte-transparent access.

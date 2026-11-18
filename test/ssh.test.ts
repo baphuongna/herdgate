@@ -306,3 +306,105 @@ test("translateBootstrap maps herdr-core probes to hc, refuses shell tricks", as
   assert.equal(translateBootstrap(`sh -c 'rm -rf /'`), null);
   assert.equal(translateBootstrap(`hc connect`), null); // not a wrapper — normal path
 });
+
+test("ssh leg: publickey auth — register a key, log in without a password", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "herdgate-sshkey-"));
+  process.env.FAKE_HC_LOG = join(dir, "hc-methods.log");
+  const ACCOUNT = "ssh-key-account-tok";
+  const { generateKeyPairSync } = (await import("ssh2")).default.utils as unknown as {
+    generateKeyPairSync: (t: string) => { private: string; public: string };
+  };
+  const good = generateKeyPairSync("ed25519");
+  const bad = generateKeyPairSync("ed25519");
+
+  const bridge = createSshBridge({
+    send: (device, payload) => agent?.send(device, payload) ?? false,
+    scopeOf: (device) => agent?.scopeOf(device) ?? "read",
+    log: () => {},
+    resolveHc: () => "hc",
+    spawnImpl: (bin, args, opts) => spawn(process.execPath, [FAKE_HC, ...args], opts),
+  });
+  const adapter: AgentAdapter = {
+    info: () => ({ name: "ssh-host", version: "0.0.0" }),
+    onFrame: (device, payload) => void bridge.handle(device, payload),
+    onDevices: () => {},
+    onPairAsk: (ask: PairAsk) => ask.scope === "act",
+  };
+  let agent: HerdGateAgent | undefined;
+  const cloud = await startCloud({
+    accounts: [{ id: "a1", name: "owner", token: ACCOUNT }],
+    log: () => {},
+    ssh: { port: 0, keyPath: join(dir, "hostkey.json") },
+  });
+  const base = `http://127.0.0.1:${cloud.port}`;
+  const port = cloud.ssh?.port ?? 0;
+  try {
+    const code = (await fetch(`${base}/v1/agent/code`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "ssh-host" }) }).then((r) => r.json())) as { code: string };
+    await fetch(`${base}/v1/agent/approve`, { method: "POST", headers: { authorization: `Bearer ${ACCOUNT}`, "content-type": "application/json" }, body: JSON.stringify({ code: code.code }) });
+    const st = (await fetch(`${base}/v1/agent/code/${code.code}/status`).then((r) => r.json())) as { roomToken?: string };
+    agent = new HerdGateAgent({ endpoint: base.replace("http", "ws") + "/v1/agent/ws", roomToken: st.roomToken!, adapter, log: () => {} });
+    agent.start();
+    await agent.firstHello;
+    const roomId = await roomIdOf(base, ACCOUNT);
+    const dev = await pairDevice(base, ACCOUNT, roomId, "key-phone", "act");
+
+    // REST rejects garbage, accepts a real line.
+    const badReq = await fetch(`${base}/v1/device/sshkey`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ device: dev.id, deviceSecret: dev.secret, pubkey: "ssh-ed25519 AAAA not-a-key" }) });
+    assert.equal(badReq.status, 400, "garbage pubkey rejected");
+    const okReq = await fetch(`${base}/v1/device/sshkey`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ device: dev.id, deviceSecret: dev.secret, pubkey: good.public }) });
+    assert.equal(okReq.status, 200);
+    const listed = (await (await fetch(`${base}/v1/device/sshkey?device=${dev.id}`, { headers: { "x-herdgate-secret": dev.secret } })).json()) as { keys: { fp: string }[] };
+    assert.equal(listed.keys.length, 1);
+    assert.match(listed.keys[0].fp, /^SHA256:/);
+
+    // A fresh SSH connection with ONLY the private key (no password) reaches hc.
+    const r = await new Promise<ExecResult>((resolve, reject) => {
+      const conn = new Client();
+      let out = "";
+      const done = (x: ExecResult) => { try { conn.end(); } catch { /* closed */ } resolve(x); };
+      const timer = setTimeout(() => done({ code: null, out }), 8_000);
+      conn.on("ready", () => {
+        conn.exec("hc connect", (err, stream) => {
+          if (err) return done({ code: -1, out: String(err) });
+          stream.on("data", (d: Buffer) => (out += d.toString()));
+          stream.on("close", (c: number | null) => { clearTimeout(timer); done({ code: c, out }); });
+          stream.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "hello", params: {} }) + "\n");
+        });
+      }).on("error", (e) => { clearTimeout(timer); reject(e); })
+        .connect({ host: "127.0.0.1", port, username: dev.id, privateKey: good.private, readyTimeout: 8_000 });
+    });
+    assert.ok(r.out.includes('"echo":"hello"'), `key auth reached hc: ${r.out.slice(0, 200)}`);
+
+    // An UNREGISTERED key never gets in.
+    const expectKeyReject = (priv: string, why: string) =>
+      assert.rejects(
+        () =>
+          new Promise<ExecResult>((resolve, reject) => {
+            const conn = new Client();
+            conn.on("error", (e) => {
+              try {
+                conn.end();
+              } catch {
+                /* closed */
+              }
+              reject(e);
+            }).on("ready", () => {
+              conn.end();
+              reject(new Error(why));
+            }).connect({ host: "127.0.0.1", port, username: dev.id, privateKey: priv, readyTimeout: 5_000 });
+          }),
+        /All configured authentication methods failed/,
+      );
+    await expectKeyReject(bad.private, "authenticated with a wrong key");
+
+    // Removing the key locks the passwordless door again.
+    const afterAdd = (await (await fetch(`${base}/v1/device/sshkey?device=${dev.id}`, { headers: { "x-herdgate-secret": dev.secret } })).json()) as { keys: { b64: string }[] };
+    const del = await fetch(`${base}/v1/device/sshkey`, { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ device: dev.id, deviceSecret: dev.secret, b64: afterAdd.keys[0].b64 }) });
+    assert.equal(del.status, 200);
+    await expectKeyReject(good.private, "authenticated after key removal");
+  } finally {
+    agent?.stop();
+    await cloud.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

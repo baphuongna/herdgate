@@ -34,6 +34,7 @@ import {
   type Envelope,
 } from "../protocol/index.ts";
 import { AgentCodes } from "./pairing.ts";
+import { parseAuthorizedKey, sshKeyFingerprint } from "./sshd.ts";
 import { type Account, type DeviceRecord, type RoomRecord, State } from "./stores.ts";
 import { readJsonBody, randomId, sameSecret, sha256Hex } from "./util.ts";
 import { serveStatic } from "./static.ts";
@@ -824,6 +825,46 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         if (u.protocol !== "https:" && u.protocol !== "http:") return json(res, 400, { error: "bad endpoint" });
         state.setDevicePush(device.id, endpoint);
         return json(res, 200, { ok: true });
+      });
+    }
+
+    // Device SSH public keys: register the key of the machine that will `hc machine
+    // add` this device, so system ssh logs in without a password prompt. Same two
+    // identities as /v1/device/push (the device's own secret, or the owner's token).
+    if (path === "/v1/device/sshkey") {
+      if (blocked(ipOf(req))) return json(res, 429, { error: "rate limited" });
+      return void readJsonBody(req).then((body) => {
+        // GET carries no body: the device id rides the query, its secret a header
+        // (never a query string — those end up in proxy logs).
+        const q = new URL(req.url ?? "/", "http://x").searchParams;
+        const headerSecret = req.headers["x-herdgate-secret"];
+        const deviceId = typeof body?.device === "string" ? body.device : q.get("device") ?? "";
+        const deviceSecret = typeof body?.deviceSecret === "string" ? body.deviceSecret : typeof headerSecret === "string" ? headerSecret : "";
+        let device: DeviceRecord | null = deviceId && deviceSecret ? state.deviceByCredentials(deviceId, deviceSecret) : null;
+        if (!device) {
+          const account = accountByAuth(req);
+          if (!account) return json(res, 401, { error: "device credentials or account token required" });
+          device = deviceId ? state.deviceById(deviceId) : null;
+          if (!device || device.accountId !== account.id) return json(res, 403, { error: "not one of this account's devices" });
+        }
+        if (req.method === "GET") {
+          return json(res, 200, {
+            keys: (device.sshKeys ?? []).map((k) => ({ algo: k.algo, fp: sshKeyFingerprint(k.b64), comment: k.comment ?? "", at: k.at, b64: k.b64 })),
+          });
+        }
+        if (req.method === "DELETE") {
+          const b64 = typeof body?.b64 === "string" ? body.b64 : "";
+          if (!b64) return json(res, 400, { error: "b64 required" });
+          return json(res, state.removeDeviceSshKey(device.id, b64) ? 200 : 404, { ok: state.deviceById(device.id)?.sshKeys !== undefined });
+        }
+        if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
+        const parsed = parseAuthorizedKey(typeof body?.pubkey === "string" ? body.pubkey : "");
+        if (!parsed) return json(res, 400, { error: "bad pubkey (want an authorized_keys line: <algo> <base64> [comment])" });
+        const added = state.addDeviceSshKey(device.id, parsed.algo, parsed.b64, parsed.comment);
+        if (!added && !(state.deviceById(device.id)?.sshKeys ?? []).some((k) => k.algo === parsed.algo && k.b64 === parsed.b64)) {
+          return json(res, 422, { error: "too many keys (max 5)" });
+        }
+        return json(res, 200, { ok: true, fp: sshKeyFingerprint(parsed.b64) });
       });
     }
 

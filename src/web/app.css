@@ -299,3 +299,14 @@ dialog::backdrop {
 #view details.ssh .keyrow button.link {
   font-size: 0.95em;
 }
+
+/* SSH public-key management inside the device's SSH section */
+.sshkeys .pubkey-input {
+  flex: 1;
+  min-width: 0;
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 8px;
+  border: 1px solid var(--border, #ccc);
+  border-radius: 6px;
+}
+.sshkeys .keyrow { margin-top: 8px; }

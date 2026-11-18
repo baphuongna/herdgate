@@ -107,7 +107,28 @@ shell helper blocks forever. Local `curl http://127.0.0.1:8833/` returns **421**
 design — the gateway pins `Host: gate.phuongnb.io.vn`; that is the pinning contract
 working, not a bug.
 
-### The SSH leg is not a Cloudflare-TCP leg — three ways in
+### The SSH leg — passwordless logins (publickey)
+
+`hc machine add` shells out to the system `ssh`, which prefers keys and the agent and
+refuses to answer prompts when it has no terminal. A device whose machine should add
+it non-interactively registers that machine's public key first:
+
+1. In the PWA: machine → **SSH for the Herdr app** → *Public keys* → paste the output of
+   `cat ~/.ssh/id_ed25519.pub` from the machine that will run `hc machine add` → **Add key**.
+2. On that machine (one time, to skip the host-key question):
+
+       Host ssh.phuongnb.io.vn
+           StrictHostKeyChecking accept-new
+
+   in `~/.ssh/config`.
+3. `hc machine add d_<device>@ssh.phuongnb.io.vn:2299` now logs in with the key —
+   no password prompt. Password auth (the device key from pair time) keeps working.
+
+The REST surface (same two identities as `/v1/device/push`: the device's own secret,
+or the account token): `GET/POST/DELETE /v1/device/sshkey`. Ed25519, RSA and ECDSA
+(nistp256/384/521) keys are accepted; signatures are verified per RFC 4252 §7.
+
+## The SSH leg is not a Cloudflare-TCP leg — three ways in
 
 Phones speak plain SSH to `host:port`; Cloudflare Tunnel only carries TCP for clients
 running `cloudflared access`, which the phone does not. Reachability options, in order

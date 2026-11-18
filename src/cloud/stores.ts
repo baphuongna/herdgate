@@ -38,6 +38,8 @@ export interface DeviceRecord {
   secretHash?: string;
   /** The device's web-push subscription endpoint for silent wake pings (VAPID). */
   push?: { endpoint: string; at: string };
+  /** SSH public keys this device may log in with (authorized_keys lines, parsed). */
+  sshKeys?: { algo: string; b64: string; comment?: string; at: string }[];
 }
 
 interface StateFile {
@@ -130,6 +132,29 @@ export class State {
     const d = this.deviceById(id);
     if (!d || !d.secretHash) return null;
     return sameSecret(d.secretHash, sha256Hex(secret)) ? d : null;
+  }
+
+  /** Authorize an SSH public key for a device (deduped, capped). */
+  addDeviceSshKey(id: string, algo: string, b64: string, comment?: string): boolean {
+    const d = this.deviceById(id);
+    if (!d) return false;
+    d.sshKeys ??= [];
+    if (d.sshKeys.some((k) => k.algo === algo && k.b64 === b64)) return true;
+    if (d.sshKeys.length >= 5) return false;
+    d.sshKeys.push({ algo, b64, comment: comment?.slice(0, 200) || undefined, at: new Date().toISOString() });
+    this.#save();
+    return true;
+  }
+
+  removeDeviceSshKey(id: string, b64: string): boolean {
+    const d = this.deviceById(id);
+    if (!d?.sshKeys) return false;
+    const n = d.sshKeys.length;
+    d.sshKeys = d.sshKeys.filter((k) => k.b64 !== b64);
+    if (d.sshKeys.length === n) return false;
+    if (d.sshKeys.length === 0) delete d.sshKeys;
+    this.#save();
+    return true;
   }
 
   accountById(id: string): Account | null {

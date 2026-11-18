@@ -16,7 +16,7 @@
  * (`ssh <host> hc connect`), and that channel is relayed byte by byte.
  */
 
-import { createHash, generateKeyPairSync as nodeKeyPair } from "node:crypto";
+import { createHash, createPublicKey, generateKeyPairSync as nodeKeyPair, verify as cryptoVerify, type KeyObject } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, chmodSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import ssh2Pkg from "ssh2";
@@ -29,6 +29,77 @@ const utils = (ssh2Pkg as unknown as { utils?: { generateKeyPairSync?(type: stri
 const MAX_CHANNELS_PER_DEVICE = 3;
 const AUTH_STRIKES = 5;
 const AUTH_BLOCK_MS = 60_000;
+
+/** The algos herdgate authorizes for device keys. */
+const SSH_KEY_ALGOS = new Set(["ssh-ed25519", "ssh-rsa", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"]);
+
+/** Fingerprint of an SSH public key blob, OpenSSH style (`SHA256:…`, no padding). */
+export function sshKeyFingerprint(b64: string): string {
+  return "SHA256:" + createHash("sha256").update(Buffer.from(b64, "base64")).digest("base64").replace(/=+$/, "");
+}
+
+/** Parse a `authorized_keys`-style line → { algo, b64, comment } | null. */
+export function parseAuthorizedKey(line: string): { algo: string; b64: string; comment?: string } | null {
+  const parts = line.trim().split(/\s+/);
+  if (parts.length < 2) return null;
+  const [algo, b64, ...rest] = parts;
+  if (!SSH_KEY_ALGOS.has(algo) || !/^[A-Za-z0-9+/]+={0,2}$/.test(b64)) return null;
+  let blob: Buffer;
+  try {
+    blob = Buffer.from(b64, "base64");
+  } catch {
+    return null;
+  }
+  // The blob must open with its own algo name (SSH wire format's first string).
+  if (blob.length < 8 || blob.readUInt32BE(0) !== algo.length || blob.subarray(4, 4 + algo.length).toString() !== algo) return null;
+  return { algo, b64, comment: rest.join(" ").slice(0, 200) || undefined };
+}
+
+/** SSH wire pubkey blob → a node KeyObject for verification; null when unparsable. */
+function sshPubKeyToKeyObject(algo: string, data: Buffer): KeyObject | null {
+  let off = 0;
+  const rstr = (): Buffer | null => {
+    if (off + 4 > data.length) return null;
+    const len = data.readUInt32BE(off);
+    off += 4;
+    if (off + len > data.length) return null;
+    const b = data.subarray(off, off + len);
+    off += len;
+    return b;
+  };
+  const mpintB64url = (b: Buffer): string => (b[0] === 0 ? b.subarray(1) : b).toString("base64url");
+  try {
+    if (algo === "ssh-ed25519") {
+      rstr(); // the algo string, redundant with the wire-level algorithm name
+      const raw = rstr();
+      if (!raw || raw.length !== 32) return null;
+      return createPublicKey({ key: { kty: "OKP", crv: "Ed25519", x: raw.toString("base64url") }, format: "jwk" });
+    }
+    if (algo === "ssh-rsa") {
+      rstr(); // the algo string
+      const e = rstr();
+      const n = rstr();
+      if (!e || !n) return null;
+      return createPublicKey({ key: { kty: "RSA", e: mpintB64url(e), n: mpintB64url(n) }, format: "jwk" });
+    }
+    const m = algo.match(/^ecdsa-sha2-nistp(256|384|521)$/);
+    if (m) {
+      rstr(); // the algo string
+      rstr(); // the curve name, redundant with the algo
+      const point = rstr();
+      if (!point || point[0] !== 4) return null;
+      const byteLen = { "256": 32, "384": 48, "521": 66 }[m[1] as "256" | "384" | "521"];
+      if (point.length !== 1 + 2 * byteLen) return null;
+      return createPublicKey({
+        key: { kty: "EC", crv: `P-${m[1]}`, x: point.subarray(1, 1 + byteLen).toString("base64url"), y: point.subarray(1 + byteLen).toString("base64url") },
+        format: "jwk",
+      });
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
 
 export interface SshConfig {
   port?: number;
@@ -122,21 +193,44 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
     let dev: DeviceRecord | null = null; // narrowed alias for the closures below
     client.on("authentication", (ctx) => {
       if (blocked(ip)) return ctx.reject();
+      const id = ctx.username.trim();
+      const rec = /^d_[A-Za-z0-9]+$/.test(id) ? deps.state.deviceById(id) : null;
+      if (ctx.method === "publickey") {
+        // Non-interactive clients (herdr-core's `machine add` shells out to system ssh,
+        // which prefers keys and the agent) log in with a registered public key. ssh2
+        // parses the request; verifying the signature (RFC 4252 §7, `ctx.blob` is the
+        // exact signed bytes) is ours. A request WITHOUT a signature is the client
+        // asking "would you take this key?" — accepting answers PK_OK (ssh2 does that).
+        const pk = ctx as unknown as { key?: { algo: string; data: Buffer }; signature?: Buffer; blob?: Buffer; hashAlgo?: string };
+        const key = pk.key;
+        if (!rec || !key?.data) return ctx.reject();
+        const entry = rec.sshKeys?.find((k) => k.algo === key.algo && Buffer.from(k.b64, "base64").equals(key.data));
+        if (!entry) return ctx.reject(); // agent key not for us: no strike, just no
+        if (!pk.signature) return ctx.accept();
+        const keyObj = sshPubKeyToKeyObject(key.algo, key.data);
+        if (!keyObj || !cryptoVerify(pk.hashAlgo ?? undefined, pk.blob ?? Buffer.alloc(0), keyObj, pk.signature)) {
+          strike(ip);
+          deps.log(`ssh: bad key signature for ${rec.id} from ${ip}`);
+          return ctx.reject();
+        }
+        device = rec;
+        dev = rec;
+        deps.log(`ssh: device ${rec.id} (${rec.name}, ${rec.scope}) authenticated with key ${sshKeyFingerprint(entry.b64)} from ${ip}`);
+        return ctx.accept();
+      }
       if (ctx.method !== "password") {
-        // Only per-device passwords in v0: the phone's "add machine" flow always has a
-        // password field, and a device secret is exactly that.
+        // Per-device passwords (and registered public keys) are the only ways in.
         return ctx.reject();
       }
-      const id = ctx.username.trim();
-      const rec = /^d_[A-Za-z0-9]+$/.test(id) ? deps.state.deviceByCredentials(id, ctx.password ?? "") : null;
-      if (!rec) {
+      const ok = rec ? deps.state.deviceByCredentials(id, ctx.password ?? "") : null;
+      if (!ok) {
         strike(ip);
         deps.log(`ssh: auth failed for "${id.slice(0, 12)}" from ${ip}`);
         return ctx.reject();
       }
-      device = rec;
-      dev = rec;
-      deps.log(`ssh: device ${rec.id} (${rec.name}, ${rec.scope}) authenticated from ${ip}`);
+      device = ok;
+      dev = ok;
+      deps.log(`ssh: device ${ok.id} (${ok.name}, ${ok.scope}) authenticated from ${ip}`);
       ctx.accept();
     });
 

@@ -315,6 +315,96 @@ function renderRoom() {
       keyRow.append(reveal);
     }
     details.append(keyRow);
+
+    // Registered SSH PUBLIC keys: the machine that runs `hc machine add` can then log
+    // in with its key (system ssh prefers keys/agent) — no password prompt, which the
+    // app's non-interactive add screen requires.
+    const keysBlock = document.createElement("div");
+    keysBlock.className = "sshkeys";
+    const keysTitle = document.createElement("p");
+    keysTitle.className = "muted small";
+    keysTitle.textContent = "Public keys — paste the output of `cat ~/.ssh/id_ed25519.pub` from the machine that will add this one:";
+    keysBlock.append(keysTitle);
+    const keyList = document.createElement("div");
+    keysBlock.append(keyList);
+    const addRow = document.createElement("div");
+    addRow.className = "keyrow";
+    const addInput = document.createElement("input");
+    addInput.type = "text";
+    addInput.placeholder = "ssh-ed25519 AAAA… your@machine";
+    addInput.setAttribute("autocomplete", "off");
+    addInput.setAttribute("spellcheck", "false");
+    addInput.className = "pubkey-input";
+    const addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.textContent = "Add key";
+    addBtn.className = "primary";
+    addRow.append(addInput, addBtn);
+    keysBlock.append(addRow);
+    const cfgHint = document.createElement("p");
+    cfgHint.className = "muted small";
+    cfgHint.textContent = `then on that machine: hc machine add ${state.deviceId}@${sshHost}:${port} (add “StrictHostKeyChecking accept-new” for ${sshHost} in ~/.ssh/config to skip the host-key question)`;
+    keysBlock.append(cfgHint);
+    details.append(keysBlock);
+
+    const renderKeys = (keys) => {
+      keyList.replaceChildren();
+      for (const k of keys) {
+        const row = document.createElement("div");
+        row.className = "keyrow";
+        const pre = document.createElement("pre");
+        pre.textContent = `${k.fp} ${k.comment}`.trim();
+        row.append(pre);
+        const rm = document.createElement("button");
+        rm.type = "button";
+        rm.className = "link";
+        rm.textContent = "remove";
+        rm.addEventListener("click", async () => {
+          await fetch(`${cloudBase()}/v1/device/sshkey`, {
+            method: "DELETE",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ device: state.deviceId, deviceSecret: state.deviceSecret, b64: k.b64 }),
+          });
+          loadKeys();
+        });
+        row.append(rm);
+        keyList.append(row);
+      }
+      if (!keys.length) {
+        const none = document.createElement("p");
+        none.className = "muted small";
+        none.textContent = "none yet — password login still works";
+        keyList.append(none);
+      }
+    };
+    const loadKeys = async () => {
+      try {
+        const r = await fetch(`${cloudBase()}/v1/device/sshkey?device=${encodeURIComponent(state.deviceId)}`, {
+          method: "GET",
+          headers: { "content-type": "application/json", "x-herdgate-secret": state.deviceSecret },
+        });
+        if (r.ok) renderKeys((await r.json()).keys ?? []);
+      } catch {
+        /* offline: the section just stays as-is */
+      }
+    };
+    addBtn.addEventListener("click", async () => {
+      const pubkey = addInput.value.trim();
+      if (!pubkey) return;
+      const r = await fetch(`${cloudBase()}/v1/device/sshkey`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ device: state.deviceId, deviceSecret: state.deviceSecret, pubkey }),
+      });
+      if (!r.ok) {
+        addInput.value = "";
+        addInput.placeholder = await r.json().then((b) => b.error ?? "rejected").catch(() => "rejected");
+        return;
+      }
+      addInput.value = "";
+      loadKeys();
+    });
+    loadKeys();
     box.append(details);
   }
 }
