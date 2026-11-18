@@ -86,6 +86,9 @@ resume after reconnect, payload confidentiality on the wire beyond TLS (E2E road
    `agents[]` and the focused ids into a versioned view. Device ops are `view` and `ping`; every other op is
    refused on the host with `read-only`. Next in this line: an `act` op set once per-op policy and audit exist.
 5. **Device PWA** — pairing page + dashboard + frame UI (static files served by the cloud).
+5b. **SSH leg through the gate** — so the Herdr phone app can "add a machine" that points at herdgate, keeping
+   its native SSH flow while herdgate supplies identity and reachability. Needs a transport bridge in front of
+   `hc` and per-device keys; see §8.
 6. **Push wake** — VAPID keys in the cloud; hosts send opaque wake pings.
 7. Multi-account signup, quotas, Postgres state, audit log.
 
@@ -120,6 +123,9 @@ extensions (`docs/plugins.mdx`) and lists in the marketplace (`herdr-plugin` Git
 | `[[actions]]` | `pair`, `status`, `stop` | the human-facing operations, invoked as `herdr plugin action invoke dev.herdgate.host.pair` |
 | `[[panes]]` | `node server/index.mjs pane` | a `split` pane inside Herdr showing honest publish state (light 10s poll) |
 
+Two official surfaces are used, one per program: the **plugin** (§ above, `herdr-plugin.toml`) for the TUI, and
+the **app mod** (§ below, `mods/<name>/`) for the desktop app.
+
 The plugin's only Herdr API is the documented one: `HERDR_BIN_PATH ... api snapshot`. Env it relies on is the
 set Herdr injects (`HERDR_ENV`, `HERDR_BIN_PATH`, `HERDR_SOCKET_PATH`, `HERDR_PLUGIN_ID`, `HERDR_PLUGIN_ROOT`,
 `HERDR_PLUGIN_CONFIG_DIR`, `HERDR_PLUGIN_STATE_DIR`, `HERDR_PLUGIN_CONTEXT_JSON`, …). Nothing is read from a
@@ -131,8 +137,32 @@ it uses Node's global `WebSocket`, so a GitHub `herdr plugin install` of just th
 
 Note on Herdr's moving parts: the **TUI** (`herdr`) exposes workspaces/tabs/panes/agents; **herdr-core** (`hc`)
 is the separate runtime under the Herdr app and its iPhone/iPad/Android app, with a JSON-RPC API of its own.
-The plugin attaches to the TUI's documented CLI. Deciding whether herdgate should also front `hc` is an open
-question (see §9).
+The plugin attaches to the TUI's documented CLI.
+
+### The Herdr app mod (`app-mod/herdgate/`)
+
+The desktop app extends through **mods**, a different official surface (`docs/mods.md`,
+`defaults/AGENTS.md`): `mods/<name>/` with `mod.json` + `main.js`, written in gpui-kit. A mod is trusted code
+with `fetch`, `exec`, and unrestricted network — but **no Node globals** (`process`, `require`, `setTimeout`
+are absent). Verified in a real window: `herdr-app check` passes, `mod.open` reports `overlays:["herdgate"]`
+with `errors: []`, and a probe mod reached a live herdgate cloud with `fetch` (HTTP 200).
+
+The mod and the TUI plugin share one publisher: the mod owns the pairing conversation (mint a code, poll,
+write the token 0600) and shells out to `plugin/server/index.mjs serve` for the long-lived connection. One
+implementation, two surfaces.
+
+### Mobile: over SSH, through herdgate (planned)
+
+The Herdr phone app is closed source and has no extension surface. It talks to `herdr-core` **over SSH** and
+that is the supported path — herdgate does not try to replace it. The intended shape is an **SSH leg through
+the gate**: the phone's SSH target becomes a herdgate endpoint, herdgate authenticates the device with the same
+room/scope model it already has, and forwards the session to `hc` on the host. That keeps the phone on its
+native flow (add a machine, done) while herdgate supplies the identity and the public reachability the phone
+otherwise gets from Tailscale.
+
+This is a **new leg** (`ssh`), not a change to the WebSocket legs: it needs a transport bridge in front of
+`hc` plus per-device keys, and it is scoped after the mod and the PWA (see §6 roadmap). Until it exists, the
+phone reaches a host the way Herdr documents: SSH or a VPN.
 
 ## 9. Herdr-relay comparison (why a new project)
 

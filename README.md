@@ -32,7 +32,8 @@ src/protocol/   the wire contract (envelope, agent leg, device leg)
 src/cloud/      the gateway: stores, pairing, routing, HTTP/WS, CLI (main.ts)
 src/agent/      HerdGateAgent SDK + AgentAdapter (what a host app implements)
 src/host/       standalone host CLI (no Herdr needed) + the `herdr api snapshot` adapter
-plugin/         the Herdr plugin: herdr-plugin.toml + server/ (what `herdr plugin link` loads)
+plugin/         the Herdr TUI plugin: herdr-plugin.toml + server/ (what `herdr plugin link` loads)
+app-mod/        the Herdr app mod: mods/herdgate/ (what `herdr-app check` validates)
 test/           e2e relay, the adapter, and the plugin's own commands
 ```
 
@@ -68,6 +69,18 @@ herdr plugin action list --plugin dev.herdgate.host
 herdr plugin action invoke dev.herdgate.host.pair     # prints the code; approve it
 herdr plugin pane open --plugin dev.herdgate.host --entrypoint status
 ```
+
+**Install as a Herdr app mod** (the desktop app's own surface — `herdr-app check` validates it):
+
+```sh
+cp -r /home/bom/source/herdgate/app-mod/herdgate ~/.config/herdr-app/mods/
+herdr-app check ~/.config/herdr-app/mods/herdgate      # → check passed
+```
+
+The panel docks on the right: set the cloud URL and the herdgate folder, press **Pair**, approve the code in
+your dashboard, then **Publish**. The token goes to `~/.config/herdr-app/herdgate/config/herdgate.env` (0600).
+The mod has `fetch` and `exec` but **no Node globals** (no `process`, `require`, `setTimeout`) — verified in a
+real window.
 
 Herdr then runs the `[[startup]]` hook itself: one publisher per server, read-only, reconnecting on its own.
 Credentials live in `HERDR_PLUGIN_CONFIG_DIR/herdgate.env` (mode 0600), never in the plugin root — the plugin
