@@ -58,6 +58,46 @@ the pairing links shown to hosts.
   protection then. It works with the same code (the gate never trusts CF headers), but adds no value and more
   exposure. Not recommended.
 
+## Rehearse before going live (edge-sim)
+
+`npm run edge` runs a local Cloudflare-edge simulator: TLS termination + `Host` rewrite +
+WebSocket Upgrade splice — byte-for-byte the origin-side job cloudflared does. It lets you
+exercise the public contract (`expectedHost` pinning → 421 on wrong host, the PWA over
+TLS, both wss legs) on this machine, with a throwaway dev cert:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+  -keyout /tmp/edge-key.pem -out /tmp/edge-cert.pem -days 2 -nodes -subj "/CN=127.0.0.1"
+
+HERDGATE_PUBLIC_HOST=gate.local HERDGATE_SSH_PORT=0 npm start          # terminal 1
+HERDGATE_TARGET_PORT=8787 HERDGATE_PINNED_HOST=gate.local \
+  HERDGATE_EDGE_CERT=/tmp/edge-cert.pem HERDGATE_EDGE_KEY=/tmp/edge-key.pem \
+  npm run edge                                                          # terminal 2
+# → https://127.0.0.1:<port>  (trust the cert or pass --ignore-certificate-errors)
+```
+
+Verified by `test/edge.test.ts` and a full headless-Chrome run: sign in → `online` →
+machine online → pair read → live Herdr view + SSH hint, all over TLS with both wss legs
+through the splice.
+
+### A note on `trycloudflare.com` quick tunnels
+
+On this machine, quick tunnels **register** successfully (cloudflared logs `Registered
+tunnel connection`, edge hkg) but the edge answers **404** for the trycloudflare hostname
+from both IPv4 and IPv6, minutes after registration — the data path is blocked somewhere
+between this sandbox and Cloudflare, before our code is ever reached. If you see the same,
+don't debug herdgate: use a named tunnel with your own zone (section B), which terminates
+at your account and behaves predictably. The origin-side configuration is identical
+(plain HTTP to loopback), which is what edge-sim proves locally.
+
+### The SSH leg is not a Cloudflare-TCP leg
+
+Phones speak plain SSH to `host:port`; Cloudflare Tunnel only carries TCP for clients
+running `cloudflared access`, which the phone does not. So the SSH leg's reachability is
+LAN / VPN / Tailscale to the machine running the gate (bind it with
+`HERDGATE_SSH_BIND=0.0.0.0`), or hosting the gate on a VPS later. The HTTP/WSS surface
+(PWA, pairing, publisher) is the part that goes through the tunnel.
+
 ## Keep it running
 
 ```sh

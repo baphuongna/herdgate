@@ -17,6 +17,8 @@ export interface AgentOptions {
   log?: (line: string) => void;
   /** Reconnect bounds (ms). Defaults: 1s..30s, doubling, +0..500ms jitter. */
   backoff?: { minMs?: number; maxMs?: number };
+  /** Passed to the underlying WebSocket (e.g. `rejectUnauthorized` for dev certs). */
+  wsOptions?: Record<string, unknown>;
 }
 
 export class HerdGateAgent {
@@ -80,7 +82,7 @@ export class HerdGateAgent {
 
   #connect(): void {
     if (this.#stop) return;
-    const ws = new WebSocket(this.#o.endpoint, { maxPayload: 256 * 1024 });
+    const ws = new WebSocket(this.#o.endpoint, { maxPayload: 256 * 1024, ...this.#o.wsOptions });
     this.#ws = ws;
     let helloed = false;
 
