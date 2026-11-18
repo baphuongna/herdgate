@@ -20,8 +20,10 @@ Both remote connections are outbound; the cloud gateway binds loopback.
 
 v0.6.0 — gateway (HTTP + 2 WS legs), pairing flows, routing, presence, rate limits, state persistence; agent
 SDK with reconnect; **a real Herdr plugin** (`plugin/`) using Herdr's official extension surface; an app mod,
-a PWA, an SSH leg for the Herdr phone app, and **room-stream resume** — a phone that drops off wifi replays
-what it missed (frames + presence) instead of losing them; 24 tests. Live through a real Cloudflare Tunnel.
+a PWA, an SSH leg for the Herdr phone app, **room-stream resume** — a phone that drops off wifi replays
+what it missed (frames + presence) instead of losing them — and **end-to-end payloads**: Noise_XX between
+device and host inside the opaque channel, so the cloud routes ciphertext it cannot read; 27 tests. All of
+it verified live through a real Cloudflare Tunnel (gate.phuongnb.io.vn).
 
 The Herdr adapter is read-only: it runs `herdr api snapshot` and serves workspaces/tabs/panes/agents/status to
 paired devices. It never reads a pane, sends a keystroke, or prompts an agent. Terminal content is a later

@@ -17,6 +17,63 @@ const CLOUD_KEY = "herdgate.cloud";
 const DEVICE_KEY = "herdgate.device";
 const DEVICE_SECRET_KEY = "herdgate.deviceSecret";
 
+import { DeviceChannel, generateKeyPair, fingerprint } from "/e2e.js";
+
+// E2E payloads: this device's Noise_XX identity (kept locally, never sent to the cloud
+// in the clear) and the host fingerprints it has pinned (TOFU per room).
+const E2E_KEY = "herdgate.e2ekey";
+const e2eFpKey = (roomId) => `herdgate.e2efp.${roomId}`;
+
+async function e2eSelfKey() {
+  try {
+    const v = JSON.parse(localStorage.getItem(E2E_KEY) ?? "null");
+    if (v?.jwk?.kty === "EC" && typeof v.pub === "string") return { jwk: v.jwk, pub: e2eB64d(v.pub) };
+  } catch {
+    /* mint below */
+  }
+  const self = await generateKeyPair();
+  localStorage.setItem(E2E_KEY, JSON.stringify({ jwk: self.jwk, pub: e2eB64e(self.pub) }));
+  return self;
+}
+function e2eB64e(u8) {
+  let s = "";
+  for (const b of u8) s += String.fromCharCode(b);
+  return btoa(s);
+}
+function e2eB64d(s) {
+  const bin = atob(s);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+
+// Per-room channel state; reset when the socket drops. The channel only carries
+// traffic after the host's `e2e.ready` ack — nothing may race the handshake's
+// last step, or the transport counters desync for good.
+const e2e = { ch: null, initing: false, ready: false };
+function e2eReset() {
+  e2e.ch = null;
+  e2e.initing = false;
+  e2e.ready = false;
+}
+
+/** Begin (or restart) the Noise_XX handshake with this room's host. */
+async function e2eBegin() {
+  if (e2e.ch?.ready() || e2e.initing) return;
+  if (!(state.deviceSecret && state.deviceId && state.roomId)) return;
+  if (state.ws?.readyState !== WebSocket.OPEN) return;
+  e2e.initing = true;
+  try {
+    const self = await e2eSelfKey();
+    const ch = new DeviceChannel(self);
+    const init = await ch.begin();
+    e2e.ch = ch;
+    send({ t: "frame", payload: { op: "e2e.init", e: init.e } });
+  } finally {
+    e2e.initing = false;
+  }
+}
+
 // Resume bookkeeping: where this device stopped reading each room's stream, so a
 // reconnect can replay what it missed. Keyed per room; cleared when the cloud
 // says the stream's generation moved (gateway restart) or the state went stale.
@@ -133,6 +190,23 @@ function renderRoom() {
   const room = (state.hello?.agents ?? []).find((r) => r.roomId === state.roomId);
   text("room-name", room?.name || state.roomId);
   text("room-state", room ? (room.online ? "host online" : "host offline") : "unknown room");
+
+  // E2E status: the pinned host fingerprint, or a loud note when it changed.
+  const e2eNote = $("e2e-note");
+  const pinned = state.roomId ? localStorage.getItem(e2eFpKey(state.roomId)) : null;
+  const current = e2e.ch?.ready() && e2e.ready ? e2e.ch.hostFingerprint : null;
+  const shown = current ?? pinned;
+  if (pinned && current && current !== pinned) {
+    e2eNote.hidden = false;
+    e2eNote.className = "error small";
+    e2eNote.textContent = `The host key changed (was ${pinned}, now ${current}). Re-pair if you did not do this.`;
+  } else if (shown) {
+    e2eNote.hidden = false;
+    e2eNote.className = "muted small";
+    e2eNote.textContent = `end-to-end encrypted · host key ${shown}`;
+  } else {
+    e2eNote.hidden = true;
+  }
 
   const box = $("view");
   box.replaceChildren();
@@ -252,12 +326,13 @@ function connect() {
     } catch {
       return;
     }
-    onMessage(m, ws);
+    void onMessage(m, ws);
   });
 
   ws.addEventListener("close", (event) => {
     state.ws = null;
     state.hello = null;
+    e2eReset();
     if (state.closedByUs) return;
     if (event.code === 4001) {
       // The cloud refused the token: do not hammer it, send the person back to sign-in.
@@ -274,7 +349,7 @@ function connect() {
   });
 }
 
-function onMessage(m, ws) {
+async function onMessage(m, ws) {
   // Track the room stream so the next reconnect resumes from here.
   if (typeof m.seq === "number" && (m.t === "frame" || m.t === "presence")) {
     const rid = m.t === "presence" ? m.roomId : state.roomId;
@@ -303,20 +378,53 @@ function onMessage(m, ws) {
       }
       setStatus("online", "good");
       render();
-      if (state.roomId) askView();
+      if (state.roomId) {
+        void e2eBegin();
+        askView();
+      }
       return;
     }
     case "frame": {
       const payload = m.payload;
-      if (payload && typeof payload === "object" && payload.op === "view") {
-        state.view = payload.view;
-        state.viewError = null;
-      } else if (payload && typeof payload === "object" && payload.op === "error") {
-        // The host refused or could not answer: an op we may not use, or its Herdr is down.
-        state.viewError = payload.message ?? payload.code ?? "the host refused";
-        state.view = null;
+      if (payload && typeof payload === "object" && payload.op === "e2e.reply") {
+        await onE2eReply(payload);
+        return;
       }
-      if (state.roomId) renderRoom();
+      if (payload && typeof payload === "object" && payload.op === "e2e.ready") {
+        e2e.ready = true;
+        renderRoom();
+        askView(); // now over the encrypted channel
+        return;
+      }
+      if (payload && typeof payload === "object" && payload.op === "e2e") {
+        if (!e2e.ch?.ready()) return; // ciphertext for a session we do not have
+        let inner;
+        try {
+          inner = await e2e.ch.recv(payload);
+        } catch {
+          // Wrong key or tampered frame: start over rather than show nonsense.
+          e2eReset();
+          void e2eBegin();
+          return;
+        }
+        applyPayload(inner);
+        return;
+      }
+      if (payload && typeof payload === "object" && payload.code === "e2e" && e2e.ch) {
+        // The host dropped our session (decrypt failed there): renegotiate.
+        e2eReset();
+        void e2eBegin();
+        return;
+      }
+      if (payload && typeof payload === "object" && payload.op === "view" && e2e.ch?.ready() && e2e.ready) {
+        // Plaintext view while an encrypted session is up: the host lost its side —
+        // renegotiate (its publisher restarted).
+        e2eReset();
+        void e2eBegin();
+        applyPayload(payload);
+        return;
+      }
+      applyPayload(payload);
       return;
     }
     case "pair.granted": {
@@ -331,6 +439,7 @@ function onMessage(m, ws) {
       state.roomId = m.device?.roomId ?? state.roomId;
       closePair();
       render();
+      void e2eBegin();
       askView();
       return;
     }
@@ -366,10 +475,48 @@ function retryLater() {
   setTimeout(connect, wait);
 }
 
-/** Ask the host for its view: the only op this app ever sends. */
-function askView() {
+/** Ask the host for its view: the only op this app ever sends (encrypted when up). */
+async function askView() {
   if (state.ws?.readyState !== WebSocket.OPEN || !state.roomId) return;
-  state.ws.send(JSON.stringify({ v: 1, t: "frame", payload: { op: "view" } }));
+  if (e2e.ch?.ready() && e2e.ready) {
+    send({ t: "frame", payload: await e2e.ch.send({ op: "view" }) });
+    return;
+  }
+  void e2eBegin(); // establish in the background; the ack path asks again over it
+  send({ t: "frame", payload: { op: "view" } });
+}
+function applyPayload(payload) {
+  // The plaintext (or decrypted) payload from the host lands here.
+  if (payload && typeof payload === "object" && payload.op === "view") {
+    state.view = payload.view;
+    state.viewError = null;
+  } else if (payload && typeof payload === "object" && payload.op === "error") {
+    // The host refused or could not answer: an op we may not use, or its Herdr is down.
+    state.viewError = payload.message ?? payload.code ?? "the host refused";
+    state.view = null;
+  }
+  if (state.roomId) renderRoom();
+}
+
+/** The host answered our handshake: finish it, pin its fingerprint (TOFU). */
+async function onE2eReply(payload) {
+  const ch = e2e.ch;
+  if (!ch) return;
+  try {
+    const finish = await ch.acceptReply(payload);
+    send({ t: "frame", payload: { op: "e2e.finish", c: finish.c } });
+  } catch {
+    e2eReset();
+    return;
+  }
+  const fp = ch.hostFingerprint;
+  if (fp && state.roomId) {
+    const stored = localStorage.getItem(e2eFpKey(state.roomId));
+    if (!stored) localStorage.setItem(e2eFpKey(state.roomId), fp);
+    renderRoom();
+  }
+  // The channel is up: ask for the view over it.
+  askView();
 }
 
 function send(message) {

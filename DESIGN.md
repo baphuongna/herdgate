@@ -94,8 +94,12 @@ What v0 does **not** promise: per-device secrets (account token = device identit
    the account token stays in the dashboard only (and is never an SSH credential).
 2. ~~**Resume**~~ — **done (v0.6.0)**: room streams with `seq`/`gen`, a bounded replay buffer, gap declaration;
    see §3. Ciphertext-friendly by construction (the buffer stores opaque envelopes).
-3. **E2E payloads** — Noise_XX at pair time (device ↔ host key exchange), `payload` becomes a ciphertext
-   string; the cloud is already a dumb router, so nothing changes server-side.
+3. ~~**E2E payloads**~~ — **done (v0.7.0)**: Noise_XX (P-256/SHA-256/AES-256-GCM, WebCrypto-only so the
+   plugin and the PWA run one identical module) over the payload channel; the device initiates after
+   pairing, the host acks with `e2e.ready` (nothing encrypts before the ack — a frame racing the
+   handshake's last step would desync the counters forever), and a decrypt failure drops the session for
+   renegotiation. Host static key is TOFU: the device pins its fingerprint and screams if it changes.
+   See DESIGN §3 and `plugin/server/e2e.mjs`.
 4. ~~**Official Herdr adapter**~~ — **done (v0.1.0)**, read-only. `src/host/herdr.ts` runs
    `herdr api snapshot` (verified on Herdr 0.9.5, protocol 22) and maps `workspaces[]`, `tabs[]`, `panes[]`,
    `agents[]` and the focused ids into a versioned view. Device ops are `view` and `ping`; every other op is

@@ -12,6 +12,7 @@ import { join, dirname } from "node:path";
 import { hostname } from "node:os";
 import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize } from "./common.mjs";
 import { createSshBridge } from "./ssh.mjs";
+import { HostChannel, b64d, b64e, fingerprint, generateKeyPair } from "./e2e.mjs";
 
 const D = dirs();
 const NAME = process.env.HERDGATE_HOST_NAME || hostname();
@@ -165,9 +166,78 @@ async function publisherLoop() {
   };
 
   let wsRef = null;
+
+  // ---- E2E payloads: the host speaks Noise_XX to every paired device ----
+  // Handshake + transport live inside frame.payload; the cloud routes them blind.
+  // A device that has not completed the handshake keeps working in the clear —
+  // the plaintext path stays the compat fallback.
+  const e2eKeyPath = D.stateDir ? join(D.stateDir, "e2e-host.json") : "";
+  let e2eSelf = null;
+  const e2eSelfKey = async () => {
+    if (e2eSelf) return e2eSelf;
+    try {
+      const j = JSON.parse(readFileSync(e2eKeyPath, "utf8"));
+      e2eSelf = { jwk: j.jwk, pub: b64d(j.pub) };
+      return e2eSelf;
+    } catch {
+      /* mint a fresh identity below */
+    }
+    e2eSelf = await generateKeyPair();
+    try {
+      mkdirSync(dirname(e2eKeyPath), { recursive: true });
+      writeFileSync(e2eKeyPath, JSON.stringify({ jwk: e2eSelf.jwk, pub: b64e(e2eSelf.pub) }), { mode: 0o600 });
+    } catch (e) {
+      log(`e2e: could not persist host key (${e instanceof Error ? e.message : String(e)})`);
+    }
+    return e2eSelf;
+  };
+  const e2eSessions = new Map(); // deviceId → HostChannel
+  /** null = not an e2e payload; {reply} = handshake answer to send; {inner} = decrypted device payload. */
+  const e2eOnDevice = async (device, payload) => {
+    if (payload && typeof payload === "object" && typeof payload.op === "string" && payload.op.startsWith("e2e")) log(`e2e: op ${payload.op} from ${device}`);
+    if (!payload || typeof payload !== "object") return null;
+    if (payload.op === "e2e.init") {
+      const ch = new HostChannel(await e2eSelfKey());
+      e2eSessions.set(device, ch);
+      return { reply: { op: "e2e.reply", ...(await ch.acceptInit(payload)) } };
+    }
+    if (payload.op === "e2e.finish") {
+      const ch = e2eSessions.get(device);
+      if (!ch) return { reply: { op: "error", code: "e2e", message: "no handshake in progress" } };
+      await ch.acceptFinish(payload);
+      log(`e2e: session up with ${device} (host fp ${fingerprint((await e2eSelfKey()).pub)})`);
+      // The ack is the start signal: the device encrypts nothing before it, so no
+      // transport frame can race the handshake's last step and desync the counters.
+      return { reply: { op: "e2e.ready" } };
+    }
+    if (payload.op === "e2e") {
+      const ch = e2eSessions.get(device);
+      if (!ch?.ready()) return { reply: { op: "error", code: "e2e", message: "no session" } };
+      try {
+        return { inner: await ch.recv(payload) };
+      } catch {
+        // A decrypt failure means the counters can never resync: drop the session and
+        // make the device renegotiate.
+        e2eSessions.delete(device);
+        log(`e2e: dropped session with ${device} (decrypt failed — renegotiate)`);
+        return { reply: { op: "error", code: "e2e", message: "session dropped — renegotiate" } };
+      }
+    }
+    return null;
+  };
+  /** Encrypt for this device when a session exists; passthrough otherwise. */
+  const e2eToDevice = async (device, payload) => {
+    const ch = e2eSessions.get(device);
+    return ch?.ready() ? ch.send(payload) : payload;
+  };
+
   const ssh = createSshBridge({
     send: (device, payload) => {
-      if (wsRef && wsRef.readyState === 1) wsRef.send(JSON.stringify({ v: 1, t: "frame", device, payload }));
+      void (async () => {
+        if (wsRef && wsRef.readyState === 1) {
+          wsRef.send(JSON.stringify({ v: 1, t: "frame", device, payload: await e2eToDevice(device, payload) }));
+        }
+      })();
     },
     scopeOf: (device) => devices.find((d) => d.id === device)?.scope ?? null,
     log,
@@ -176,7 +246,9 @@ async function publisherLoop() {
     if (ws.readyState !== 1 || devices.length === 0) return;
     const payload = await snapshotPayload();
     if (!payload) return;
-    for (const d of devices) ws.send(JSON.stringify({ v: 1, t: "frame", device: d.id, payload }));
+    for (const d of devices) {
+      ws.send(JSON.stringify({ v: 1, t: "frame", device: d.id, payload: await e2eToDevice(d.id, payload) }));
+    }
   };
 
   const connect = () => {
@@ -187,6 +259,8 @@ async function publisherLoop() {
       ws.send(JSON.stringify({ v: 1, t: "hello", roomToken: token, info: { name: NAME, version: "0.1.0", capabilities: ["dev.herdgate.host", "read-only"] } }));
     };
     ws.onmessage = (ev) => {
+      void (async () => {
+        try {
       let m;
       try {
         m = JSON.parse(typeof ev.data === "string" ? ev.data : String(ev.data));
@@ -210,21 +284,32 @@ async function publisherLoop() {
         return;
       }
       if (m.t === "frame") {
-        // SSH-leg ops are the bridge's; everything else: only `view` and `ping` exist.
-        const op = m.payload && typeof m.payload === "object" ? m.payload.op : undefined;
-        if (typeof op === "string" && op.startsWith("ssh.")) {
+        // SSH-leg ops are the bridge's; e2e ops are the crypto bridge's; everything
+        // else: only `view` and `ping` exist. Encrypted devices unwrap first.
+        const rawOp = m.payload && typeof m.payload === "object" ? m.payload.op : undefined;
+        if (typeof rawOp === "string" && rawOp.startsWith("ssh.")) {
           ssh.handle(m.device, m.payload);
           return;
         }
-        const replyTo = (payload) => ws.send(JSON.stringify({ v: 1, t: "frame", device: m.device, payload }));
-        if (op === "ping") return replyTo({ op: "pong", n: m.payload.n ?? null, at: new Date().toISOString() });
+        const unwrapped = await e2eOnDevice(m.device, m.payload);
+        if (unwrapped) {
+          if (unwrapped.reply !== null && unwrapped.reply !== undefined) {
+            ws.send(JSON.stringify({ v: 1, t: "frame", device: m.device, payload: unwrapped.reply }));
+          }
+          if (unwrapped.inner === undefined) return; // handshake bookkeeping
+        }
+        const payload = unwrapped?.inner ?? m.payload;
+        const op = payload && typeof payload === "object" ? payload.op : undefined;
+        const replyTo = async (out) => {
+          ws.send(JSON.stringify({ v: 1, t: "frame", device: m.device, payload: await e2eToDevice(m.device, out) }));
+        };
+        if (op === "ping") return void replyTo({ op: "pong", n: payload.n ?? null, at: new Date().toISOString() });
         if (op === "view") {
           // Answer this device now, even if the view has not changed since the last push.
           lastSig = "";
           return void publish(ws);
         }
-        replyTo({ op: "error", code: "read-only", message: `dev.herdgate.host has no op ${String(op)}` });
-        return;
+        return void replyTo({ op: "error", code: "read-only", message: `dev.herdgate.host has no op ${String(op)}` });
       }
       if (m.t === "pair.request") {
         // Read-only plugin: `act` is never granted.
@@ -232,6 +317,10 @@ async function publisherLoop() {
         return;
       }
       if (m.t === "ping") ws.send(JSON.stringify({ v: 1, t: "pong", n: m.n ?? 0 }));
+      } catch (e) {
+        log(`frame handler: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      })().catch(() => {});
     };
     ws.onclose = () => {
       if (timer) clearInterval(timer);
