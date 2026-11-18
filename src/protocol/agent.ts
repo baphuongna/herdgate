@@ -41,7 +41,11 @@ export interface AgentPing {
   t: "ping";
   n: number;
 }
-export type AgentToCloud = AgentHello | AgentFrame | AgentPresence | PairResponse | AgentPing;
+export interface AgentWake {
+  t: "wake";
+  device: string;
+}
+export type AgentToCloud = AgentHello | AgentFrame | AgentPresence | PairResponse | AgentPing | AgentWake;
 
 // ---- cloud → agent ----
 

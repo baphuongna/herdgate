@@ -441,6 +441,7 @@ async function onMessage(m, ws) {
       render();
       void e2eBegin();
       askView();
+      void subscribePush();
       return;
     }
     case "pair.denied": {
@@ -496,6 +497,35 @@ function applyPayload(payload) {
     state.view = null;
   }
   if (state.roomId) renderRoom();
+}
+
+// ---- push wake ---------------------------------------------------------------
+
+/** Subscribe this device to silent wake pushes; ask for permission only once paired. */
+async function subscribePush() {
+  if (!(state.deviceSecret && state.deviceId)) return; // paired devices only
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      const keyRes = await fetch(`${cloudBase()}/v1/push/key`);
+      if (!keyRes.ok) return; // push disabled on this cloud
+      const { publicKey } = await keyRes.json();
+      const raw = Uint8Array.from(atob(publicKey.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+      sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: raw });
+    }
+    const endpoint = sub.endpoint;
+    if (state.pushEndpoint === endpoint) return;
+    state.pushEndpoint = endpoint;
+    await fetch(`${cloudBase()}/v1/device/push`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ device: state.deviceId, deviceSecret: state.deviceSecret, endpoint }),
+    });
+  } catch {
+    /* permission denied or push unavailable: the gate still works without it */
+  }
 }
 
 /** The host answered our handshake: finish it, pin its fingerprint (TOFU). */

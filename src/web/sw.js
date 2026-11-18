@@ -3,7 +3,7 @@
 //
 // Bump VERSION when a shell file changes; old caches are dropped on activate.
 
-const VERSION = "herdgate-v3";
+const VERSION = "herdgate-v4";
 const SHELL = ["/", "/app.css", "/e2e.js", "/app.js", "/app.webmanifest", "/icons/icon.svg"];
 
 self.addEventListener("install", (event) => {
@@ -24,6 +24,37 @@ self.addEventListener("activate", (event) => {
       .keys()
       .then((keys) => Promise.all(keys.filter((k) => k !== VERSION).map((k) => caches.delete(k))))
       .then(() => self.clients.claim()),
+  );
+});
+
+// Push wake: the cloud sends a silent, payload-less ping (VAPID) when the host has
+// news and this device is away. If a window is already open its socket reconnects on
+// its own — otherwise raise a notification that opens the app.
+self.addEventListener("push", (event) => {
+  event.waitUntil(
+    (async () => {
+      const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      if (all.length > 0) {
+        for (const client of all) client.postMessage({ t: "wake" });
+        return;
+      }
+      await self.registration.showNotification("herdgate", {
+        body: "Có hoạt động mới trên máy của bạn — chạm để mở.",
+        tag: "herdgate-wake",
+        renotify: true,
+      });
+    })(),
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  event.waitUntil(
+    (async () => {
+      const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      for (const client of all) if ("focus" in client) return client.focus();
+      return self.clients.openWindow("/");
+    })(),
   );
 });
 

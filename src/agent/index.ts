@@ -59,6 +59,11 @@ export class HerdGateAgent {
     this.#send({ t: "frame", device, payload } satisfies AgentToCloud);
   }
 
+  /** Ask the cloud to push-wake a device that is not connected (silent, no payload). */
+  wake(device: string): void {
+    this.#send({ t: "wake", device } satisfies AgentToCloud);
+  }
+
   presence(online: boolean, detail?: string): void {
     this.#send({ t: "presence", online, detail } satisfies AgentToCloud);
   }

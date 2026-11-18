@@ -16,7 +16,7 @@
  * Payload rule: `frame.payload` is routed, never parsed (see protocol/envelope.ts).
  */
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer, request, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import {
   decode,
@@ -35,6 +35,7 @@ import { type Account, type DeviceRecord, type RoomRecord, State } from "./store
 import { readJsonBody, randomId, sameSecret, sha256Hex } from "./util.ts";
 import { serveStatic } from "./static.ts";
 import { startSshd, type SshHandle, type SshConfig } from "./sshd.ts";
+import { endpointTag, vapidHeader, type VapidKeys } from "./vapid.ts";
 
 export interface CloudConfig {
   accounts: { id: string; name: string; token: string }[];
@@ -50,6 +51,8 @@ export interface CloudConfig {
   webRoot?: string;
   /** The SSH leg phones dial. `port: 0` disables. */
   ssh?: SshConfig;
+  /** VAPID keys for silent wake pushes; omit to disable the push endpoints. */
+  push?: { keys: VapidKeys; /** mailto contact required by the VAPID spec. */ sub: string } | null;
   log?: (line: string) => void;
 }
 
@@ -118,6 +121,35 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     }
     return s;
   };
+  /** Silent wake push to a device's stored endpoint (VAPID, no payload). */
+  const wakeDevice = (deviceId: string): void => {
+    const push = cfg.push;
+    const endpoint = state.deviceById(deviceId)?.push?.endpoint;
+    if (!push || !endpoint) return;
+    const u = new URL(endpoint);
+    const req = request(
+      {
+        protocol: u.protocol,
+        hostname: u.hostname,
+        port: u.port || (u.protocol === "https:" ? 443 : 80),
+        path: `${u.pathname}${u.search}`,
+        method: "POST",
+        headers: {
+          TTL: "60",
+          Urgency: "normal",
+          "content-length": "0",
+          Authorization: vapidHeader(endpoint, push.keys, push.sub),
+        },
+      },
+      (res) => {
+        res.resume();
+        if (res.statusCode && res.statusCode >= 400) log(`push: wake ${endpointTag(endpoint)} answered ${res.statusCode}`);
+      },
+    );
+    req.on("error", (e) => log(`push: wake ${endpointTag(endpoint)} failed (${e instanceof Error ? e.message : String(e)})`));
+    req.end();
+  };
+
   const streamEmit = (roomId: string, msg: Record<string, unknown>): void => {
     const s = streamOf(roomId);
     s.seq += 1;
@@ -325,6 +357,18 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
           if (!requestId || !resolve) return fail(ws, "bad-message", "unknown requestId");
           pendingPairs.delete(requestId);
           resolve(m.ok === true);
+          return;
+        }
+        case "wake": {
+          // The host asks for a phone to be woken: deliver a silent push only if the
+          // device is not connected right now (a connected one is already live).
+          if (!cfg.push) return fail(ws, "no-push", "push is not configured");
+          const deviceId = typeof m.device === "string" ? m.device : null;
+          if (!deviceId) return fail(ws, "bad-message", "wake.device");
+          const rec = state.deviceById(deviceId);
+          if (!rec || rec.roomId !== room.id) return fail(ws, "no-such-device", "not one of this room's devices");
+          if ([...deviceConns].some((c) => c.device?.id === deviceId)) return;
+          wakeDevice(deviceId);
           return;
         }
         case "ping":
@@ -594,6 +638,40 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       const st = codes.status(statusMatch[1]);
       if (st.status === "unknown") return json(res, 404, { status: st.status });
       return json(res, 200, st);
+    }
+
+    if (cfg.push && req.method === "GET" && path === "/v1/push/key") {
+      return json(res, 200, { publicKey: cfg.push.keys.publicBase64Url });
+    }
+    if (cfg.push && path === "/v1/device/push") {
+      if (blocked(ipOf(req))) return json(res, 429, { error: "rate limited" });
+      // Two identities, same as the WS leg: the paired device (id + its own secret in
+      // the body) or the owner (account token in Authorization, device id in the body).
+      return void readJsonBody(req).then((body) => {
+        const deviceId = typeof body?.device === "string" ? body.device : "";
+        const deviceSecret = typeof body?.deviceSecret === "string" ? body.deviceSecret : "";
+        let device: DeviceRecord | null = deviceId && deviceSecret ? state.deviceByCredentials(deviceId, deviceSecret) : null;
+        if (!device) {
+          const account = accountByAuth(req);
+          if (!account) return json(res, 401, { error: "device credentials or account token required" });
+          device = deviceId ? state.deviceById(deviceId) : null;
+          if (!device || device.accountId !== account.id) return json(res, 403, { error: "not one of this account's devices" });
+        }
+        if (req.method === "DELETE") {
+          state.setDevicePush(device.id, null);
+          return json(res, 200, { ok: true });
+        }
+        const endpoint = typeof body?.endpoint === "string" ? body.endpoint.trim().slice(0, 2048) : "";
+        let u: URL;
+        try {
+          u = new URL(endpoint);
+        } catch {
+          return json(res, 400, { error: "bad endpoint" });
+        }
+        if (u.protocol !== "https:" && u.protocol !== "http:") return json(res, 400, { error: "bad endpoint" });
+        state.setDevicePush(device.id, endpoint);
+        return json(res, 200, { ok: true });
+      });
     }
 
     // The PWA, same-origin with the WS legs. Only GET/HEAD, and only after the API

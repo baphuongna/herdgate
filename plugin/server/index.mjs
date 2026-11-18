@@ -158,10 +158,13 @@ async function publisherLoop() {
     }
     const sig = JSON.stringify([snap?.workspaces, snap?.agents, snap?.focused_workspace_id]);
     const summary = summarize(snap);
+    let changed = false;
     if (sig !== lastSig) {
+      changed = true;
       lastSig = sig;
       writeState(D.statePath, { lastPublish: { at: new Date().toISOString(), summary } });
     }
+    if (changed) wakeAway(true);
     return { op: "view", view: { v: 1, source: "herdr", takenAt: new Date().toISOString(), summary } };
   };
 
@@ -248,6 +251,20 @@ async function publisherLoop() {
     if (!payload) return;
     for (const d of devices) {
       ws.send(JSON.stringify({ v: 1, t: "frame", device: d.id, payload: await e2eToDevice(d.id, payload) }));
+    }
+  };
+
+  /** Wake phones that are away when something actually changed (throttled per device). */
+  const lastWake = new Map(); // deviceId → epoch ms
+  const wakeAway = (changed) => {
+    if (!changed) return;
+    const now = Date.now();
+    for (const d of devices) {
+      if (d.connected !== false) continue;
+      const at = lastWake.get(d.id) ?? 0;
+      if (now - at < 5 * 60_000) continue;
+      lastWake.set(d.id, now);
+      if (wsRef && wsRef.readyState === 1) wsRef.send(JSON.stringify({ v: 1, t: "wake", device: d.id }));
     }
   };
 

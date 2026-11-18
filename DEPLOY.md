@@ -117,6 +117,35 @@ LAN / VPN / Tailscale to the machine running the gate (bind it with
 
 ## Keep it running
 
+On this machine (Linux + systemd) a user unit keeps the gate up; the tunnel is a second unit:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/herdgate.service <<'UNIT'
+[Unit]
+Description=herdgate cloud relay hub
+After=network-online.target
+
+[Service]
+ExecStart=/home/bom/.nvm/versions/node/v22.23.1/bin/node /home/bom/source/herdgate/src/cloud/main.ts
+Environment=HERDGATE_ACCOUNT_TOKEN=change-me
+Environment=HERDGATE_PUBLIC_HOST=gate.phuongnb.io.vn
+Environment=HERDGATE_PORT=8833
+Environment=HERDGATE_STATE=/home/bom/.local/state/herdgate/state.json
+WorkingDirectory=/home/bom/source/herdgate
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+UNIT
+systemctl --user daemon-reload && systemctl --user enable --now herdgate
+# tunnel:  cloudflared --config ~/.cloudflared/herdgate.yml tunnel run herdgate
+#   (a second unit wrapping that line, same shape)
+```
+
+Other platforms:
+
 ```sh
 # launchd agent sketch (adjust paths); or use tmux/systemd-in-wsl as you prefer
 cat > ~/Library/LaunchAgents/dev.herdgate.cloud.plist <<'PLIST'

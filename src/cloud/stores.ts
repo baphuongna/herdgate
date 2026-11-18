@@ -36,6 +36,8 @@ export interface DeviceRecord {
   created: string;
   /** sha256 of the device's own secret; the plaintext exists only at pair time. */
   secretHash?: string;
+  /** The device's web-push subscription endpoint for silent wake pings (VAPID). */
+  push?: { endpoint: string; at: string };
 }
 
 interface StateFile {
@@ -111,6 +113,16 @@ export class State {
 
   deviceById(id: string): DeviceRecord | null {
     return this.devices.find((d) => d.id === id) ?? null;
+  }
+
+  /** Remember (or forget, with a null endpoint) where to wake a device. */
+  setDevicePush(id: string, endpoint: string | null): boolean {
+    const d = this.deviceById(id);
+    if (!d) return false;
+    d.push = endpoint ? { endpoint, at: new Date().toISOString() } : undefined;
+    if (!endpoint) delete d.push;
+    this.#save();
+    return true;
   }
 
   /** A paired device presenting its own secret (not the account token). */
