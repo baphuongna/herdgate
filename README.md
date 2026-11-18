@@ -18,8 +18,8 @@ Both remote connections are outbound; the cloud gateway binds loopback.
 
 ## Status
 
-v0.1.0 — gateway (HTTP + 2 WS legs), pairing flows, routing, presence, rate limits, state persistence; agent
-SDK with reconnect; **host adapter for official [Herdr](https://herdr.dev)**; 6 tests.
+v0.2.0 — gateway (HTTP + 2 WS legs), pairing flows, routing, presence, rate limits, state persistence; agent
+SDK with reconnect; **a real Herdr plugin** (`plugin/`) using Herdr's official extension surface; 11 tests.
 
 The Herdr adapter is read-only: it runs `herdr api snapshot` and serves workspaces/tabs/panes/agents/status to
 paired devices. It never reads a pane, sends a keystroke, or prompts an agent. Terminal content is a later
@@ -31,8 +31,9 @@ slice, by design. No third-party plugin or relay is a dependency — only Herdr'
 src/protocol/   the wire contract (envelope, agent leg, device leg)
 src/cloud/      the gateway: stores, pairing, routing, HTTP/WS, CLI (main.ts)
 src/agent/      HerdGateAgent SDK + AgentAdapter (what a host app implements)
-src/host/       the Herdr host: adapter over `herdr api snapshot` + CLI (main.ts)
-test/           e2e relay, plus the Herdr adapter against upstream snapshot shapes
+src/host/       standalone host CLI (no Herdr needed) + the `herdr api snapshot` adapter
+plugin/         the Herdr plugin: herdr-plugin.toml + server/ (what `herdr plugin link` loads)
+test/           e2e relay, the adapter, and the plugin's own commands
 ```
 
 ## Quickstart
@@ -59,7 +60,21 @@ curl localhost:8787/v1/agent/code/XXXX/status                            # → {
 A device opens `ws://…/v1/device/ws`, sends `hello {accountToken}`, calls `pair.begin` — `read` pairs at once,
 `act` waits for the host to answer `pair.request`.
 
-**Run the host** (on the machine where Herdr runs — pair once, then keep it running):
+**Install as a Herdr plugin** (the supported surface — `herdr plugin link` validates the manifest):
+
+```sh
+herdr plugin link /home/bom/source/herdgate/plugin
+herdr plugin action list --plugin dev.herdgate.host
+herdr plugin action invoke dev.herdgate.host.pair     # prints the code; approve it
+herdr plugin pane open --plugin dev.herdgate.host --entrypoint status
+```
+
+Herdr then runs the `[[startup]]` hook itself: one publisher per server, read-only, reconnecting on its own.
+Credentials live in `HERDR_PLUGIN_CONFIG_DIR/herdgate.env` (mode 0600), never in the plugin root — the plugin
+uses only env Herdr injects (`HERDR_BIN_PATH`, `HERDR_PLUGIN_CONFIG_DIR`, `HERDR_PLUGIN_STATE_DIR`, …) and
+needs no `node_modules` (Node's global `WebSocket`).
+
+**Or run the host standalone** (no Herdr, its own process):
 
 ```sh
 HERDGATE_URL=https://herd.example.com HERDGATE_PROVISION=1 npm run host

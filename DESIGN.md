@@ -108,7 +108,33 @@ empty/honest value rather than throwing.
 Pairing `act` is off unless the operator sets `HERDGATE_ALLOW_ACT=1`; the read-only op set means even an `act`
 device has nothing to cause an effect with yet.
 
-## 8. Herdr-relay comparison (why a new project)
+## 8. How herdgate attaches to Herdr (official surface only)
+
+Herdr is not forked, patched, or re-implemented. herdgate is a **Herdr plugin**: a directory with
+`herdr-plugin.toml` whose commands Herdr validates, launches, and logs — the surface Herdr documents for
+extensions (`docs/plugins.mdx`) and lists in the marketplace (`herdr-plugin` GitHub topic, `/tui/plugins/`).
+
+| Manifest entry | Command | Why |
+|---|---|---|
+| `[[startup]]` | `node server/index.mjs serve` | Herdr runs it once after the socket API is ready; it spawns the long-lived publisher and exits, so a failed publisher cannot fail the Herdr server |
+| `[[actions]]` | `pair`, `status`, `stop` | the human-facing operations, invoked as `herdr plugin action invoke dev.herdgate.host.pair` |
+| `[[panes]]` | `node server/index.mjs pane` | a `split` pane inside Herdr showing honest publish state (light 10s poll) |
+
+The plugin's only Herdr API is the documented one: `HERDR_BIN_PATH ... api snapshot`. Env it relies on is the
+set Herdr injects (`HERDR_ENV`, `HERDR_BIN_PATH`, `HERDR_SOCKET_PATH`, `HERDR_PLUGIN_ID`, `HERDR_PLUGIN_ROOT`,
+`HERDR_PLUGIN_CONFIG_DIR`, `HERDR_PLUGIN_STATE_DIR`, `HERDR_PLUGIN_CONTEXT_JSON`, …). Nothing is read from a
+private Herdr path and nothing patches Herdr.
+
+Credentials go in `HERDR_PLUGIN_CONFIG_DIR` (user-editable, never in `HERDR_PLUGIN_ROOT`, which is a managed
+source checkout); runtime state goes in `HERDR_PLUGIN_STATE_DIR`. The plugin has no `node_modules` dependency:
+it uses Node's global `WebSocket`, so a GitHub `herdr plugin install` of just this directory works.
+
+Note on Herdr's moving parts: the **TUI** (`herdr`) exposes workspaces/tabs/panes/agents; **herdr-core** (`hc`)
+is the separate runtime under the Herdr app and its iPhone/iPad/Android app, with a JSON-RPC API of its own.
+The plugin attaches to the TUI's documented CLI. Deciding whether herdgate should also front `hc` is an open
+question (see §9).
+
+## 9. Herdr-relay comparison (why a new project)
 
 herdr-relay: Mac-local bridge, Tailscale identity, renders Herdr's mods in sandboxed processes, diffs trees
 bridge-side. herdgate: the cloud in the middle, own identity, host renders, cloud routes opaque frames. The

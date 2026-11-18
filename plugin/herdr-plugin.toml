@@ -1,0 +1,36 @@
+id = "dev.herdgate.host"
+name = "herdgate"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Publish this Herdr session to your own devices through a herdgate cloud relay (read-only by default)."
+platforms = ["linux", "macos"]
+
+# One long-lived publisher per Herdr server. Herdr runs startup hooks once the
+# socket API is ready, and again after a live handoff; the process reconnects on
+# its own if the network drops. `idempotent` keeps a second invocation from
+# starting a competing publisher (one agent per room on the cloud side).
+[[startup]]
+command = ["node", "server/index.mjs", "serve"]
+
+[[actions]]
+id = "status"
+title = "herdgate: show pairing status"
+command = ["node", "server/index.mjs", "status"]
+
+[[actions]]
+id = "pair"
+title = "herdgate: pair this Herdr to a cloud"
+command = ["node", "server/index.mjs", "pair"]
+
+[[actions]]
+id = "stop"
+title = "herdgate: stop publishing"
+command = ["node", "server/index.mjs", "stop"]
+
+# The pane is the surface inside Herdr: honest state of the publish lane, and
+# the pairing code when one is waiting to be approved.
+[[panes]]
+id = "status"
+title = "herdgate"
+placement = "split"
+command = ["node", "server/index.mjs", "pane"]
