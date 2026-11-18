@@ -82,13 +82,30 @@ through the splice.
 
 ### A note on `trycloudflare.com` quick tunnels
 
-On this machine, quick tunnels **register** successfully (cloudflared logs `Registered
-tunnel connection`, edge hkg) but the edge answers **404** for the trycloudflare hostname
-from both IPv4 and IPv6, minutes after registration — the data path is blocked somewhere
-between this sandbox and Cloudflare, before our code is ever reached. If you see the same,
-don't debug herdgate: use a named tunnel with your own zone (section B), which terminates
-at your account and behaves predictably. The origin-side configuration is identical
-(plain HTTP to loopback), which is what edge-sim proves locally.
+On this machine, quick tunnels **register** but the edge answers **404** for the
+trycloudflare hostname from both IPv4 and IPv6 — the free-for-all hostname space is
+blocked somewhere between this machine and Cloudflare. **Named tunnels on your own zone
+do not have this problem**: `gate.phuongnb.io.vn` (tunnel `herdgate`, id `dfc578ef`) is
+live — PWA + CSP through the edge, owner + host wss legs through the edge, pairing and
+the live Herdr view all verified in headless Chrome with the real Cloudflare cert (no
+`--ignore-certificate-errors`). The live recipe on this machine:
+
+```sh
+cloudflared tunnel create herdgate
+cloudflared tunnel route dns -f <tunnel-uuid> gate.phuongnb.io.vn   # -f overwrites; the
+    # bare form once logged the WRONG tunnel id (fell back to config.yml) — always pass
+    # the UUID and check the log line says your tunnel id
+# ~/.cloudflared/herdgate.yml  →  ingress gate.phuongnb.io.vn → http://127.0.0.1:8833
+HERDGATE_PUBLIC_HOST=gate.phuongnb.io.vn HERDGATE_PORT=8833 HERDGATE_SSH_PORT=2299 npm start
+cloudflared --config ~/.cloudflared/herdgate.yml tunnel run herdgate
+```
+
+Gotchas hit along the way: port 8787 was already taken by the hermes webui (the old
+`config.yml` routes `hermes.phuongnb.io.vn` there — an ingress clash would silently serve
+the wrong app through our hostname), and running the gateway script without `&` in a
+shell helper blocks forever. Local `curl http://127.0.0.1:8833/` returns **421** by
+design — the gateway pins `Host: gate.phuongnb.io.vn`; that is the pinning contract
+working, not a bug.
 
 ### The SSH leg is not a Cloudflare-TCP leg
 
