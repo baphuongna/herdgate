@@ -107,6 +107,9 @@ What v0 does **not** promise: per-device secrets (account token = device identit
 5. **Device PWA** — pairing page + dashboard + frame UI (static files served by the cloud).
 5b. ~~**SSH leg through the gate**~~ — **done (v0.5.0)**; see §8. Follow-ups: publickey auth, framed/live
    terminals for `read` devices via an observe-only proxy.
+5c. ~~**SSH bridge for machines with no open port**~~ — **done (v0.9.0)**: a one-file bridge on any reachable
+   host dials the cloud over wss and pipes raw SSH into the sshd (`ssh2.injectSocket`); the device hello
+   advertises the bridge while it is live. Auth/scopes/allowlist unchanged — in the cloud.
 6. ~~**Push wake**~~ — **done (v0.8.0)**: VAPID keys beside the state file; a paired device stores its web-push
    subscription (`/v1/device/push`); the host sends `wake {device}` and the cloud delivers a silent,
    payload-less push — but only when the device is not connected (a connected one is already live). The

@@ -16,8 +16,10 @@
  * Payload rule: `frame.payload` is routed, never parsed (see protocol/envelope.ts).
  */
 
-import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { Duplex, type Stream } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import {
   decode,
@@ -90,6 +92,37 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
   const agentByRoom = new Map<string, AgentConn>(); // roomId → conn
   const deviceConns = new Set<DeviceConn>();
   const pendingPairs = new Map<string, (ok: boolean) => void>(); // requestId → resolve
+
+  // ---- SSH bridges: a reachable front door for the SSH leg --------------------
+  // A bridge runs on any host with an open port (e.g. a tiny VPS), dials the cloud
+  // over wss (outbound only) and pipes raw SSH bytes both ways. Device auth, scopes
+  // and the read-only allowlist all live in the sshd behind the gate — the bridge
+  // carries no secrets, so the account token (owner-level) is its credential.
+  interface BridgeConn {
+    ws: WebSocket;
+    account: Account;
+    /** What phones should dial ({host, port}); when set, the device hello prefers it. */
+    advertise: { host: string; port: number } | null;
+  }
+  const bridges = new Set<BridgeConn>();
+
+  /** A virtual SSH client socket: bytes arrive from / leave to a bridged wss frame. */
+  class VirtualSshSocket extends Duplex {
+    readonly remoteAddress = "bridge"; // the sshd's strike map sees one source — documented
+    readonly remoteFamily = "IPv4";
+    readonly remotePort = 0;
+    constructor() {
+      super({ allowHalfOpen: false });
+    }
+    // ssh2 (isWritable) also reads these — Duplex provides writable/_readableState.
+    _write(chunk: Buffer, _enc: string, cb: (err?: Error | null) => void): void {
+      this.emit("tobytes", chunk);
+      cb(null);
+    }
+    _read(): void {
+      /* pushed from the bridge leg */
+    }
+  }
 
   // ---- room streams (resume support) ----
   // Messages a phone must not lose while it is away (host frames, presence) are
@@ -260,12 +293,12 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
   };
 
   /** Token bucket: returns false when over the rate (the caller closes 1008). */
-  const bucket = () => {
-    let tokens = RATE_BURST;
+  const bucket = (perSec = RATE_MSG_PER_S, burst = RATE_BURST) => {
+    let tokens = burst;
     let last = Date.now();
     return (): boolean => {
       const now = Date.now();
-      tokens = Math.min(RATE_BURST, tokens + ((now - last) / 1000) * RATE_MSG_PER_S);
+      tokens = Math.min(burst, tokens + ((now - last) / 1000) * perSec);
       last = now;
       if (tokens < 1) return false;
       tokens -= 1;
@@ -273,7 +306,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     };
   };
 
-  const upgrade = (req: IncomingMessage, socket: import("node:stream").Duplex, head: Buffer, leg: "agent" | "device"): void => {
+  const upgrade = (req: IncomingMessage, socket: import("node:stream").Duplex, head: Buffer, leg: "agent" | "device" | "bridge"): void => {
     const ip = ipOf(req);
     if (blocked(ip)) {
       socket.write("HTTP/1.1 429 Too Many Requests\r\n\r\n");
@@ -282,6 +315,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
       if (leg === "agent") attachAgent(ws, ip);
+      else if (leg === "bridge") attachBridge(ws, ip);
       else attachDevice(ws, ip);
     });
   };
@@ -394,6 +428,108 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         log(`agent ${conn.room.id} disconnected`);
         pushPresence(conn.room.id, false);
         pushRoomUpdate(conn.room.id);
+      }
+    });
+  };
+
+  /**
+   * The bridge leg (`/v1/bridge/ws`): owner-token hello, then `bridge.open/data/close`
+   * frames carrying one phone's raw SSH bytes each. Bytes land in the sshd through a
+   * virtual socket — auth, scopes and the allowlist are unchanged, inside SSH.
+   */
+  const attachBridge = (ws: WebSocket, ip: string): void => {
+    let conn: BridgeConn | null = null;
+    let done = false;
+    const sessions = new Map<string, VirtualSshSocket>();
+    const take = bucket(600, 1200); // SSH chunks: higher ceiling than interactive legs
+    const helloTimer = setTimeout(() => {
+      if (!done) ws.close(4001, "hello timeout");
+    }, HELLO_TIMEOUT_MS);
+    const iv = keepAlive(() => conn !== null, ws);
+    ws.on("pong", () => {
+      /* conn presence is the liveness marker for bridges */
+    });
+
+    ws.on("message", (data, isBinary) => {
+      if (isBinary) return ws.close(1003, "text only");
+      const m = decode(String(data));
+      if (!m) return fail(ws, "bad-message", "not a v1 envelope");
+      if (conn && !take()) return ws.close(1008, "rate");
+
+      if (!conn) {
+        if (m.t !== "hello" || typeof m.bridgeToken !== "string") {
+          strike(ip);
+          return ws.close(4001, "bad hello");
+        }
+        const bridgeToken = m.bridgeToken;
+        const account = typeof bridgeToken === "string" ? (cfg.accounts.find((a) => sameSecret(a.token, bridgeToken)) ?? null) : null;
+        if (!account) {
+          strike(ip);
+          return ws.close(4001, "unknown bridge token");
+        }
+        if (!sshd) {
+          return ws.close(4001, "ssh leg disabled on this cloud");
+        }
+        const ad = m.advertise;
+        const advertise =
+          ad && typeof ad === "object" && typeof (ad as { host?: unknown }).host === "string" && typeof (ad as { port?: unknown }).port === "number" && Number.isSafeInteger((ad as { port: number }).port) && (ad as { port: number }).port > 0 && (ad as { port: number }).port < 65536
+            ? { host: String((ad as { host: string }).host).slice(0, 255), port: (ad as { port: number }).port }
+            : null;
+        done = true;
+        clearTimeout(helloTimer);
+        conn = { ws, account, advertise };
+        bridges.add(conn);
+        log(`bridge (${account.name}) connected${advertise ? ` — phones dial ${advertise.host}:${advertise.port}` : ""}`);
+        send(ws, { t: "hello", ok: true });
+        return;
+      }
+
+      switch (m.t) {
+        case "bridge.open": {
+          const sid = typeof m.sid === "string" ? m.sid : "";
+          if (!sid || sessions.has(sid)) return fail(ws, "bad-message", "bridge.open.sid");
+          if (!sshd) return fail(ws, "no-ssh", "ssh leg disabled");
+          const sock = new VirtualSshSocket();
+          sessions.set(sid, sock);
+          sock.on("tobytes", (chunk: Buffer) => send(ws, { t: "bridge.data", sid, b64: chunk.toString("base64") }));
+          sock.on("close", () => {
+            sessions.delete(sid);
+            send(ws, { t: "bridge.close", sid });
+          });
+          sshd.inject(sock as unknown as import("node:net").Socket);
+          return;
+        }
+        case "bridge.data": {
+          const sid = typeof m.sid === "string" ? m.sid : "";
+          const sock = sessions.get(sid);
+          if (!sock || typeof m.b64 !== "string") return fail(ws, "bad-message", "bridge.data");
+          sock.push(Buffer.from(m.b64, "base64"));
+          return;
+        }
+        case "bridge.close": {
+          const sid = typeof m.sid === "string" ? m.sid : "";
+          const sock = sessions.get(sid);
+          if (sock) {
+            sock.push(null); // EOF into the sshd
+            sock.destroy();
+          }
+          return;
+        }
+        case "ping":
+          return send(ws, { t: "pong", n: m.n ?? 0 });
+        default:
+          return fail(ws, "unknown", `bridge leg has no ${m.t}`);
+      }
+    });
+
+    ws.on("close", () => {
+      clearTimeout(helloTimer);
+      clearInterval(iv);
+      for (const sock of sessions.values()) sock.destroy();
+      sessions.clear();
+      if (conn && bridges.has(conn)) {
+        bridges.delete(conn);
+        log(`bridge (${conn.account.name}) disconnected`);
       }
     });
   };
@@ -512,7 +648,14 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
             ...helloMsg,
             resumed: false,
             ...(s ? { stream: { gen: s.gen, seq: s.seq } } : {}),
-            ...(cfg.ssh ? { ssh: { port: cfg.ssh.port, ...(cfg.sshHost ? { host: cfg.sshHost } : {}) } } : {}),
+            ...((): Record<string, unknown> => {
+              // A live bridge with an advertised address wins: phones reach the bridge,
+              // not the gate machine (which may sit behind NAT with no IPv6).
+              if (!cfg.ssh) return {};
+              for (const b of bridges) if (b.advertise) return { ssh: { ...b.advertise } };
+              // The real port (the listener may be ephemeral), falling back to config.
+              return { ssh: { port: sshd?.port ?? cfg.ssh.port, ...(cfg.sshHost ? { host: cfg.sshHost } : {}) } };
+            })(),
           });
         }
         if (device) pushRoomUpdate(device.roomId);
@@ -702,6 +845,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     const path = new URL(req.url ?? "/", "http://x").pathname;
     if (path === "/v1/agent/ws") return upgrade(req, socket, head, "agent");
     if (path === "/v1/device/ws") return upgrade(req, socket, head, "device");
+    if (path === "/v1/bridge/ws") return upgrade(req, socket, head, "bridge");
     socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
     socket.destroy();
   });

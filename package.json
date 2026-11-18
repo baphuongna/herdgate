@@ -12,7 +12,8 @@
     "host": "node src/host/main.ts",
     "edge": "node src/dev/main.ts",
     "test": "node --test test/*.test.ts",
-    "check": "tsc -p tsconfig.json"
+    "check": "tsc -p tsconfig.json",
+    "ssh-bridge": "node src/cloud/ssh-bridge.ts"
   },
   "dependencies": {
     "ssh2": "^1.17.0",

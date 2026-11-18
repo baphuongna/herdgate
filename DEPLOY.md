@@ -107,13 +107,37 @@ shell helper blocks forever. Local `curl http://127.0.0.1:8833/` returns **421**
 design — the gateway pins `Host: gate.phuongnb.io.vn`; that is the pinning contract
 working, not a bug.
 
-### The SSH leg is not a Cloudflare-TCP leg
+### The SSH leg is not a Cloudflare-TCP leg — three ways in
 
 Phones speak plain SSH to `host:port`; Cloudflare Tunnel only carries TCP for clients
-running `cloudflared access`, which the phone does not. So the SSH leg's reachability is
-LAN / VPN / Tailscale to the machine running the gate (bind it with
-`HERDGATE_SSH_BIND=0.0.0.0`), or hosting the gate on a VPS later. The HTTP/WSS surface
-(PWA, pairing, publisher) is the part that goes through the tunnel.
+running `cloudflared access`, which the phone does not. Reachability options, in order
+of setup cost:
+
+1. **LAN / same network** — `HERDGATE_SSH_BIND=0.0.0.0`, phones dial the machine.
+2. **IPv6 AAAA** (this machine's setup) — a DNS-only `AAAA` record to the gate
+   machine's global IPv6; `~/.local/bin/herdgate-ssh-ddns` + the `herdgate-ddns`
+   timer keep it current (needs a Cloudflare API token + `ufw allow`).
+3. **The SSH bridge (v0.9.0)** — a front door on ANY host with an open port (a tiny
+   VPS is enough), when the gate machine itself has none:
+
+```sh
+# on the VPS (Node ≥ 22, one file, no dependencies):
+node ssh-bridge.ts   # env: HERDGATE_URL, HERDGATE_BRIDGE_TOKEN (the account token),
+                     #      HERDGATE_BRIDGE_BIND/PORT (default 0.0.0.0:2299),
+                     #      HERDGATE_BRIDGE_PUBLIC_HOST/PORT — advertise what phones dial
+```
+
+The bridge dials the cloud over an OUTBOUND WebSocket and pipes raw SSH bytes both
+ways; the cloud feeds them into its sshd through ssh2's `injectSocket`. Device-key
+auth, act-scope enforcement, the read-only allowlist and brute-force strikes all stay
+in the cloud — the bridge carries no secrets, which is why its credential is the
+account (owner) token. While a bridge with an advertised address is connected, the
+device hello's `ssh {host, port}` points phones at it; disconnect it and the hello
+falls back to the gate's own address. Verified end to end through the real Cloudflare
+tunnel: pair over wss → SSH the bridge → `hello` (32 methods), `server.status`, and
+`terminal.send` refused with the act-scope error.
+
+The HTTP/WSS surface (PWA, pairing, publisher) goes through the tunnel as always.
 
 ## Keep it running
 

@@ -13,7 +13,10 @@ Both remote connections are outbound; the cloud gateway binds loopback.
   GitHub-style device flow; devices pair into a room; `act` scope needs the host's own approval.
 - **Opaque payloads** — the cloud routes frames between legs and never inspects, logs or persists them.
   End-to-end encryption can be added later without changing the cloud.
-- **No inbound ports** — the cloud binds loopback and is published through `cloudflared`; the cloud itself is the
+- **No inbound ports on your machines** — publishers dial out over wss; the gate is published through
+  `cloudflared`; and the phone app's SSH leg reaches machines with no open port at all via the
+  one-file [`ssh-bridge`](DEPLOY.md#the-ssh-leg-is-not-a-cloudflare-tcp-leg--three-ways-in) on any
+  reachable host — auth and the read-only allowlist stay in the cloud, the bridge carries no secrets;
   identity provider (no Cloudflare Access needed, none of its headers trusted).
 
 ## Status

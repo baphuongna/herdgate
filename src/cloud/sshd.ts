@@ -54,6 +54,12 @@ export interface SshHandle {
   port: number | null;
   bind: string | null;
   hostKeyFingerprint: string | null;
+  /**
+   * Feed a virtual (non-TCP) socket into the SSH server — how the bridge leg
+   * (`/v1/bridge/ws`) delivers a phone's raw SSH bytes. Auth, strikes and the
+   * read-only allowlist apply unchanged; `socket.remoteAddress` is the strike key.
+   */
+  inject(socket: import("node:stream").Duplex & { remoteAddress?: string }): void;
   close(): Promise<void>;
   /** Gateway calls this when a HOST sends an `ssh.*` frame to a device. */
   onHostFrame(deviceId: string, payload: Record<string, unknown>): void;
@@ -205,6 +211,11 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
     port: realPort,
     bind,
     hostKeyFingerprint: hostKey.fingerprint,
+    inject(socket) {
+      // ssh2's official injection point; the socket only needs the stream API plus
+      // remoteAddress/remoteFamily/remotePort for logging and the strike map.
+      server.injectSocket(socket as unknown as import("node:net").Socket);
+    },
     /** The HOST's ssh.* frames come back through the agent leg; write them into the phone's stream. */
     onHostFrame(deviceId, payload) {
       const op = typeof payload.op === "string" ? payload.op : "";

@@ -339,17 +339,24 @@ async function publisherLoop() {
       }
       })().catch(() => {});
     };
-    ws.onclose = () => {
+    // One retry per socket: an error while still CONNECTING (e.g. the cloud is
+    // restarting and refuses) never produces a close event on this WebSocket
+    // implementation — waiting for onclose alone stalled the publisher forever.
+    let retried = false;
+    const retry = (why) => {
+      if (retried) return;
+      retried = true;
       if (timer) clearInterval(timer);
       timer = null;
       ssh.closeAll();
       devices = [];
       const wait = Math.min(30_000, backoff) + Math.random() * 500;
       backoff *= 2;
-      log(`disconnected; retrying in ${Math.round(wait)}ms`);
+      log(`${why}; retrying in ${Math.round(wait)}ms`);
       setTimeout(connect, wait).unref?.();
     };
-    ws.onerror = () => {}; // onclose carries the retry
+    ws.onclose = () => retry("disconnected");
+    ws.onerror = () => retry("ws error");
   };
   connect();
   // Keep the child alive while the socket reconnects.
