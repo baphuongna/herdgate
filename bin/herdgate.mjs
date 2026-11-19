@@ -154,27 +154,39 @@ function integrate(home) {
   }
   let src = readFileSync(tabs, "utf8");
   const anchor = `.when(enabled.includes("changes"), el => el.child(panelButton("changes", "Changes", "mods/changes/changes.svg")))`;
-  const btn = `.when(enabled.includes("herdgate"), el => el.child(panelButton("herdgate", "herdgate", "mods/herdgate/herdgate.svg")))`;
+  // The exact line we insert — the idempotency marker. (An earlier build checked
+  // for a different .when(…) string and never matched, so every re-install added
+  // one more button — this marker is the inserted text itself.)
+  const inserted = `.child(panelButton("herdgate", "herdgate", "mods/herdgate/herdgate.svg"))`;
+  const marker = 'panelButton("herdgate"';
+  // Repair old duplicates first: drop every inserted line, re-add exactly one.
+  const dupes = src.split("\n").filter((l) => l.trim().startsWith(inserted)).length;
+  let dropped = false;
+  if (dupes > 1 || (dupes === 1 && src.includes(anchor))) {
+    if (dupes > 1) console.log(`herdgate: removing ${dupes - 1} duplicate button(s) from earlier installs`);
+    src = src.split("\n").filter((l) => !l.trim().startsWith(inserted)).join("\n");
+    dropped = true;
+  }
   let changed = false;
-  if (src.includes(anchor) && !src.includes(btn)) {
+  if (src.includes(anchor) && !src.includes(marker)) {
     // Unconditional .child — no shared("workspace.panels") gate, no new imports:
     // the button exists on every Herdr version (older apps may lack setShared).
-    src = src.replace(anchor, `${anchor}\n      .child(panelButton("herdgate", "herdgate", "mods/herdgate/herdgate.svg"))`);
+    src = src.replace(anchor, `${anchor}\n      ${inserted}`);
     src = src.replace(
       `const enabled = shared("workspace.panels") ?? ["files", "changes"];`,
       `const enabled = shared("workspace.panels") ?? ["files", "changes", "herdgate"];`,
     );
     changed = true;
-  } else if (!src.includes(btn) && !src.includes('panelButton("herdgate"')) {
+  } else if (!src.includes(marker)) {
     console.log("herdgate: tabs mod anchors not found (Herdr version drift?) — button not added, pane.split still works");
   }
-if (changed) writeFileSync(tabs, src);
+  if (dropped || changed) writeFileSync(tabs, src);
   if (changed && !verifyTabs(home, live)) {
     console.log("herdgate: the patched tabs clone does not load — retrying from a fresh copy");
     cpSync(join(home, "mods", "tabs"), join(home, "mods", "tabs-herdgate"), { recursive: true });
     const fresh = readFileSync(tabs, "utf8");
     if (fresh.includes(anchor)) {
-      writeFileSync(tabs, fresh.replace(anchor, `${anchor}\n      .child(panelButton("herdgate", "herdgate", "mods/herdgate/herdgate.svg"))`));
+      writeFileSync(tabs, fresh.replace(anchor, `${anchor}\n      ${inserted}`));
     }
     if (!verifyTabs(home, live)) {
       console.log("herdgate: still no — restoring the shipped tabs mod untouched (button not added; pane.split still works)");
