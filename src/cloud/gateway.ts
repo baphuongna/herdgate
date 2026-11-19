@@ -855,7 +855,8 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         if (req.method === "DELETE") {
           const b64 = typeof body?.b64 === "string" ? body.b64 : "";
           if (!b64) return json(res, 400, { error: "b64 required" });
-          return json(res, state.removeDeviceSshKey(device.id, b64) ? 200 : 404, { ok: state.deviceById(device.id)?.sshKeys !== undefined });
+          const removed = state.removeDeviceSshKey(device.id, b64);
+          return json(res, removed ? 200 : 404, { ok: removed });
         }
         if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
         const parsed = parseAuthorizedKey(typeof body?.pubkey === "string" ? body.pubkey : "");
