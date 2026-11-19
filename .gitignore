@@ -7,3 +7,5 @@ node_modules/
 app-mod/**/jsconfig.json
 app-mod/**/*.d.ts
 src/web/herdgate-host.zip
+app-mod/herdgate/gpui-kit.d.ts
+app-mod/herdgate/jsconfig.json
