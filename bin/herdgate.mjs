@@ -32,9 +32,8 @@ function appHome() {
   const forced = arg("app-home");
   if (forced) return forced;
   if (process.env.HERDR_APP_HOME) return process.env.HERDR_APP_HOME;
-  const plat = process.platform;
-  if (plat === "win32") return join(process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "herdr-app");
-  if (plat === "darwin") return join(homedir(), "Library", "Application Support", "herdr-app");
+  // herdr-app keeps the same home everywhere: ~/.config/herdr-app ("Home:" line in
+  // `herdr-app --help`) — Windows included.
   return join(homedir(), ".config", "herdr-app");
 }
 
