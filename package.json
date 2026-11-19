@@ -1,11 +1,10 @@
 {
-  "name": "herdgate",
+  "name": "@bom0792/herdgate",
   "version": "0.9.5",
-  "description": "A cloud relay hub: desktop host agents and mobile devices meet behind one gate.",
+  "description": "Cloud relay hub for herdr-core: every machine dials out, phones and browsers follow (PWA + SSH leg, E2E payloads).",
   "type": "module",
-  "private": true,
   "engines": {
-    "node": ">=22.18"
+    "node": ">=22"
   },
   "scripts": {
     "start": "node src/cloud/main.ts",
@@ -25,5 +24,16 @@
     "@types/ssh2": "^1.15.6",
     "@types/ws": "^8.5.13",
     "typescript": "^5.7.0"
-  }
+  },
+  "bin": {
+    "herdgate": "bin/herdgate.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "app-mod",
+    "plugin",
+    "scripts",
+    "dist-readme.md"
+  ]
 }

@@ -27,6 +27,6 @@ if (broken.test(src)) {
 } else if (src.includes("nistp521'\n    + ',rsa-sha2-512") || /nistp521,\s*'?\+?\s*'?rsa-sha2-512/.test(src)) {
   console.error("patch-ssh2: already patched");
 } else {
-  console.error("patch-ssh2: upstream source changed — check whether the bug is fixed upstream, then drop this patch");
-  process.exit(1);
+  // A warning, never a failure: this must not break anyone's `npm install`.
+  console.error("patch-ssh2: ssh2 source not recognised (fixed upstream, or a different build) — skipping");
 }
