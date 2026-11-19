@@ -102,32 +102,55 @@ function do_(args) {
 }
 
 function integrate(home) {
-  const probe = spawnSync("herdr-app", ["status"], { encoding: "utf8" });  if (probe.status !== 0) {
-    console.log("herdgate: herdr-app not reachable — start the app, then re-run setup-host");
-    return;
-  }
-  // 1. clone the tabs mod and add our button.
+  const probe = spawnSync("herdr-app", ["status"], { encoding: "utf8" });
+  const live = probe.status === 0;
+  // 1. clone the tabs mod and add our button. Live: the app's own command (it also
+  // registers the clone). Offline: shipped mods are plain files — copy them; a
+  // closed app reads the folder at start.
   let tabs = join(home, "mods", "tabs-herdgate", "main.js");
   if (!existsSync(tabs)) {
-    const c = do_(["mod.clone", JSON.stringify({ name: "tabs", as: "tabs-herdgate" })]);
-    if (!c.ok && !existsSync(tabs)) return console.log(`herdgate: could not clone tabs (${c.out.slice(0, 120)}) — panel stays reachable via pane.split`);
+    let ok = false;
+    if (live) ok = do_(["mod.clone", JSON.stringify({ name: "tabs", as: "tabs-herdgate" })]).ok;
+    if (!ok) cpSync(join(home, "mods", "tabs"), join(home, "mods", "tabs-herdgate"), { recursive: true });
+    if (!existsSync(tabs)) return console.log("herdgate: could not clone the tabs mod — panel stays reachable via pane.split");
   }
   let src = readFileSync(tabs, "utf8");
   const anchor = `.when(enabled.includes("changes"), el => el.child(panelButton("changes", "Changes", "mods/changes/changes.svg")))`;
   const btn = `.when(enabled.includes("herdgate"), el => el.child(panelButton("herdgate", "herdgate", "mods/herdgate/herdgate.svg")))`;
+  let changed = false;
   if (src.includes(anchor) && !src.includes(btn)) {
     src = src.replace(anchor, `${anchor}\n      ${btn}`);
-    src = src.replace(`shared("workspace.panels") ?? ["files", "changes"]`, `shared("workspace.panels") ?? ["files", "changes", "herdgate"]`);
-    writeFileSync(tabs, src);
+    changed = true;
   } else if (!src.includes(btn)) {
     console.log("herdgate: tabs mod anchors not found (Herdr version drift?) — button not added, pane.split still works");
   }
+  // Independent of the button: the tab bar always loads, so IT self-heals the panel
+  // list — if the welcome fixed workspace.panels without us, join it (converges in
+  // one re-render). Machines patched by older installers lack this; re-running adds it.
+  if (!src.includes("setShared(\"workspace.panels\")")) {
+    const heal = `const __panels = shared("workspace.panels");
+    if (!Array.isArray(__panels) || !__panels.includes("herdgate"))
+      setShared("workspace.panels", [...(Array.isArray(__panels) ? __panels : ["files", "changes"]), "herdgate"]);
+    const enabled = shared("workspace.panels") ?? ["files", "changes"];`;
+    // 0.9.7-patched clones carry the herdgate variant of the enabled default.
+    const before = src;
+    src = src.replace(`const enabled = shared("workspace.panels") ?? ["files", "changes"];`, heal);
+    if (src === before) src = src.replace(`const enabled = shared("workspace.panels") ?? ["files", "changes", "herdgate"];`, heal);
+    src = src.replace(
+      `import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings } from "herdr";`,
+      `import { spaces, panes, run, openOverlay, theme, window, shared, setShared, layout, settings } from "herdr";`,
+    );
+    changed = true;
+  }
+  if (changed) writeFileSync(tabs, src);
 
   // 2. clone the main layout, seat herdgate in panel-body, point the tab bar at the clone.
   const layoutPath = join(home, "layouts", "herdgate-main.json");
   if (!existsSync(layoutPath)) {
-    const c = do_(["layout.clone", JSON.stringify({ name: "main", as: "herdgate-main" })]);
-    if (!c.ok && !existsSync(layoutPath)) return console.log(`herdgate: could not clone layout (${c.out.slice(0, 120)})`);
+    let ok = false;
+    if (live) ok = do_(["layout.clone", JSON.stringify({ name: "main", as: "herdgate-main" })]).ok;
+    if (!ok) cpSync(join(home, "layouts", "main.json"), layoutPath);
+    if (!existsSync(layoutPath)) return console.log("herdgate: could not create the herdgate-main layout");
   }
   const tree = JSON.parse(readFileSync(layoutPath, "utf8"));
   const find = (n, id) => {
@@ -144,9 +167,23 @@ function integrate(home) {
   }
   const tabsBlock = find(tree, "tabs");
   if (tabsBlock?.content?.mod === "tabs") tabsBlock.content.mod = "tabs-herdgate";
-  const set = do_(["layout.set", JSON.stringify({ layout: tree })]);
-  if (!set.ok) return console.log(`herdgate: layout.set failed (${set.out.slice(0, 120)})`);
-  do_(["layout.switch", JSON.stringify({ name: "herdgate-main" })]);
+  if (live) {
+    const set = do_(["layout.set", JSON.stringify({ layout: tree })]);
+    if (!set.ok) return console.log(`herdgate: layout.set failed (${set.out.slice(0, 120)})`);
+    do_(["layout.switch", JSON.stringify({ name: "herdgate-main" })]);
+  } else {
+    // App closed: the files are ours to write. Switch the layout and join the panel
+    // list directly (the tab-bar clone re-checks at load, this just makes it immediate).
+    writeFileSync(layoutPath, JSON.stringify(tree, null, 1) + "\n");
+    const sharedPath = join(home, "shared.json");
+    let sh = {};
+    try { sh = JSON.parse(readFileSync(sharedPath, "utf8")); } catch { /* none yet */ }
+    sh.layout = "herdgate-main";
+    const panels = Array.isArray(sh["workspace.panels"]) ? sh["workspace.panels"] : ["files", "changes"];
+    if (!panels.includes("herdgate")) panels.push("herdgate");
+    sh["workspace.panels"] = panels;
+    writeFileSync(sharedPath, JSON.stringify(sh, null, 2) + "\n");
+  }
   console.log("herdgate: panel button added to the tab bar (layout herdgate-main) — press it any time;");
   console.log("           the shipped layout `main` stays untouched (layout.switch main goes back).");
 }
