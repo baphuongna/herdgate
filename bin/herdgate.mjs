@@ -102,7 +102,7 @@ To connect FROM this machine to another machine in the herd (no admin,
 works on IPv4-only networks — ssh over wss/443), first:
   ssh-keygen -t ed25519 -f "%USERPROFILE%\\.ssh\\herdgate" -N "" -q
 and register the printed key in the PWA (machine → Public keys). Then:
-  hc machine add <device-id>@herdgate --name home --via "node ${viaPath} --gate ${cloud} --user <device-id>"`);
+  hc machine add --name home --via "node ${viaPath} --gate ${cloud} --user <device-id>"`);
   }
 }
 
