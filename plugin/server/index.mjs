@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { hostname, homedir } from "node:os";
-import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize } from "./common.mjs";
+import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead } from "./common.mjs";
 import { createSshBridge } from "./ssh.mjs";
 import { HostChannel, b64d, b64e, fingerprint, generateKeyPair } from "./e2e.mjs";
 
@@ -198,7 +198,9 @@ async function publisherLoop() {
     }
     return e2eSelf;
   };
-  const e2eSessions = new Map(); // deviceId → HostChannel
+  const e2eSessions = new Map();
+  /** Per-device last-call times for the subprocess-backed term.* ops (1/s each). */
+  const termThrottle = new Map();
   /** null = not an e2e payload; {reply} = handshake answer to send; {inner} = decrypted device payload. */
   const e2eOnDevice = async (device, payload) => {
     if (payload && typeof payload === "object" && typeof payload.op === "string" && payload.op.startsWith("e2e")) log(`e2e: op ${payload.op} from ${device}`);
@@ -332,6 +334,38 @@ async function publisherLoop() {
           // Answer this device now, even if the view has not changed since the last push.
           lastSig = "";
           return void publish(ws);
+        }
+        // Live terminal access, read-only: the panes list and one pane's ANSI screen.
+        // Subprocess-backed, so both ops are throttled per device (a phone's poll must
+        // not fork `herdr` in a tight loop) and the target string is whitelisted hard.
+        if (op === "term.list") {
+          const now = Date.now();
+          const last = termThrottle.get(`list:${m.device}`) ?? 0;
+          if (now - last < 1_000) return void replyTo({ op: "error", code: "busy", message: "term.list is throttled (1/s)" });
+          termThrottle.set(`list:${m.device}`, now);
+          try {
+            const panes = await herdrPanes(D.herdrBin);
+            return void replyTo({ op: "term.list", panes });
+          } catch (e) {
+            return void replyTo({ op: "error", code: "herdr", message: `pane list failed: ${e instanceof Error ? e.message : String(e)}` });
+          }
+        }
+        if (op === "term.read") {
+          const target = typeof payload.target === "string" ? payload.target : "";
+          const lines = Math.max(10, Math.min(120, Number(payload.lines) || 40));
+          if (!/^[A-Za-z0-9_:.-]{1,64}$/.test(target)) {
+            return void replyTo({ op: "error", code: "bad-target", message: "term.read needs a pane id" });
+          }
+          const now = Date.now();
+          const last = termThrottle.get(`read:${m.device}`) ?? 0;
+          if (now - last < 1_000) return void replyTo({ op: "error", code: "busy", message: "term.read is throttled (1/s)" });
+          termThrottle.set(`read:${m.device}`, now);
+          try {
+            const ansi = await herdrRead(D.herdrBin, target, lines);
+            return void replyTo({ op: "term.read", target, ansi });
+          } catch (e) {
+            return void replyTo({ op: "error", code: "herdr", message: `read failed: ${e instanceof Error ? e.message : String(e)}` });
+          }
         }
         return void replyTo({ op: "error", code: "read-only", message: `dev.herdgate.host has no op ${String(op)}` });
       }

@@ -42,18 +42,18 @@ test("devices: roster lists pairs; revoke kills access and the socket", async ()
     agent = new HerdGateAgent({ endpoint: `${base.replace("http", "ws")}/v1/agent/ws`, roomToken: status.roomToken!, adapter, log: () => {} });
     agent.start();
     await agent.firstHello;
-    const hello = (await new DeviceSock(base.replace("http", "ws") + "/v1/device/ws").hello({ accountToken: ACCOUNT, name: "probe" })) as { agents: { roomId: string }[] };
+    const hello = (await new DeviceSock(base.replace("http", "ws") + "/v1/device/ws").hello({ accountToken: ACCOUNT, name: "probe" })) as unknown as { agents: { roomId: string }[] };
     const roomId = hello.agents[0].roomId;
 
     readSock = new DeviceSock(base.replace("http", "ws") + "/v1/device/ws");
     await readSock.hello({ accountToken: ACCOUNT, name: "owner" });
     await readSock.send({ t: "pair.begin", roomId, name: "phone", scope: "read" });
-    const read = (await readSock.expect("pair.granted")) as { device: { id: string }; deviceSecret: string };
+    const read = (await readSock.expect("pair.granted")) as unknown as { device: { id: string }; deviceSecret: string };
 
     actSock = new DeviceSock(base.replace("http", "ws") + "/v1/device/ws");
     await actSock.hello({ accountToken: ACCOUNT, name: "owner2" });
     await actSock.send({ t: "pair.begin", roomId, name: "laptop", scope: "act" });
-    const act = (await actSock.expect("pair.granted")) as { device: { id: string }; deviceSecret: string };
+    const act = (await actSock.expect("pair.granted")) as unknown as { device: { id: string }; deviceSecret: string };
 
     // Roster: account token sees both, live; a stranger sees nothing.
     const roster = (await (await fetch(`${base}/v1/devices?room=${roomId}`, { headers: { authorization: `Bearer ${ACCOUNT}` } })).json()) as { devices: { id: string; name: string; scope: string; connected: boolean; keys: number }[] };

@@ -155,6 +155,46 @@ export async function readHerdrView(o: HerdrReadOptions = {}): Promise<HerdrView
   return mapSnapshot(parsed);
 }
 
+export interface HerdrPane {
+  id: string;
+  workspace: string;
+  agent: string | null;
+  status: string;
+  cwd: string;
+  title: string;
+}
+
+/** Live panes (`herdr pane list`), mapped for the term.list op. */
+export async function readHerdrPanes(o: HerdrReadOptions = {}): Promise<HerdrPane[]> {
+  const bin = o.bin ?? process.env.HERDGATE_HERDR_BIN ?? "herdr";
+  const { stdout } = await run(bin, ["pane", "list"], { timeout: o.timeoutMs ?? 5_000, maxBuffer: MAX_SNAPSHOT_BYTES, env: o.env ?? process.env });
+  const parsed = JSON.parse(stdout) as { result?: { panes?: unknown[] }; panes?: unknown[] };
+  const panes = parsed?.result?.panes ?? parsed?.panes ?? [];
+  return panes
+    .filter((p): p is Record<string, unknown> => Boolean(p) && typeof (p as Record<string, unknown>).pane_id === "string")
+    .map((p) => ({
+      id: String(p.pane_id),
+      workspace: typeof p.workspace_id === "string" ? p.workspace_id : "",
+      agent: typeof p.agent === "string" ? p.agent : null,
+      status: typeof p.agent_status === "string" ? p.agent_status : "unknown",
+      cwd: typeof p.cwd === "string" ? p.cwd : "",
+      title: typeof p.terminal_title_stripped === "string" ? p.terminal_title_stripped : typeof p.terminal_title === "string" ? p.terminal_title : "",
+    }));
+}
+
+/** One pane's visible screen as ANSI (`herdr agent read --format ansi`). */
+export async function readHerdrTerm(target: string, lines = 40, o: HerdrReadOptions = {}): Promise<string> {
+  const bin = o.bin ?? process.env.HERDGATE_HERDR_BIN ?? "herdr";
+  if (!/^[A-Za-z0-9_:.-]{1,64}$/.test(target)) throw new Error("bad pane id");
+  const n = Math.max(10, Math.min(120, Math.trunc(lines) || 40));
+  const { stdout } = await run(bin, ["agent", "read", target, "--source", "visible", "--lines", String(n), "--format", "ansi"], {
+    timeout: o.timeoutMs ?? 5_000,
+    maxBuffer: MAX_SNAPSHOT_BYTES,
+    env: o.env ?? process.env,
+  });
+  return stdout;
+}
+
 /** What the host can push/drive; the agent supplies it (see `HerdrAdapter.attach`). */
 export interface HostLink {
   send(device: string, payload: unknown): void;
@@ -191,6 +231,8 @@ export class HerdrAdapter implements AgentAdapter {
   readonly #log: (line: string) => void;
   #link: HostLink | null = null;
   #view: HerdrView | null = null;
+  /** Per-device last-call times for the subprocess-backed term.* ops (1/s each). */
+  #termThrottle = new Map<string, number>();
   #sig = "";
   #lastError: string | null = null;
   #timer: NodeJS.Timeout | null = null;
@@ -257,6 +299,30 @@ export class HerdrAdapter implements AgentAdapter {
       }
       case "ping":
         return link.send(device, { op: "pong", n: (payload as { n?: unknown }).n ?? null, at: (this.#o.now?.() ?? new Date()).toISOString() });
+      case "term.list": {
+        // Subprocess-backed: throttle per device so a poll loop cannot fork herdr hot.
+        const now = this.#o.now?.() ?? new Date();
+        const last = this.#termThrottle.get(`list:${device}`) ?? 0;
+        if (now.getTime() - last < 1_000) return link.send(device, { op: "error", code: "busy", message: "term.list is throttled (1/s)" });
+        this.#termThrottle.set(`list:${device}`, now.getTime());
+        readHerdrPanes()
+          .then((panes) => link.send(device, { op: "term.list", panes }))
+          .catch((e: unknown) => link.send(device, { op: "error", code: "herdr", message: `pane list failed: ${e instanceof Error ? e.message : String(e)}` }));
+        return;
+      }
+      case "term.read": {
+        const target = typeof (payload as { target?: unknown }).target === "string" ? (payload as { target: string }).target : "";
+        if (!/^[A-Za-z0-9_:.-]{1,64}$/.test(target)) return link.send(device, { op: "error", code: "bad-target", message: "term.read needs a pane id" });
+        const lines = Math.max(10, Math.min(120, Number((payload as { lines?: unknown }).lines) || 40));
+        const nowT = this.#o.now?.() ?? new Date();
+        const lastT = this.#termThrottle.get(`read:${device}`) ?? 0;
+        if (nowT.getTime() - lastT < 1_000) return link.send(device, { op: "error", code: "busy", message: "term.read is throttled (1/s)" });
+        this.#termThrottle.set(`read:${device}`, nowT.getTime());
+        readHerdrTerm(target, lines)
+          .then((ansi) => link.send(device, { op: "term.read", target, ansi }))
+          .catch((e: unknown) => link.send(device, { op: "error", code: "herdr", message: `read failed: ${e instanceof Error ? e.message : String(e)}` }));
+        return;
+      }
       default:
         // The read-only invariant lives HERE: the cloud cannot inspect payloads, so the
         // host is the last trusted decision point for "this device may not do that".

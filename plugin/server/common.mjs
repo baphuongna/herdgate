@@ -64,6 +64,33 @@ export async function herdrSnapshot(bin, timeoutMs = 8_000) {
   return parsed?.result?.snapshot ?? parsed?.snapshot ?? parsed;
 }
 
+/** Live panes — the PWA's terminal picker. One row per pane, grouped by workspace there. */
+export async function herdrPanes(bin, timeoutMs = 8_000) {
+  const { stdout } = await run(bin, ["pane", "list"], { timeout: timeoutMs, maxBuffer: 8 << 20 });
+  const parsed = JSON.parse(stdout);
+  const panes = parsed?.result?.panes ?? parsed?.panes ?? [];
+  return panes
+    .filter((p) => p && typeof p.pane_id === "string")
+    .map((p) => ({
+      id: p.pane_id,
+      workspace: typeof p.workspace_id === "string" ? p.workspace_id : "",
+      agent: typeof p.agent === "string" ? p.agent : null,
+      status: typeof p.agent_status === "string" ? p.agent_status : "unknown",
+      cwd: typeof p.cwd === "string" ? p.cwd : "",
+      title: typeof p.terminal_title_stripped === "string" ? p.terminal_title_stripped : typeof p.terminal_title === "string" ? p.terminal_title : "",
+    }));
+}
+
+/** One pane's screen as ANSI text — the PWA renders the colors itself. */
+export async function herdrRead(bin, target, lines = 40, timeoutMs = 8_000) {
+  const { stdout } = await run(
+    bin,
+    ["agent", "read", String(target), "--source", "visible", "--lines", String(lines), "--format", "ansi"],
+    { timeout: timeoutMs, maxBuffer: 8 << 20 },
+  );
+  return stdout;
+}
+
 export function summarize(snap) {
   const ws = Array.isArray(snap?.workspaces) ? snap.workspaces : [];
   const agents = Array.isArray(snap?.agents) ? snap.agents : [];

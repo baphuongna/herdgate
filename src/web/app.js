@@ -11,7 +11,7 @@
 //   - the token lives in localStorage on this device and is never sent anywhere but the
 //     cloud's own WS endpoint.
 
-const BUILD = "v0.9.19";
+const BUILD = "v0.9.20";
 
 const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = "herdgate.token";
@@ -107,6 +107,12 @@ const state = {
   roomId: null,
   view: null,
   viewError: null,
+  terms: null,
+  termTarget: null,
+  termAnsi: null,
+  termTimer: null,
+  termBody: null,
+  termPre: null,
   retry: 0,
   closedByUs: false,
 };
@@ -265,6 +271,30 @@ function renderRoom() {
     p.className = "muted small";
     p.textContent = `as of ${new Date(v.takenAt).toLocaleTimeString()}`;
     box.append(p);
+  }
+
+  // Live terminals (read-only): the host's own panes — pick one and watch its
+  // ANSI screen. Everything rides the same frames (E2E when paired), no new trust.
+  if (room?.online) {
+    const tblock = document.createElement("details");
+    tblock.className = "terms";
+    const ts = document.createElement("summary");
+    ts.textContent = "Live terminals — this machine's panes, read-only";
+    tblock.append(ts);
+    const tbody = document.createElement("div");
+    tbody.className = "termbody";
+    tblock.append(tbody);
+    tblock.addEventListener("toggle", () => {
+      if (tblock.open && !state.terms) send({ t: "frame", payload: { op: "term.list" } });
+    });
+    box.append(tblock);
+    state.termBody = tbody;
+    renderTerms();
+    if (state.termTarget) {
+      // The view rebuilds this node; keep the live pane ticking without a new poll.
+      paintTerm();
+      if (!state.termTimer) startTerm(state.termTarget);
+    }
   }
 
   // The SSH leg: this device's own key dials the gate. In the Herdr phone app, add a
@@ -472,6 +502,162 @@ function renderRoom() {
     };
     loadDevices();
   }
+}
+
+// ---- live terminals (read-only) ---------------------------------------------
+
+function startTerm(target) {
+  stopTerm(false);
+  state.termTarget = target;
+  state.termAnsi = null;
+  send({ t: "frame", payload: { op: "term.read", target, lines: 40 } });
+  state.termTimer = setInterval(() => {
+    if (!state.termTarget || !state.roomId) return stopTerm();
+    send({ t: "frame", payload: { op: "term.read", target: state.termTarget, lines: 40 } });
+  }, 2_000);
+  renderTerms();
+}
+
+function stopTerm(rerender = true) {
+  if (state.termTimer) clearInterval(state.termTimer);
+  state.termTimer = null;
+  state.termTarget = null;
+  state.termAnsi = null;
+  if (rerender) renderTerms();
+}
+
+/** The panes list + the live pane, inside the details' body (survives view re-renders). */
+function renderTerms() {
+  const body = state.termBody;
+  if (!body) return;
+  body.replaceChildren();
+  if (state.termTarget) {
+    const bar = document.createElement("div");
+    bar.className = "termbar";
+    const name = document.createElement("span");
+    name.className = "muted small";
+    name.textContent = `${state.termTarget} — live, refreshes every 2s`;
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.className = "link";
+    stop.textContent = "close";
+    stop.addEventListener("click", () => stopTerm());
+    bar.append(name, stop);
+    body.append(bar);
+    const pre = document.createElement("pre");
+    pre.className = "termscreen";
+    pre.textContent = state.termAnsi ?? "waiting for the pane…";
+    body.append(pre);
+    state.termPre = pre;
+    paintTerm();
+    return;
+  }
+  const list = document.createElement("div");
+  list.className = "termlist";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "link";
+  btn.textContent = "refresh the pane list";
+  btn.addEventListener("click", () => send({ t: "frame", payload: { op: "term.list" } }));
+  list.append(btn);
+  const panes = state.terms ?? null;
+  if (panes === null) {
+    list.append(note("loading…", "muted"));
+  } else if (!panes.length) {
+    list.append(note("no panes — is a workspace open on the machine?", "muted"));
+  } else {
+    const labels = new Map((state.view?.workspaces ?? []).map((w) => [w.id, w.label]));
+    for (const p of panes) {
+      const row = document.createElement("div");
+      row.className = "keyrow termrow";
+      const label = document.createElement("button");
+      label.type = "button";
+      label.className = "link termname";
+      const ws = labels.get(p.workspace) || p.workspace;
+      label.textContent = `${ws} · ${p.agent ? `${p.agent} (${p.status})` : p.title || "terminal"}`;
+      label.title = `${p.cwd} — ${p.id}`;
+      label.addEventListener("click", () => startTerm(p.id));
+      row.append(label);
+      list.append(row);
+    }
+  }
+  body.append(list);
+}
+
+function paintTerm() {
+  const pre = state.termPre;
+  if (!pre || !state.termAnsi) return;
+  pre.replaceChildren(...ansiToNodes(state.termAnsi));
+  pre.scrollTop = pre.scrollHeight;
+}
+
+/** SGR-only ANSI → DOM nodes: colors (palette + truecolor), bold. Cursor and other
+ *  sequences are dropped — this is a reading view, not an emulator. No innerHTML:
+ *  every byte from the wire becomes text nodes, never markup. */
+function ansiToNodes(s) {
+  const pal = ["#5b5b5b", "#d54e53", "#5db542", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#acacac", "#8a8a8a", "#ff6f6f", "#8ce07d", "#ffe08a", "#93c5fd", "#e2a2ff", "#8be9fd", "#ffffff"];
+  const out = [];
+  let fg = null;
+  let bg = null;
+  let bold = false;
+  let i = 0;
+  s = String(s).replace(/\r\n?/g, "\n");
+  const flush = (text) => {
+    if (!text) return;
+    if (fg === null && bg === null && !bold) {
+      out.push(document.createTextNode(text));
+      return;
+    }
+    const span = document.createElement("span");
+    if (fg) span.style.color = bold ? `color-mix(in srgb, ${fg} 70%, white)` : fg;
+    if (bg) span.style.background = bg;
+    if (bold && !fg) span.style.fontWeight = "600";
+    span.textContent = text;
+    out.push(span);
+  };
+  while (i < s.length) {
+    if (s.charCodeAt(i) === 27) {
+      const rest = s.slice(i);
+      let m = /^\x1b\[([0-9;]*)([A-Za-z])/.exec(rest);
+      if (m) {
+        if (m[2] === "m") {
+          const parts = m[1] === "" ? [0] : m[1].split(";").map((x) => (x === "" ? 0 : Number(x)));
+          for (let k = 0; k < parts.length; k += 1) {
+            const p = parts[k];
+            if (p === 0) { fg = bg = null; bold = false; }
+            else if (p === 1) bold = true;
+            else if (p === 22) bold = false;
+            else if (p === 39) fg = null;
+            else if (p === 49) bg = null;
+            else if (p >= 30 && p <= 37) fg = pal[p - 30];
+            else if (p >= 90 && p <= 97) fg = pal[p - 90 + 8];
+            else if (p >= 40 && p <= 47) bg = pal[p - 40];
+            else if (p >= 100 && p <= 107) bg = pal[p - 100 + 8];
+            else if ((p === 38 || p === 48) && parts[k + 1] === 2) {
+              const c = `rgb(${parts[k + 2] || 0},${parts[k + 3] || 0},${parts[k + 4] || 0})`;
+              if (p === 38) fg = c; else bg = c;
+              k += 4;
+            } else if ((p === 38 || p === 48) && parts[k + 1] === 5) {
+              const n8 = parts[k + 2] || 0;
+              const c = pal[n8 % 16];
+              if (p === 38) fg = c; else bg = c;
+              k += 2;
+            }
+          }
+        }
+        i += m[0].length;
+        continue;
+      }
+      m = /^\x1b\][^\x07]*(?:\x07|\x1b\\)/.exec(rest) || /^\x1b./.exec(rest);
+      i += m ? m[0].length : 1;
+      continue;
+    }
+    let j = s.indexOf("\x1b", i);
+    if (j < 0) j = s.length;
+    flush(s.slice(i, j));
+    i = j;
+  }
+  return out;
 }
 
 function note(message, kind) {
@@ -688,6 +874,18 @@ function applyPayload(payload) {
   if (payload && typeof payload === "object" && payload.op === "view") {
     state.view = payload.view;
     state.viewError = null;
+  } else if (payload && typeof payload === "object" && payload.op === "term.list") {
+    state.terms = Array.isArray(payload.panes) ? payload.panes : [];
+    renderTerms();
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "term.read") {
+    if (payload.target === state.termTarget && typeof payload.ansi === "string") {
+      state.termAnsi = payload.ansi;
+      paintTerm();
+    }
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "error" && payload.code === "busy") {
+    return; // our poll raced the host's 1/s throttle — the next tick catches up
   } else if (payload && typeof payload === "object" && payload.op === "error") {
     // The host refused or could not answer: an op we may not use, or its Herdr is down.
     state.viewError = payload.message ?? payload.code ?? "the host refused";
