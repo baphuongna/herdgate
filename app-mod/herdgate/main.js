@@ -1,5 +1,5 @@
 // herdgate for the Herdr app — a docked panel that pairs this machine to a herdgate
-// cloud and shows honest publish state.
+// cloud, publishes it, and (as the owner) approves other machines joining the herd.
 //
 // Official mod surface only (docs/mods.md, defaults/AGENTS.md "### UI" and
 // "### The `herdr` module"):
@@ -11,7 +11,8 @@
 //   - `herdr-app check <mod folder>` loads it once and reports errors.
 //
 // Division of labour: this panel owns the pairing conversation (mint a code with
-// `fetch`, poll it, write the room token) and delegates long-lived publishing to the
+// `fetch`, poll it, write the room token), the owner conversation (approve another
+// machine's code with the account token), and delegates long-lived publishing to the
 // same publisher the TUI plugin ships (`<root>/plugin/server/index.mjs serve`).
 // One implementation, two surfaces.
 //
@@ -71,6 +72,24 @@ async function readJson(path) {
 export default class Herdgate extends View {
   init(_props, cx) {
     this.h = cx.focus_handle();
+    this.settings = { cloud: "", root: "", name: "", accountToken: "" };
+    this.paired = false;
+    this.cloud = "";
+    this.publisher = { pid: null, running: false };
+    this.lastPublish = null;
+
+    this.pending = null; // { code, url, expiresAt } while a code is waiting
+    this.phase = "idle"; // idle | waiting | saving | error
+    this.message = "";
+    this.busy = { pair: false, publish: false, approve: false, save: false };
+    this.notified = false;
+
+    this.cloudInput = InputState.new({ placeholder: "https://herd.example.com" });
+    this.rootInput = InputState.new({ placeholder: "set by `npx @bom0792/herdgate setup-host`" });
+    this.nameInput = InputState.new({ placeholder: "this-machine" });
+    this.tokenInput = InputState.new({ placeholder: "account token — only for approving other machines" });
+    this.codeInput = InputState.new({ placeholder: "the code its panel shows" });
+
     // The shipped tabs mod renders its panel buttons from shared("workspace.panels")
     // (the welcome may have fixed it to ["files","changes"] — the layout clone's new
     // default never applies then). Self-heal: join the list once, keeping whatever
@@ -80,20 +99,6 @@ export default class Herdgate extends View {
       const list = Array.isArray(panels) ? panels : ["files", "changes"];
       if (!list.includes("herdgate")) setShared("workspace.panels", [...list, "herdgate"]);
     }
-    this.settings = { cloud: "", root: "", name: "" };
-    this.paired = false;
-    this.cloud = "";
-    this.publisher = { pid: null, running: false };
-    this.lastPublish = null;
-
-    this.pending = null; // { code, url, expiresAt } while a code is waiting
-    this.phase = "idle"; // idle | waiting | saving | error
-    this.message = "";
-    this.notified = false;
-
-    this.cloudInput = InputState.new({ placeholder: "https://herd.example.com" });
-    this.rootInput = InputState.new({ placeholder: "~/src/herdgate" });
-    this.nameInput = InputState.new({ placeholder: "this-machine" });
 
     cx.spawn(async (cx) => {
       await this.load();
@@ -111,7 +116,7 @@ export default class Herdgate extends View {
 
   async load() {
     const s = await readJson(SETTINGS);
-    if (s) this.settings = { cloud: s.cloud ?? "", root: s.root ?? "", name: s.name ?? "" };
+    if (s) this.settings = { cloud: s.cloud ?? "", root: s.root ?? "", name: s.name ?? "", accountToken: s.accountToken ?? "" };
     await this.refresh();
   }
 
@@ -131,25 +136,29 @@ export default class Herdgate extends View {
     const cloud = (this.cloudInput.value() ?? "").trim().replace(/\/$/, "");
     const root = (this.rootInput.value() ?? "").trim().replace(/\/$/, "");
     const name = (this.nameInput.value() ?? "").trim();
-    this.settings = { cloud, root, name };
+    const accountToken = (this.tokenInput.value() ?? "").trim() || this.settings.accountToken;
+    this.busy.save = true;
+    this.settings = { cloud, root, name, accountToken };
     const body = JSON.stringify(this.settings, null, 2);
     await sh('umask 077; mkdir -p "$1"; printf "%s" "$2" > "$3"', [BASE, body, SETTINGS]);
     await this.refresh();
-    this.message = cloud ? "saved" : "a cloud URL is required";
+    this.busy.save = false;
+    this.message = cloud ? "settings saved" : "a cloud URL is required";
     cx?.notify?.();
   }
 
   // ---- pairing: mint, show, poll, write the token --------------------------
 
   pair(cx) {
-    if (this.phase === "waiting" || this.phase === "saving") return;
+    if (this.busy.pair) return;
     const cloud = (this.settings.cloud || this.cloudInput.value() || "").replace(/\/$/, "");
     if (!cloud) {
       this.phase = "error";
-      this.message = "set the herdgate cloud URL first";
+      this.message = "set the herdgate cloud URL first (Settings below)";
       cx?.notify?.();
       return;
     }
+    this.busy.pair = true;
     this.phase = "waiting";
     this.message = "asking the cloud for a code…";
     cx?.notify?.();
@@ -163,12 +172,14 @@ export default class Herdgate extends View {
         if (!res.ok) throw new Error(`the cloud answered HTTP ${res.status}`);
         const minted = await res.json();
         this.pending = { code: minted.code, url: minted.url, expiresAt: Date.now() + (minted.expiresIn ?? 600) * 1000 };
-        this.message = "approve this code in your herdgate dashboard";
+        this.message = "waiting for approve — open the dashboard, or another herdgate panel";
         this.notified = false;
+        this.busy.pair = false;
         cx.notify();
         this.poll(cx, cloud, minted.code);
       } catch (e) {
         this.phase = "error";
+        this.busy.pair = false;
         this.message = e instanceof Error ? e.message : String(e);
         cx.notify();
       }
@@ -225,6 +236,43 @@ export default class Herdgate extends View {
     cx.notify();
   }
 
+  // ---- approving ANOTHER machine (owner action, no terminal needed) --------
+
+  approveOther(cx) {
+    if (this.busy.approve) return;
+    const cloud = (this.settings.cloud || this.cloudInput.value() || "").replace(/\/$/, "");
+    const token = (this.tokenInput.value() ?? "").trim() || this.settings.accountToken;
+    const code = (this.codeInput.value() ?? "").trim();
+    if (!cloud || !token || !code) {
+      this.phase = "error";
+      this.message = !cloud ? "set the cloud URL first" : !token ? "paste your account token (Settings)" : "enter the code the other machine shows";
+      cx?.notify?.();
+      return;
+    }
+    this.busy.approve = true;
+    this.message = "approving…";
+    cx?.notify?.();
+    cx.spawn(async (cx) => {
+      try {
+        const res = await fetch(`${cloud}/v1/agent/approve`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify({ code }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.error ?? `the cloud answered HTTP ${res.status}`);
+        this.phase = "idle";
+        this.message = `approved “${body.name ?? code}” — it appears here once its publisher connects`;
+        notify({ title: "herdgate", body: `Machine “${body.name ?? code}” joined the herd.`, level: "success" });
+      } catch (e) {
+        this.phase = "error";
+        this.message = e instanceof Error ? e.message : String(e);
+      }
+      this.busy.approve = false;
+      cx.notify();
+    });
+  }
+
   // ---- publishing: delegate to the shared herdgate publisher ---------------
 
   publisherPath() {
@@ -245,13 +293,15 @@ export default class Herdgate extends View {
       cx.notify();
       return;
     }
-    this.message = "starting…";
+    this.busy.publish = true;
+    this.message = "starting publisher…";
     cx.notify();
     cx.spawn(async (cx) => {
       const found = await sh('[ -f "$1" ] && command -v node >/dev/null && printf yes', [index]);
       if (found?.stdout !== "yes") {
         this.phase = "error";
-        this.message = `needs node and ${index}`;
+        this.busy.publish = false;
+        this.message = `needs node on PATH and ${index}`;
         cx.notify();
         return;
       }
@@ -264,7 +314,8 @@ export default class Herdgate extends View {
       cx.timer.after(1_200, (cx) => {
         cx.spawn(async (cx) => {
           await this.refresh();
-          this.message = this.publisher.running ? "publisher started" : "the publisher did not start";
+          this.busy.publish = false;
+          this.message = this.publisher.running ? "publisher started — this machine is live on the gate" : "the publisher did not start (see state/publisher.log)";
           this.phase = this.publisher.running ? "idle" : "error";
           cx.notify();
         });
@@ -273,10 +324,12 @@ export default class Herdgate extends View {
   }
 
   stopPublisher(cx) {
+    this.busy.publish = true;
     cx.spawn(async (cx) => {
       if (this.publisher.pid) await sh('kill "$1" 2>/dev/null; true', [String(this.publisher.pid)]);
       await sh('rm -f "$1"', [PID_FILE]);
       await this.refresh();
+      this.busy.publish = false;
       this.message = "publisher stopped";
       cx.notify();
     });
@@ -292,6 +345,8 @@ export default class Herdgate extends View {
         .items_center()
         .child(div().text_size(11.5).text_color(t.dim).child(label))
         .child(div().flex_1().truncate().text_size(12).text_color(color ?? t.foreground).child(value));
+
+    const section = (label) => div().mt(2).text_size(9.5).font_semibold().text_color(t.dim).child(label);
 
     return v_flex()
       .id("herdgate-panel")
@@ -314,8 +369,8 @@ export default class Herdgate extends View {
               .rounded(5)
               .text_size(10.5)
               .bg(t.background)
-              .text_color(this.paired ? t.working : t.dim)
-              .child(this.paired ? "paired" : "not paired"),
+              .text_color(this.publisher.running ? t.working : this.paired ? t.dim : t.muted)
+              .child(this.publisher.running ? "live" : this.paired ? "paired" : "not paired"),
           ),
       )
       .child(line("cloud", this.cloud || "—"))
@@ -328,9 +383,33 @@ export default class Herdgate extends View {
             .child(`${this.lastPublish.summary.workspaces} spaces · ${this.lastPublish.summary.agents} agents · ${this.lastPublish.summary.herdr}`),
         ),
       )
-      .child(div().h(1).bg(t.border).my(2))
+      // The status banner: one place that always says what just happened or what is
+      // expected next. Colored by phase so "did my click do anything?" has an answer.
+      .child(
+        v_flex()
+          .id("hg-status")
+          .min_h(30)
+          .justify_center()
+          .px(8)
+          .py(4)
+          .rounded(6)
+          .bg(t.background)
+          .child(
+            div()
+              .text_size(11.5)
+              .text_color(this.phase === "error" ? t.accent : this.phase === "waiting" ? t.working : t.dim)
+              .child(
+                this.busy.pair || this.busy.publish || this.busy.approve || this.busy.save
+                  ? (this.message || "working…") + " ⏳"
+                  : this.message || "ready — Pair this machine, or approve another one below",
+              ),
+          ),
+      )
+      .child(section("THIS MACHINE"))
       .child(this.pairingBlock(t, cx))
-      .child(div().h(1).bg(t.border).my(2))
+      .child(section("ADD ANOTHER MACHINE"))
+      .child(this.approveBlock(t, cx))
+      .child(section("SETTINGS"))
       .child(this.settingsBlock(t, cx));
   }
 
@@ -342,14 +421,58 @@ export default class Herdgate extends View {
         .child(div().text_size(11.5).text_color(t.muted).child("approve in your dashboard"))
         .child(div().text_size(22).font_semibold().text_color(t.accent).child(this.pending.code.replace(/^(.{4})/, "$1 ")))
         .child(div().text_size(10.5).text_color(t.dim).truncate().child(this.pending.url ?? ""))
-        .child(this.button(t, "hg-cancel", "Cancel", t.input, t.foreground, (cx) => this.cancel(cx), true));
+        .child(
+          h_flex().gap(6).child(this.button(t, "hg-cancel", "Cancel", (cx2) => this.cancel(cx2), { enabled: !this.busy.pair })),
+        );
     }
     return h_flex()
       .id("hg-actions")
       .gap(6)
-      .child(this.button(t, "hg-pair", this.paired ? "Pair again" : "Pair", t.solid, t.solid_foreground, (cx) => this.pair(cx), true))
-      .child(this.button(t, "hg-publish", "Publish", t.input, t.foreground, (cx) => this.startPublisher(cx), this.paired && !this.publisher.running))
-      .child(this.button(t, "hg-stop", "Stop", t.input, t.foreground, (cx) => this.stopPublisher(cx), this.publisher.running));
+      .child(
+        this.button(t, "hg-pair", this.busy.pair ? "pairing…" : this.paired ? "Pair again" : "Pair", (cx2) => this.pair(cx2), {
+          primary: true,
+          enabled: !this.busy.pair && !this.busy.save,
+        }),
+      )
+      .child(
+        this.button(t, "hg-publish", this.busy.publish ? "starting…" : "Publish", (cx2) => this.startPublisher(cx2), {
+          enabled: this.paired && !this.publisher.running && !this.busy.publish,
+        }),
+      )
+      .child(
+        this.button(t, "hg-stop", "Stop", (cx2) => this.stopPublisher(cx2), {
+          enabled: this.publisher.running && !this.busy.publish,
+        }),
+      );
+  }
+
+  approveBlock(t, cx) {
+    return v_flex()
+      .id("hg-approve")
+      .gap(5)
+      .child(div().text_size(10.5).text_color(t.dim).child("on the other machine's herdgate panel, press Pair and type its code here"))
+      .child(
+        h_flex()
+          .gap(6)
+          .child(
+            Input.new(this.codeInput)
+              .id("hg-code-input")
+              .flex_1()
+              .h(28)
+              .px(8)
+              .items_center()
+              .rounded(6)
+              .border(1)
+              .border_color(t.input)
+              .bg(t.background)
+              .text_size(11.5)
+              .text_color(t.foreground),
+          )
+          .child(this.button(t, "hg-approve", this.busy.approve ? "approving…" : "Approve", (cx2) => this.approveOther(cx2), {
+            primary: true,
+            enabled: !this.busy.approve,
+          })),
+      );
   }
 
   settingsBlock(t, cx) {
@@ -377,27 +500,32 @@ export default class Herdgate extends View {
       .child(field("hg-cloud", this.cloudInput, "cloud URL"))
       .child(field("hg-root", this.rootInput, "herdgate folder"))
       .child(field("hg-name", this.nameInput, "this machine's name"))
+      .child(field("hg-token", this.tokenInput, "account token (owner) — used to approve other machines"))
       .child(
         h_flex().justify_between().items_center().child(
-          div().text_size(9.5).text_color(t.dim).child("token → config dir, mode 0600"),
-        ).child(this.button(t, "hg-save", "Save", t.input, t.foreground, (c) => this.saveSettings(c), true)),
+          div().text_size(9.5).text_color(t.dim).child("stored under the app's herdgate dir, mode 0600"),
+        ).child(this.button(t, "hg-save", this.busy.save ? "saving…" : "Save", (c) => this.saveSettings(c), { enabled: !this.busy.save })),
       );
   }
 
-  button(t, id, label, bg, fg, onClick, enabled) {
+  button(t, id, label, onClick, opts = {}) {
+    const { primary = false, enabled = true } = opts;
+    const bg = primary ? t.solid : t.input;
+    const fg = primary ? t.solid_foreground : t.foreground;
     return h_flex()
       .id(id)
-      .h(26)
-      .px(10)
+      .h(28)
+      .px(12)
       .items_center()
       .rounded(6)
       .bg(bg)
       .text_color(fg)
       .text_size(11.5)
       .when(!enabled, (el) => el.opacity(0.4))
+      .when(enabled, (el) => el.hover((s) => s.bg(primary ? bg : t.hover)))
       .cursor_pointer()
-      .on_click((_e, cx) => {
-        if (enabled) onClick(cx);
+      .on_click((_e, c) => {
+        if (enabled) onClick(c);
       })
       .child(label);
   }
