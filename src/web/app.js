@@ -11,7 +11,7 @@
 //   - the token lives in localStorage on this device and is never sent anywhere but the
 //     cloud's own WS endpoint.
 
-const BUILD = "v0.9.8";
+const BUILD = "v0.9.19";
 
 const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = "herdgate.token";
@@ -405,7 +405,72 @@ function renderRoom() {
       loadKeys();
     });
     loadKeys();
-    box.append(details);
+    details.append(keysBlock);
+  }
+
+  // The owner's roster for this machine: every paired device, its scope, live dot,
+  // public-key count — and the two things the owner always needs: pairing one more
+  // device (e.g. an `act` one) and un-pairing (revoke). Works with the account
+  // token, so it is here even when this browser itself is only a read device.
+  if (state.token && state.roomId) {
+    const block = document.createElement("details");
+    block.className = "devices";
+    const summaryEl = document.createElement("summary");
+    summaryEl.textContent = "Devices — paired phones, browsers and machines";
+    block.append(summaryEl);
+    const roster = document.createElement("div");
+    block.append(roster);
+    const pairMore = document.createElement("button");
+    pairMore.type = "button";
+    pairMore.className = "primary";
+    pairMore.textContent = "Pair another device (pick act for full control)";
+    pairMore.addEventListener("click", () => openPair(state.roomId));
+    block.append(pairMore);
+    box.append(block);
+
+    const loadDevices = async () => {
+      try {
+        const r = await fetch(`${cloudBase()}/v1/devices?room=${encodeURIComponent(state.roomId)}`, {
+          headers: { authorization: `Bearer ${state.token}` },
+        });
+        if (!r.ok) return;
+        const { devices = [] } = await r.json();
+        roster.replaceChildren();
+        for (const d of devices) {
+          const row = document.createElement("div");
+          row.className = "keyrow";
+          const pre = document.createElement("pre");
+          pre.textContent = `${d.name}  ·  ${d.scope}${d.connected ? "  ·  live" : ""}  ·  ${d.keys} key(s)  ·  ${d.id}${d.id === state.deviceId ? "  (this browser)" : ""}`;
+          row.append(pre);
+          const rm = document.createElement("button");
+          rm.type = "button";
+          rm.className = "link danger";
+          rm.textContent = "revoke";
+          rm.addEventListener("click", async () => {
+            if (!confirm(`Revoke ${d.name}? Its key and access die immediately.`)) return;
+            await fetch(`${cloudBase()}/v1/device/revoke`, {
+              method: "POST",
+              headers: { "content-type": "application/json", authorization: `Bearer ${state.token}` },
+              body: JSON.stringify({ device: d.id }),
+            });
+            if (d.id === state.deviceId) {
+              // This browser just un-paired itself: back to the machine list.
+              state.deviceId = null;
+              state.deviceSecret = null;
+              localStorage.removeItem(DEVICE_KEY);
+              localStorage.removeItem(DEVICE_SECRET_KEY);
+            }
+            loadDevices();
+          });
+          row.append(rm);
+          roster.append(row);
+        }
+        if (!devices.length) roster.append(note("none yet — pair a device below", "muted"));
+      } catch {
+        /* offline: the section stays as-is */
+      }
+    };
+    loadDevices();
   }
 }
 

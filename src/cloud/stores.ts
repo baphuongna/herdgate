@@ -157,6 +157,16 @@ export class State {
     return true;
   }
 
+  /** Un-pair: the owner revoked a device. Its secret dies with it (hash gone),
+ *  its websocket is kicked by the gateway, its push subscription with it. */
+  removeDevice(id: string): DeviceRecord | null {
+    const i = this.devices.findIndex((d) => d.id === id);
+    if (i < 0) return null;
+    const [gone] = this.devices.splice(i, 1);
+    this.#save();
+    return gone;
+  }
+
   accountById(id: string): Account | null {
     return this.accounts.find((a) => a.id === id) ?? null;
   }

@@ -576,11 +576,11 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     });
     ws.on("error", () => { /* onclose follows */ });
     sock.on("tobytes", (chunk: Buffer) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
+      if (ws.readyState === 1) ws.send(chunk); // 1 = OPEN, instance-safe
     });
     sock.on("close", () => {
       bye();
-      if (ws.readyState === WebSocket.OPEN) {
+      if (ws.readyState === 1) {
         try { ws.close(1000); } catch { /* undici: some codes throw */ }
       }
     });
@@ -876,6 +876,47 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         }
         if (u.protocol !== "https:" && u.protocol !== "http:") return json(res, 400, { error: "bad endpoint" });
         state.setDevicePush(device.id, endpoint);
+        return json(res, 200, { ok: true });
+      });
+    }
+
+    // The owner's device roster (per room) and un-pairing. Account-token auth —
+    // the same identity that approved the machine.
+    if (path === "/v1/devices") {
+      if (blocked(ipOf(req))) return json(res, 429, { error: "rate limited" });
+      if (req.method !== "GET") return json(res, 405, { error: "method not allowed" });
+      const account = accountByAuth(req);
+      if (!account) return json(res, 401, { error: "account token required" });
+      const q = new URL(req.url ?? "/", "http://x").searchParams;
+      const room = state.rooms.find((r) => r.id === (q.get("room") ?? ""));
+      if (!room || room.accountId !== account.id) return json(res, 403, { error: "not one of this account's rooms" });
+      const live = new Set<string>();
+      for (const c of deviceConns) if (c.device) live.add(c.device.id);
+      return json(res, 200, {
+        devices: state.devices
+          .filter((d) => d.roomId === room.id)
+          .map((d) => ({ id: d.id, name: d.name, scope: d.scope, connected: live.has(d.id), keys: (d.sshKeys ?? []).length, created: d.created })),
+      });
+    }
+    if (path === "/v1/device/revoke") {
+      if (blocked(ipOf(req))) return json(res, 429, { error: "rate limited" });
+      if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
+      const account = accountByAuth(req);
+      if (!account) return json(res, 401, { error: "account token required" });
+      return void readJsonBody(req).then((body) => {
+        const deviceId = typeof body?.device === "string" ? body.device : "";
+        const device = deviceId ? state.deviceById(deviceId) : null;
+        if (!device || device.accountId !== account.id) return json(res, 404, { error: "no such device" });
+        const gone = state.removeDevice(device.id);
+        if (!gone) return json(res, 404, { error: "no such device" });
+        for (const c of deviceConns) {
+          if (c.device?.id === device.id) {
+            deviceConns.delete(c);
+            try { c.ws.close(4001, "revoked"); } catch { /* already gone */ }
+          }
+        }
+        pushRoomUpdate(device.roomId);
+        log(`device ${device.id} (${device.name}) revoked by ${account.name}`);
         return json(res, 200, { ok: true });
       });
     }
