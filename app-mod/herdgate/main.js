@@ -21,7 +21,7 @@
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { exec, appHome, readTextFile, notify, theme, props } from "herdr";
+import { exec, appHome, readTextFile, notify, theme, props, window } from "herdr";
 
 const BASE = `${appHome()}/herdgate`;
 const SETTINGS = `${BASE}/settings.json`;
@@ -83,6 +83,9 @@ export default class Herdgate extends View {
     this.message = "";
     this.busy = { pair: false, publish: false, approve: false, save: false };
     this.notified = false;
+
+    this.isWindows = false;
+    try { this.isWindows = window()?.platform === "windows"; } catch { /* window() unavailable this early */ }
 
     this.cloudInput = InputState.new({ placeholder: "https://herd.example.com" });
     this.rootInput = InputState.new({ placeholder: "set by `npx @bom0792/herdgate setup-host`" });
@@ -270,6 +273,12 @@ export default class Herdgate extends View {
   }
 
   startPublisher(cx) {
+    if (this.isWindows) {
+      this.phase = "error";
+      this.message = "publishing this machine needs Linux/macOS for now (Windows host is coming) — pairing and approving below still work";
+      cx.notify();
+      return;
+    }
     if (!this.paired) {
       this.phase = "error";
       this.message = "pair this machine first";
@@ -314,6 +323,12 @@ export default class Herdgate extends View {
   }
 
   stopPublisher(cx) {
+    if (this.isWindows) {
+      this.phase = "error";
+      this.message = "no publisher can be running here (Windows host is coming)";
+      cx.notify();
+      return;
+    }
     this.busy.publish = true;
     cx.spawn(async (cx) => {
       if (this.publisher.pid) await sh('kill "$1" 2>/dev/null; true', [String(this.publisher.pid)]);
@@ -396,6 +411,7 @@ export default class Herdgate extends View {
           ),
       )
       .child(section("THIS MACHINE"))
+      .when(this.isWindows, (el) => el.child(div().text_size(10).text_color(t.dim).child("this machine can pair and approve others; publishing it needs Linux/macOS for now")))
       .child(this.pairingBlock(t, cx))
       .child(section("ADD ANOTHER MACHINE"))
       .child(this.approveBlock(t, cx))
@@ -440,7 +456,7 @@ export default class Herdgate extends View {
     return v_flex()
       .id("hg-approve")
       .gap(5)
-      .child(div().text_size(10.5).text_color(t.dim).child("on the other machine's herdgate panel, press Pair and type its code here"))
+      .child(div().text_size(10.5).text_color(t.dim).child("want another machine in the herd? on IT: npx @bom0792/herdgate setup-host → its herdgate panel → Pair — it shows a code. type that code here:"))
       .child(
         h_flex()
           .gap(6)
