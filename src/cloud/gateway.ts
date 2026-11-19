@@ -109,11 +109,12 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
 
   /** A virtual SSH client socket: bytes arrive from / leave to a bridged wss frame. */
   class VirtualSshSocket extends Duplex {
-    readonly remoteAddress = "bridge"; // the sshd's strike map sees one source — documented
+    readonly remoteAddress: string; // the sshd's strike map sees this source — documented
     readonly remoteFamily = "IPv4";
     readonly remotePort = 0;
-    constructor() {
+    constructor(addr: string) {
       super({ allowHalfOpen: false });
+      this.remoteAddress = addr;
     }
     // ssh2 (isWritable) also reads these — Duplex provides writable/_readableState.
     _write(chunk: Buffer, _enc: string, cb: (err?: Error | null) => void): void {
@@ -307,7 +308,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     };
   };
 
-  const upgrade = (req: IncomingMessage, socket: import("node:stream").Duplex, head: Buffer, leg: "agent" | "device" | "bridge"): void => {
+  const upgrade = (req: IncomingMessage, socket: import("node:stream").Duplex, head: Buffer, leg: "agent" | "device" | "bridge" | "ssh-ws"): void => {
     const ip = ipOf(req);
     if (blocked(ip)) {
       socket.write("HTTP/1.1 429 Too Many Requests\r\n\r\n");
@@ -317,6 +318,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     wss.handleUpgrade(req, socket, head, (ws) => {
       if (leg === "agent") attachAgent(ws, ip);
       else if (leg === "bridge") attachBridge(ws, ip);
+      else if (leg === "ssh-ws") attachSshTunnel(ws, ip);
       else attachDevice(ws, ip);
     });
   };
@@ -490,7 +492,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
           const sid = typeof m.sid === "string" ? m.sid : "";
           if (!sid || sessions.has(sid)) return fail(ws, "bad-message", "bridge.open.sid");
           if (!sshd) return fail(ws, "no-ssh", "ssh leg disabled");
-          const sock = new VirtualSshSocket();
+          const sock = new VirtualSshSocket("bridge");
           sessions.set(sid, sock);
           sock.on("tobytes", (chunk: Buffer) => send(ws, { t: "bridge.data", sid, b64: chunk.toString("base64") }));
           sock.on("close", () => {
@@ -533,6 +535,56 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         log(`bridge (${conn.account.name}) disconnected`);
       }
     });
+  };
+
+  /**
+   * The ssh-ws leg (`/v1/ssh/ws`): one WebSocket = one raw SSH connection, piped
+   * into the sshd via `inject`. For clients whose network cannot reach the TCP
+   * leg (IPv4-only vs an AAAA-only host) — the tunnel rides port 443 like the
+   * web app. No pre-auth: the SSH protocol itself authenticates (device id +
+   * publickey/password) and the sshd's strike map keys on the socket's address —
+   * which, behind a CDN, is the edge IP; documented, and bounded here.
+   */
+  const sshTunnels = new Map<string, number>();
+  const SSH_TUNNELS_PER_IP = 6;
+  const SSH_TUNNELS_TOTAL = 64;
+  const attachSshTunnel = (ws: WebSocket, ip: string): void => {
+    const n = sshTunnels.get(ip) ?? 0;
+    const total = [...sshTunnels.values()].reduce((a, b) => a + b, 0);
+    if (!sshd || n >= SSH_TUNNELS_PER_IP || total >= SSH_TUNNELS_TOTAL) {
+      ws.close(1013, !sshd ? "ssh leg disabled" : "busy");
+      return;
+    }
+    sshTunnels.set(ip, n + 1);
+    const sock = new VirtualSshSocket(ip);
+    let closed = false;
+    const bye = (): void => {
+      if (closed) return;
+      closed = true;
+      const left = (sshTunnels.get(ip) ?? 1) - 1;
+      if (left > 0) sshTunnels.set(ip, left);
+      else sshTunnels.delete(ip);
+    };
+    ws.on("message", (data, isBinary) => {
+      if (!isBinary) return ws.close(1003, "binary only");
+      if (!sock.push(Buffer.from(data as Buffer))) return; // sshd not reading: leave the buffering to ws
+    });
+    ws.on("close", () => {
+      bye();
+      sock.push(null); // EOF: the sshd hangs up cleanly
+      sock.destroy();
+    });
+    ws.on("error", () => { /* onclose follows */ });
+    sock.on("tobytes", (chunk: Buffer) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
+    });
+    sock.on("close", () => {
+      bye();
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.close(1000); } catch { /* undici: some codes throw */ }
+      }
+    });
+    sshd.inject(sock as unknown as import("node:net").Socket);
   };
 
   const attachDevice = (ws: WebSocket, ip: string): void => {
@@ -888,6 +940,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     if (path === "/v1/agent/ws") return upgrade(req, socket, head, "agent");
     if (path === "/v1/device/ws") return upgrade(req, socket, head, "device");
     if (path === "/v1/bridge/ws") return upgrade(req, socket, head, "bridge");
+    if (path === "/v1/ssh/ws") return upgrade(req, socket, head, "ssh-ws");
     socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
     socket.destroy();
   });

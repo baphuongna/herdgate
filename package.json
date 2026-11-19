@@ -1,6 +1,6 @@
 {
   "name": "@bom0792/herdgate",
-  "version": "0.9.14",
+  "version": "0.9.15",
   "description": "Cloud relay hub for herdr-core: every machine dials out, phones and browsers follow (PWA + SSH leg, E2E payloads).",
   "type": "module",
   "engines": {
@@ -34,6 +34,7 @@
     "app-mod",
     "plugin",
     "scripts",
-    "dist-readme.md"
+    "dist-readme.md",
+    "templates"
   ]
 }

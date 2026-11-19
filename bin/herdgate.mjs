@@ -60,6 +60,14 @@ function setupHost() {
   const base = join(home, "herdgate");
   mkdirSync(base, { recursive: true });
   cpSync(pluginSrc, join(base, "plugin"), { recursive: true });
+  // The --via transport for `hc machine add` when the SSH leg's TCP host is
+  // unreachable from THIS machine (e.g. IPv4-only network vs an AAAA record):
+  // it pipes the system ssh through wss on port 443. One stable path for --via.
+  const viaSrc = join(ROOT, "templates", "herdgate-via.mjs");
+  if (existsSync(viaSrc)) {
+    mkdirSync(join(base, "bin"), { recursive: true });
+    cpSync(viaSrc, join(base, "bin", "herdgate-via.mjs"));
+  }
 
   // Prefill what the panel would otherwise ask for. The publisher is spawned from
   // <root>/plugin/server/index.mjs — keep root pinned to where we just put it.
@@ -78,12 +86,24 @@ function setupHost() {
   console.log(`herdgate: installed for herdr-app at ${home}
   mod       → ${join(home, "mods", "herdgate")}
   publisher → ${join(base, "plugin", "server", "index.mjs")}
+  via       → ${join(base, "bin", "herdgate-via.mjs")}
   settings  → ${settingsPath} (cloud: ${cloud}, name: ${name})
 
 Next: open (or restart) herdr-app → herdgate panel → Pair, then approve the
 code in the PWA (${cloud}) and click Publish. Requires node >= 22 on PATH
 for the publisher (node -v).`);
   if (!arg("no-integrate")) integrate(home);
+  // The other direction — THIS machine controlling one that is already paired —
+  // needs one command. Print it ready to paste (cmd expands %USERPROFILE%).
+  const viaPath = join(base, "bin", "herdgate-via.mjs");
+  if (existsSync(viaPath)) {
+    console.log(`
+To connect FROM this machine to another machine in the herd (no admin,
+works on IPv4-only networks — ssh over wss/443), first:
+  ssh-keygen -t ed25519 -f "%USERPROFILE%\\.ssh\\herdgate" -N "" -q
+and register the printed key in the PWA (machine → Public keys). Then:
+  hc machine add <device-id>@herdgate --name home --via "node ${viaPath} --gate ${cloud} --user <device-id>"`);
+  }
 }
 
 // ---- first-class panel: clone the main layout + tabs mod, add herdgate to both ----
