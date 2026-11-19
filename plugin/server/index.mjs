@@ -9,7 +9,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { hostname } from "node:os";
+import { hostname, homedir } from "node:os";
 import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize } from "./common.mjs";
 import { createSshBridge } from "./ssh.mjs";
 import { HostChannel, b64d, b64e, fingerprint, generateKeyPair } from "./e2e.mjs";
@@ -17,6 +17,10 @@ import { HostChannel, b64d, b64e, fingerprint, generateKeyPair } from "./e2e.mjs
 const D = dirs();
 const NAME = process.env.HERDGATE_HOST_NAME || hostname();
 const log = (line) => console.error(`herdgate: ${line}`);
+/** The panel's settings file (app home herdgate dir) — the owner's switches live
+ *  there. HERDGATE_SETTINGS lets tests point somewhere else. */
+const SETTINGS =
+  process.env.HERDGATE_SETTINGS ?? join(homedir(), ".config", "herdr-app", "herdgate", "settings.json");
 
 /** The publisher runs as a detached child of `serve`, recording its pid in state. */
 const pidPath = D.stateDir ? join(D.stateDir, "publisher.pid") : "";
@@ -273,7 +277,10 @@ async function publisherLoop() {
     wsRef = ws;
     let helloed = false;
     ws.onopen = () => {
-      ws.send(JSON.stringify({ v: 1, t: "hello", roomToken: token, info: { name: NAME, version: "0.1.0", capabilities: ["dev.herdgate.host", "read-only"] } }));
+      // Advertise honestly: `act` only when the owner's switch allows it.
+      let allowAct = false;
+      try { allowAct = (JSON.parse(readFileSync(SETTINGS, "utf8")) ?? {}).allowAct === true; } catch { /* no settings yet */ }
+      ws.send(JSON.stringify({ v: 1, t: "hello", roomToken: token, info: { name: NAME, version: "0.1.0", capabilities: ["dev.herdgate.host", allowAct ? "act" : "read-only"] } }));
     };
     ws.onmessage = (ev) => {
       void (async () => {
@@ -329,8 +336,13 @@ async function publisherLoop() {
         return void replyTo({ op: "error", code: "read-only", message: `dev.herdgate.host has no op ${String(op)}` });
       }
       if (m.t === "pair.request") {
-        // Read-only plugin: `act` is never granted.
-        ws.send(JSON.stringify({ v: 1, t: "pair.response", requestId: m.requestId, ok: false }));
+        // `act` (control) is the owner's call, made ON THIS MACHINE: the settings'
+        // allowAct switch. Read fresh — the panel can flip it while we run.
+        let allow = false;
+        try { allow = (JSON.parse(readFileSync(SETTINGS, "utf8")) ?? {}).allowAct === true; } catch { /* not configured */ }
+        const ok = allow && m.scope === "act";
+        log(`pair request from ${m.device?.name ?? "?"} for ${m.scope}: ${ok ? "approved (allowAct)" : "denied"}`);
+        ws.send(JSON.stringify({ v: 1, t: "pair.response", requestId: m.requestId, ok }));
         return;
       }
       if (m.t === "ping") ws.send(JSON.stringify({ v: 1, t: "pong", n: m.n ?? 0 }));

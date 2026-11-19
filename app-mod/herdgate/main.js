@@ -72,7 +72,7 @@ async function readJson(path) {
 export default class Herdgate extends View {
   init(_props, cx) {
     this.h = cx.focus_handle();
-    this.settings = { cloud: "", root: "", name: "", accountToken: "" };
+    this.settings = { cloud: "", root: "", name: "", accountToken: "", allowAct: false };
     this.paired = false;
     this.cloud = "";
     this.publisher = { pid: null, running: false };
@@ -109,7 +109,7 @@ export default class Herdgate extends View {
 
   async load() {
     const s = await readJson(SETTINGS);
-    if (s) this.settings = { cloud: s.cloud ?? "", root: s.root ?? "", name: s.name ?? "", accountToken: s.accountToken ?? "" };
+    if (s) this.settings = { cloud: s.cloud ?? "", root: s.root ?? "", name: s.name ?? "", accountToken: s.accountToken ?? "", allowAct: s.allowAct === true };
     await this.refresh();
   }
 
@@ -137,6 +137,21 @@ export default class Herdgate extends View {
     await this.refresh();
     this.busy.save = false;
     this.message = cloud ? "settings saved" : "a cloud URL is required";
+    cx?.notify?.();
+  }
+
+  /** Flip the owner's switch for `act` (control) devices — the only way a paired
+ *  device gets more than read. Takes effect on the next pair; the publisher
+ *  re-reads settings on each request. */
+  async toggleAct(cx) {
+    const cur = await readJson(SETTINGS);
+    const s = { cloud: "", root: "", name: "", accountToken: "", ...(cur ?? {}), ...this.settings };
+    s.allowAct = s.allowAct !== true;
+    await sh('umask 077; printf "%s" "$2" > "$3"', [BASE, JSON.stringify(s, null, 2), SETTINGS]);
+    this.settings = s;
+    this.message = s.allowAct
+      ? "act devices allowed — new pairs can control (existing devices keep their scope)"
+      : "act devices blocked — new pairs are read-only";
     cx?.notify?.();
   }
 
@@ -507,6 +522,11 @@ export default class Herdgate extends View {
       .child(field("hg-root", this.rootInput, "herdgate folder"))
       .child(field("hg-name", this.nameInput, "this machine's name"))
       .child(field("hg-token", this.tokenInput, "account token (owner) — used to approve other machines"))
+      .child(
+        h_flex().justify_between().items_center().gap(6).child(
+          div().text_size(10).text_color(t.dim).child("control (act) devices — let paired machines do more than read"),
+        ).child(this.button(t, "hg-act", this.settings.allowAct ? "allowed" : "blocked", (c) => this.toggleAct(c))),
+      )
       .child(
         h_flex().justify_between().items_center().child(
           div().text_size(9.5).text_color(t.dim).child("stored under the app's herdgate dir, mode 0600"),
