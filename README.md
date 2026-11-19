@@ -127,6 +127,11 @@ ssh -p 2222 d_xxxxxxxx@your-gate        # password = the device key shown once a
 - Only `hc …` runs — no shell, no sftp, no port forwarding.
 - The host needs `herdr-core` (`hc`) on PATH or `HERDGATE_HC_BIN`.
 
+**Note:** ssh2 1.17.0 has a malformed `server-sig-algs` EXT_INFO (a missing comma garbles the
+algorithm list) that makes real OpenSSH clients silently abandon publickey auth right after
+`PK_OK`. `scripts/patch-ssh2.mjs` (wired as `postinstall`) fixes the literal in place until
+an upstream release carries the fix; the system-ssh test below guards the regression.
+
 Gateway flags: `HERDGATE_SSH_PORT` (default 2222, `0` disables), `HERDGATE_SSH_BIND` (loopback; `0.0.0.0` for
 LAN phones), `HERDGATE_SSH_KEY` (host key file). Verified against real herdr-core 0.1.21.
 Anything that is not `view`/`ping` is refused **on the host** with `read-only` — the cloud cannot see payloads,

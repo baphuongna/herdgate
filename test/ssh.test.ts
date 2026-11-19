@@ -408,3 +408,63 @@ test("ssh leg: publickey auth — register a key, log in without a password", as
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("ssh leg: publickey via the real OpenSSH client (regression: ssh2's broken server-sig-algs)", async () => {
+  if (process.platform !== "linux") return; // needs the system `ssh`
+  const dir = mkdtempSync(join(tmpdir(), "herdgate-ssh-sys-"));
+  const ACCOUNT = "ssh-sys-account-tok";
+  const keyPath = join(dir, "id_ed25519");
+  const pub = await new Promise<string>((resolve, reject) => {
+    const p = spawn("ssh-keygen", ["-t", "ed25519", "-f", keyPath, "-N", "", "-q"]);
+    p.on("exit", (c) => (c === 0 ? resolve(readFileSync(keyPath + ".pub", "utf8").trim()) : reject(new Error("ssh-keygen failed"))));
+  });
+
+  const cloud = await startCloud({
+    accounts: [{ id: "a1", name: "owner", token: ACCOUNT }],
+    log: () => {},
+    ssh: { port: 0, keyPath: join(dir, "hostkey.json") },
+  });
+  const base = `http://127.0.0.1:${cloud.port}`;
+  const port = cloud.ssh?.port ?? 0;
+  try {
+    const code = (await fetch(`${base}/v1/agent/code`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "ssh-host" }) }).then((r) => r.json())) as { code: string };
+    await fetch(`${base}/v1/agent/approve`, { method: "POST", headers: { authorization: `Bearer ${ACCOUNT}`, "content-type": "application/json" }, body: JSON.stringify({ code: code.code }) });
+    const roomId = await roomIdOf(base, ACCOUNT);
+    const sock = new DeviceSock(base.replace("http", "ws") + "/v1/device/ws");
+    await sock.send({ t: "hello", accountToken: ACCOUNT, name: "sys-ssh" });
+    await sock.expect("hello");
+    sock.send({ t: "pair.begin", roomId, name: "sys-ssh", scope: "read" });
+    const granted = (await sock.expect("pair.granted")) as unknown as { device: { id: string }; deviceSecret?: string };
+    sock.close();
+    const reg = await fetch(`${base}/v1/device/sshkey`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ device: granted.device.id, deviceSecret: granted.deviceSecret, pubkey: pub }) });
+    assert.equal(reg.status, 200);
+
+    // BatchMode = the app's world: no TTY, no agent help, only the key. `exit` is the
+    // sshd's no-op, so a successful run is a clean exit 0 with no output.
+    const res = await new Promise<{ code: number | null; out: string }>((resolve) => {
+      const p = spawn("ssh", [
+        "-p", String(port),
+        "-o", "BatchMode=yes",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", `IdentityFile=${keyPath}`,
+        "-o", "IdentitiesOnly=yes",
+        `${granted.device.id}@127.0.0.1`,
+        "exit",
+      ]);
+      let out = "";
+      p.stdout.on("data", (d: Buffer) => (out += d));
+      p.stderr.on("data", (d: Buffer) => (out += d));
+      const t = setTimeout(() => p.kill("SIGKILL"), 10_000);
+      p.on("exit", (c) => { clearTimeout(t); resolve({ code: c, out }); });
+    });
+    // No agent in this test, so exec ends with the honest "host not connected"
+    // (exit 111) — what matters is that AUTH succeeded: no denial, no ssh-level 255.
+    assert.notEqual(res.code, 255, `system ssh failed before the channel: ${res.out.slice(0, 200)}`);
+    assert.ok(!res.out.includes("Permission denied"), res.out.slice(0, 200));
+    assert.ok(res.out.includes("the host is not connected"), `the channel opened: ${res.out.slice(0, 200)}`);
+  } finally {
+    await cloud.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
