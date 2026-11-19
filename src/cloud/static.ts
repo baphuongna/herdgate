@@ -27,6 +27,8 @@ const TYPES: Record<string, string> = {
   ".png": "image/png",
   ".ico": "image/x-icon",
   ".txt": "text/plain; charset=utf-8",
+  ".zip": "application/zip",
+  ".md": "text/markdown; charset=utf-8",
   ".woff2": "font/woff2",
 };
 

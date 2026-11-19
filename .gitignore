@@ -6,3 +6,4 @@ node_modules/
 # Herdr app generates these into any mod folder it loads/checks.
 app-mod/**/jsconfig.json
 app-mod/**/*.d.ts
+src/web/herdgate-host.zip
