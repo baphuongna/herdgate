@@ -39,6 +39,12 @@
         <p id="rooms-empty" class="muted" hidden>
           No machine is paired yet. Pair one from Herdr — its plugin or app panel prints a code.
         </p>
+        <form id="addmachine" autocomplete="off">
+          <label for="addmachine-code">Add a machine — enter the code its herdgate panel shows</label>
+          <input id="addmachine-code" type="text" inputmode="text" autocomplete="off" placeholder="pairing code" required />
+          <button type="submit">Approve</button>
+        </form>
+        <p id="addmachine-note" class="muted small" hidden></p>
         <p id="build" class="muted small"></p>
       </section>
 

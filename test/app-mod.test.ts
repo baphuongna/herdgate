@@ -38,7 +38,7 @@ test("main.js: uses only documented mod surfaces", () => {
   const fromHerdr = imports.find((i) => i.from === "herdr")?.names ?? [];
   for (const name of fromHerdr) {
     assert.ok(
-      ["exec", "appHome", "readTextFile", "notify", "theme", "props", "closeOverlay", "run", "shared"].includes(name),
+      ["exec", "appHome", "readTextFile", "notify", "theme", "props", "closeOverlay", "run", "shared", "setShared"].includes(name),
       `"${name}" is not a documented export of the herdr module`,
     );
   }

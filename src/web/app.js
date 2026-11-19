@@ -11,7 +11,7 @@
 //   - the token lives in localStorage on this device and is never sent anywhere but the
 //     cloud's own WS endpoint.
 
-const BUILD = "v0.9.2";
+const BUILD = "v0.9.8";
 
 const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = "herdgate.token";
@@ -740,6 +740,33 @@ $("signin-form").addEventListener("submit", (event) => {
   $("token").value = "";
   render();
   connect();
+});
+
+// Approve a new machine: the owner types the code its herdgate panel shows.
+$("addmachine").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const code = $("addmachine-code").value.trim();
+  const noteEl = $("addmachine-note");
+  noteEl.hidden = false;
+  noteEl.className = "muted small";
+  noteEl.textContent = "approving…";
+  try {
+    const r = await fetch(`${cloudBase()}/v1/agent/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${state.token}` },
+      body: JSON.stringify({ code }),
+    });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? `HTTP ${r.status}`);
+    $("addmachine-code").value = "";
+    noteEl.textContent = "approved — the machine appears when its publisher connects";
+    // A fresh hello lists the new room (rooms come from hello).
+    state.closedByUs = true;
+    state.ws?.close();
+    connect();
+  } catch (e) {
+    noteEl.className = "error small";
+    noteEl.textContent = String(e.message ?? e);
+  }
 });
 
 $("menu").addEventListener("click", () => {

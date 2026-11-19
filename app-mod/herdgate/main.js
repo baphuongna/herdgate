@@ -20,7 +20,7 @@
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { exec, appHome, readTextFile, notify, theme, props } from "herdr";
+import { exec, appHome, readTextFile, notify, theme, props, shared, setShared } from "herdr";
 
 const BASE = `${appHome()}/herdgate`;
 const SETTINGS = `${BASE}/settings.json`;
@@ -71,6 +71,15 @@ async function readJson(path) {
 export default class Herdgate extends View {
   init(_props, cx) {
     this.h = cx.focus_handle();
+    // The shipped tabs mod renders its panel buttons from shared("workspace.panels")
+    // (the welcome may have fixed it to ["files","changes"] — the layout clone's new
+    // default never applies then). Self-heal: join the list once, keeping whatever
+    // the person chose.
+    {
+      const panels = shared("workspace.panels");
+      const list = Array.isArray(panels) ? panels : ["files", "changes"];
+      if (!list.includes("herdgate")) setShared("workspace.panels", [...list, "herdgate"]);
+    }
     this.settings = { cloud: "", root: "", name: "" };
     this.paired = false;
     this.cloud = "";
