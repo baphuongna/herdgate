@@ -101,6 +101,20 @@ function do_(args) {
   return { ok: r.status === 0, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
 }
 
+/** A clone the app rejects (version drift, a broken older patch) must never stay:
+ *  verify, and on failure rebuild from the shipped mod and re-patch once. */
+function verifyTabs(home, live) {
+  const dir = join(home, "mods", "tabs-herdgate");
+  const main = join(dir, "main.js");
+  if (!existsSync(main)) return false;
+  if (live) {
+    const r = spawnSync("herdr-app", ["check", dir], { encoding: "utf8" });
+    return r.status === 0 && !/failed|error/i.test(`${r.stdout}${r.stderr}`);
+  }
+  const r = spawnSync(process.execPath, ["--check", main], { encoding: "utf8" });
+  return r.status === 0;
+}
+
 function integrate(home) {
   const probe = spawnSync("herdr-app", ["status"], { encoding: "utf8" });
   const live = probe.status === 0;
@@ -108,6 +122,10 @@ function integrate(home) {
   // registers the clone). Offline: shipped mods are plain files — copy them; a
   // closed app reads the folder at start.
   let tabs = join(home, "mods", "tabs-herdgate", "main.js");
+  if (existsSync(tabs) && !verifyTabs(home, live)) {
+    console.log("herdgate: the existing tabs-herdgate does not load — rebuilding it from the shipped tabs mod");
+    cpSync(join(home, "mods", "tabs"), join(home, "mods", "tabs-herdgate"), { recursive: true });
+  }
   if (!existsSync(tabs)) {
     let ok = false;
     if (live) ok = do_(["mod.clone", JSON.stringify({ name: "tabs", as: "tabs-herdgate" })]).ok;
@@ -119,30 +137,30 @@ function integrate(home) {
   const btn = `.when(enabled.includes("herdgate"), el => el.child(panelButton("herdgate", "herdgate", "mods/herdgate/herdgate.svg")))`;
   let changed = false;
   if (src.includes(anchor) && !src.includes(btn)) {
-    src = src.replace(anchor, `${anchor}\n      ${btn}`);
-    changed = true;
-  } else if (!src.includes(btn)) {
-    console.log("herdgate: tabs mod anchors not found (Herdr version drift?) — button not added, pane.split still works");
-  }
-  // Independent of the button: the tab bar always loads, so IT self-heals the panel
-  // list — if the welcome fixed workspace.panels without us, join it (converges in
-  // one re-render). Machines patched by older installers lack this; re-running adds it.
-  if (!src.includes("setShared(\"workspace.panels\")")) {
-    const heal = `const __panels = shared("workspace.panels");
-    if (!Array.isArray(__panels) || !__panels.includes("herdgate"))
-      setShared("workspace.panels", [...(Array.isArray(__panels) ? __panels : ["files", "changes"]), "herdgate"]);
-    const enabled = shared("workspace.panels") ?? ["files", "changes"];`;
-    // 0.9.7-patched clones carry the herdgate variant of the enabled default.
-    const before = src;
-    src = src.replace(`const enabled = shared("workspace.panels") ?? ["files", "changes"];`, heal);
-    if (src === before) src = src.replace(`const enabled = shared("workspace.panels") ?? ["files", "changes", "herdgate"];`, heal);
+    // Unconditional .child — no shared("workspace.panels") gate, no new imports:
+    // the button exists on every Herdr version (older apps may lack setShared).
+    src = src.replace(anchor, `${anchor}\n      .child(panelButton("herdgate", "herdgate", "mods/herdgate/herdgate.svg"))`);
     src = src.replace(
-      `import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings } from "herdr";`,
-      `import { spaces, panes, run, openOverlay, theme, window, shared, setShared, layout, settings } from "herdr";`,
+      `const enabled = shared("workspace.panels") ?? ["files", "changes"];`,
+      `const enabled = shared("workspace.panels") ?? ["files", "changes", "herdgate"];`,
     );
     changed = true;
+  } else if (!src.includes(btn) && !src.includes('panelButton("herdgate"')) {
+    console.log("herdgate: tabs mod anchors not found (Herdr version drift?) — button not added, pane.split still works");
   }
-  if (changed) writeFileSync(tabs, src);
+if (changed) writeFileSync(tabs, src);
+  if (changed && !verifyTabs(home, live)) {
+    console.log("herdgate: the patched tabs clone does not load — retrying from a fresh copy");
+    cpSync(join(home, "mods", "tabs"), join(home, "mods", "tabs-herdgate"), { recursive: true });
+    const fresh = readFileSync(tabs, "utf8");
+    if (fresh.includes(anchor)) {
+      writeFileSync(tabs, fresh.replace(anchor, `${anchor}\n      .child(panelButton("herdgate", "herdgate", "mods/herdgate/herdgate.svg"))`));
+    }
+    if (!verifyTabs(home, live)) {
+      console.log("herdgate: still no — restoring the shipped tabs mod untouched (button not added; pane.split still works)");
+      cpSync(join(home, "mods", "tabs"), join(home, "mods", "tabs-herdgate"), { recursive: true });
+    }
+  }
 
   // 2. clone the main layout, seat herdgate in panel-body, point the tab bar at the clone.
   const layoutPath = join(home, "layouts", "herdgate-main.json");
