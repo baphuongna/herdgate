@@ -35,7 +35,7 @@ import {
 import { AgentCodes } from "./pairing.ts";
 import { parseAuthorizedKey, sshKeyFingerprint } from "./sshd.ts";
 import { type Account, type DeviceRecord, type RoomRecord, State } from "./stores.ts";
-import { readJsonBody, randomId, sameSecret, sha256Hex } from "./util.ts";
+import { pruneBudget, readJsonBody, randomId, sameSecret, sha256Hex } from "./util.ts";
 import { serveStatic } from "./static.ts";
 import { startSshd, type SshHandle, type SshConfig } from "./sshd.ts";
 import { pushEndpoint, sendWake } from "./push.ts";
@@ -235,12 +235,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     if (loopbackOf(addr)) return `${addr}#${randomId("k")}`;
     return addr;
   };
-  const pruneFails = (): void => {
-    if (fails.size <= FAILS_MAX) return;
-    const now = Date.now();
-    for (const [k, f] of fails) if (now - f.at > 60_000) fails.delete(k);
-    if (fails.size > FAILS_MAX) fails.clear();
-  };
+  const pruneFails = (): void => pruneBudget(fails, FAILS_MAX, 60_000);
   const strike = (key: string): void => {
     pruneFails();
     const f = fails.get(key) ?? { n: 0, until: 0, at: Date.now() };
@@ -261,6 +256,11 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
   const MINT_PER_KEY = 10;
   const MINT_WINDOW_MS = 10 * 60_000;
   const mints = new Map<string, { n: number; until: number; at: number }>();
+  // The budget map itself must stay bounded too (audit
+  // gateway:mint-budget-map-unbounded): per-connection keys behind a
+  // same-host proxy must not accumulate forever.
+  const MINTS_MAX = 4_096;
+  const pruneMints = (): void => pruneBudget(mints, MINTS_MAX, MINT_WINDOW_MS);
 
   const sendText = (ws: WebSocket, text: string | Buffer): void => {
     if (ws.readyState !== WebSocket.OPEN) return;
@@ -826,10 +826,10 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       // Two budgets so minting cannot be driven without limit (audit
       // pairing:unbounded-code-mint): a small per-client rate and a global
       // pending cap inside AgentCodes.
+      pruneMints();
       const m = mints.get(key) ?? { n: 0, until: 0, at: Date.now() };
       const now = Date.now();
       if (m.until > now) {
-        mints.set(key, m);
         return json(res, 429, { error: "too many pairing codes; retry shortly" });
       }
       if (now - m.at > MINT_WINDOW_MS) m.n = 0;

@@ -53,7 +53,9 @@ test('connect: pairs, keys, config blocks — idempotent, no secrets stored, act
     const homeRoom = (await mintRoom(base, 'home')).roomId;
 
     // A host agent that approves act pairing (event loop stays live for runAsync).
-    const laptop = await mintRoom(base, 'laptop');
+    // The room name is deliberately shell-hostile: the printed `herdr machine add`
+    // hint must single-quote it (JSON quoting leaves $ and ` live).
+    const laptop = await mintRoom(base, 'laptop"$(touch /tmp/hg-pwned)"');
     const agent = new DeviceSock(base.replace('http:', 'ws:') + '/v1/agent/ws');
     await agent.hello({ roomToken: laptop.roomToken });
 
@@ -95,7 +97,7 @@ test('connect: pairs, keys, config blocks — idempotent, no secrets stored, act
     assert.match(again.stdout, /revoke its previous device/i);
 
     // act pairing waits for the host's approval (agent answers while the CLI runs).
-    const act = runAsync(env, `${token}\n`, 'connect', '--cloud', 'local', '--room', 'laptop', '--scope', 'act');
+    const act = runAsync(env, `${token}\n`, 'connect', '--cloud', 'local', '--room', laptop.roomId, '--scope', 'act');
     const ask = await agent.expect('pair.request', 10_000);
     assert.equal(ask.scope, 'act');
     await agent.send({ t: 'pair.response', requestId: ask.requestId, ok: true });
@@ -107,7 +109,9 @@ test('connect: pairs, keys, config blocks — idempotent, no secrets stored, act
     const laptopId = /User (d_[A-Za-z0-9]+)/.exec(cfg3.split('# herdgate connect:begin local')[2])![1];
     const laptopDevices = await roster(laptop.roomId);
     assert.equal(laptopDevices.find((d) => d.id === laptopId)?.scope, 'act');
-    assert.match(actResult.stdout, /herdr machine add laptop/);
+    assert.ok(actResult.stdout.includes(`herdr machine add laptop-touch-tmp-hg-pwned --label 'laptop"$(touch /tmp/hg-pwned)"' --remote-session default`),
+      'the pasted hint single-quotes the host-controlled label (no shell substitution)');
+    assert.ok(!actResult.stdout.includes('--label "'), 'no JSON-quoted label remains in the hint');
 
     // Unknown room names fail honestly with the available machines listed.
     const miss = await runAsync(env, `${token}\n`, 'connect', '--cloud', 'local', '--room', 'nope');

@@ -387,6 +387,10 @@ function promptSecret(question) {
 
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+/** POSIX single-quoting: safe to paste into sh/bash for any label bytes
+ *  (JSON quoting leaves $ and ` live inside double quotes). */
+const shellQuote = (s) => `'${String(s).replaceAll("'", "'\\''")}'`;
+
 function gateWs(origin) {
   const url = origin.replace(/^http/, "ws") + "/v1/device/ws";
   const ws = new WebSocket(url);
@@ -540,7 +544,7 @@ async function connectController() {
     console.log(`paired this machine with ${results.length} machine(s) on ${origin} (scope ${scope}):`);
     for (const r of results) {
       console.log(`  ${r.room.name} → ssh host '${r.alias}' (device ${r.deviceId}, key ${r.fp})`);
-      console.log(`    herdr machine add ${r.alias} --label ${JSON.stringify(String(r.room.name))} --remote-session default`);
+      console.log(`    herdr machine add ${r.alias} --label ${shellQuote(r.room.name)} --remote-session default`);
     }
     console.log("The owner token and device secrets were not stored. The first ssh connection pins the gate's host key.");
     console.log("If this machine was connected before, revoke its previous device in the PWA roster.");

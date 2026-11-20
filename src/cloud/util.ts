@@ -45,3 +45,13 @@ export async function readJsonBody(req: import("node:http").IncomingMessage, max
     return null;
   }
 }
+
+/** Drop idle abuse-budget entries; if the map is still over the hard cap,
+ *  drop everything rather than growing without bound. Shared by the
+ *  failed-hello, pairing-mint and SSH-auth strike maps (audits
+ *  gateway:mint-budget-map-unbounded, sshd:auth-strike-map-unbounded). */
+export function pruneBudget<K, V extends { at: number }>(map: Map<K, V>, max: number, windowMs: number, now = Date.now()): void {
+  if (map.size <= max) return;
+  for (const [k, v] of map) if (now - v.at > windowMs) map.delete(k);
+  if (map.size > max) map.clear();
+}

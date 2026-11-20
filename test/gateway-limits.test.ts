@@ -16,6 +16,7 @@ import test from "node:test";
 import { WebSocket } from "ws";
 import { startCloud } from "../src/cloud/gateway.ts";
 import { AgentCodes } from "../src/cloud/pairing.ts";
+import { pruneBudget } from "../src/cloud/util.ts";
 import { DeviceSock } from "./util2.ts";
 
 const accounts = [{ id: "a", name: "owner", token: "limits-test-owner" }];
@@ -150,6 +151,56 @@ test("pairing-code minting is bounded per client and in total", async () => {
     assert.equal(limited, 2, "the 11th rapid mint from one client is refused");
     const other = await mint("203.0.113.11");
     assert.equal(other.status, 200, "a different client can still mint");
+  } finally {
+    await cloud.close();
+  }
+});
+
+test("abuse budget pruning drops idle entries and clears an all-fresh map over the hard cap", () => {
+  const now = 1_000_000;
+  const fresh = new Map([
+    ["a", { at: now - 10 }],
+    ["b", { at: now - 20 }],
+  ]);
+  pruneBudget(fresh, 4, 60_000, now);
+  assert.equal(fresh.size, 2, "fresh entries under the cap stay");
+
+  const stale = new Map([
+    ["a", { at: now - 61_000 }],
+    ["b", { at: now - 62_000 }],
+    ["c", { at: now - 10 }],
+  ]);
+  pruneBudget(stale, 2, 60_000, now);
+  assert.deepEqual([...stale.keys()], ["c"], "idle entries beyond the cap drop first");
+
+  const hostile = new Map(Array.from({ length: 5 }, (_, i) => [`k${i}`, { at: now }] as const));
+  pruneBudget(hostile, 4, 60_000, now);
+  assert.equal(hostile.size, 0, "an all-fresh map over the hard cap clears instead of growing forever");
+});
+
+test("minting beyond the budget-map cap resets stale client budgets instead of growing forever", { timeout: 120_000 }, async () => {
+  // Regression (audit gateway:mint-budget-map-unbounded): behind a same-host
+  // proxy every request used to add a permanent Map entry. Overflowing the
+  // hard cap must clear the budget map, which an outside observer sees as the
+  // first client's rate block disappearing.
+  const cloud = await startCloud({ accounts, trustedProxy: true, realIpHeader: "X-Client-Ip", maxPendingCodes: 5_000, log: () => {} });
+  const base = `http://127.0.0.1:${cloud.port}`;
+  const mint = (ip: string | null) => fetch(base + "/v1/agent/code", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(ip ? { "X-Client-Ip": ip } : {}) },
+    body: JSON.stringify({ name: "x" }),
+  });
+  try {
+    for (let i = 0; i < 10; i++) assert.equal((await mint("203.0.113.1")).status, 200);
+    assert.equal((await mint("203.0.113.1")).status, 429, "the per-client rate engages");
+
+    // 4,200 more requests without a usable header each get a per-connection
+    // key (the same-host proxy shape); the 4,097th overflows MINTS_MAX and —
+    // every entry being fresh — clears the map instead of accumulating.
+    for (let i = 0; i < 4_200; i++) await mint(null);
+
+    const again = await mint("203.0.113.1");
+    assert.equal(again.status, 200, "the overflowed budget map was pruned, not grown");
   } finally {
     await cloud.close();
   }

@@ -23,7 +23,7 @@ import { dirname } from "node:path";
 import type { Duplex } from "node:stream";
 import ssh2Pkg from "ssh2";
 import { type State } from "./stores.ts";
-import { randomToken } from "./util.ts";
+import { pruneBudget, randomToken } from "./util.ts";
 
 const { Server } = ssh2Pkg;
 const utils = (ssh2Pkg as unknown as { utils?: { generateKeyPairSync?(type: string): { private: string; public: string } } }).utils;
@@ -165,7 +165,11 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
 
   const hostKey = loadOrMintHostKey(deps);
   const channels = new Map<string, Channel>(); // `${deviceId}:${ch}` → channel
-  const strikes = new Map<string, { n: number; until: number }>();
+  const strikes = new Map<string, { n: number; until: number; at: number }>();
+  // Bounded like the gateway's failed-hello map (audit
+  // sshd:auth-strike-map-unbounded): WSS tunnels each authenticate under a
+  // per-connection key, so failed-auth churn must not accumulate forever.
+  const STRIKES_MAX = 4_096;
 
   const ipOf = (ctx: { ip?: string }): string => ctx.ip ?? "?";
   const blocked = (ip: string): boolean => {
@@ -173,8 +177,10 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
     return Boolean(f && f.until > Date.now());
   };
   const strike = (ip: string): void => {
-    const f = strikes.get(ip) ?? { n: 0, until: 0 };
+    pruneBudget(strikes, STRIKES_MAX, AUTH_BLOCK_MS);
+    const f = strikes.get(ip) ?? { n: 0, until: 0, at: Date.now() };
     f.n += 1;
+    f.at = Date.now();
     if (f.n >= AUTH_STRIKES) {
       f.until = Date.now() + AUTH_BLOCK_MS;
       f.n = 0;
