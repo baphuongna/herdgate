@@ -60,6 +60,7 @@ Nếu có Python 3.11+ và file `herdr_pi.py` đi kèm **trong thư mục của 
 ## Quy trình chung khi được yêu cầu tạo agent
 
 1. Xác định cwd, kind và flags mà người dùng muốn. Không có profile chung của Herdr; dùng help/catalog của CLI con, ví dụ `pi --list-models` nếu cần chọn model. Mặc định ưu tiên Pi đang dùng nếu kind/bin sẵn có, không tự chuyển host, tài khoản/provider hay model khi lỗi. Tôn trọng model/flags chỉ định; cờ riêng đặt sau `--`.
+   Pi mới dùng settings/provider/tài nguyên của user và workspace trên máy đích. Khi người dùng yêu cầu override, truyền cờ Pi đã xác minh sau `--` bằng argv riêng (ví dụ `--model provider/id --thinking high`; tool, skill, extension và session flags theo `pi --help` tại máy đích). `agent prompt` vào Pi đã mở dùng model/thinking hiện tại; không gắn cờ khởi chạy vào nội dung prompt.
 2. Mặc định tạo sibling pane trong tab hiện tại, giữ cwd và không giật focus. `pane layout --pane "$HERDR_PANE_ID"` giúp chọn `right`/`down` phù hợp. Xác định cwd tuyệt đối trên chính máy đích: local Unix dùng `pwd -P`, Windows PowerShell dùng `(Get-Location).ProviderPath` trong thư mục filesystem, Windows Git Bash dùng `pwd -W`. Với SSH, xác minh cwd bằng thông tin workspace/pane của máy đích hoặc đường dẫn do người dùng cung cấp; không chuyển đổi cwd local thành cwd remote. Chỉ dùng existing pane khi người dùng chỉ định và xác minh đó là shell trống. Ví dụ dưới đây là mẫu, không tự chạy khi chỉ đọc skill:
 
    ```bash

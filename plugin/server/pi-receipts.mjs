@@ -4,7 +4,8 @@
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { readFileSync, readdirSync, watch } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, readdirSync, watch } from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 
 export const MAX_BODY_BYTES = 64 * 1024; // served size cap for one archived reply
 
@@ -80,8 +81,8 @@ export function publicReceipt(entry) {
 
 /**
  * Find the archived reply text for a request id across workspace scopes.
- * Bodies exist only when the writer ran with HERDGATE_PI_RECEIPT_BODY=1; the
- * served text is capped at MAX_BODY_BYTES (truncated flags the cut). Exact id
+ * Writers archive bodies only when configured to retain the reply. The
+ * served text is capped (truncated flags the cut). Exact id
  * only, no enumeration; unreadable -> null (fail closed).
  */
 export function findBody(base, id) {
@@ -89,10 +90,26 @@ export function findBody(base, id) {
   try {
     for (const name of readdirSync(base)) {
       if (!/^[0-9a-f]{16}$/.test(name)) continue;
-      let raw;
-      try { raw = readFileSync(join(base, name, 'responses', `${id}.md`), 'utf8'); }
-      catch { continue; }
-      return { text: raw.slice(0, MAX_BODY_BYTES), truncated: raw.length > MAX_BODY_BYTES, bytes: raw.length };
+      let fd;
+      try {
+        fd = openSync(join(base, name, 'responses', `${id}.md`), constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0));
+        const stat = fstatSync(fd);
+        if (!stat.isFile()) continue;
+        const buf = Buffer.alloc(Math.min(stat.size, MAX_BODY_BYTES));
+        let read = 0;
+        while (read < buf.length) {
+          const n = readSync(fd, buf, read, buf.length - read, null);
+          if (!n) break;
+          read += n;
+        }
+        if (read !== buf.length) continue; // archive changed while reading
+        const truncated = stat.size > read;
+        const data = buf.subarray(0, read);
+        // For a capped reply, omit a final incomplete code point rather than substituting U+FFFD.
+        const text = truncated ? new StringDecoder('utf8').write(data) : data.toString('utf8');
+        return { text, truncated, bytes: stat.size };
+      } catch { continue; }
+      finally { if (fd !== undefined) closeSync(fd); }
     }
     return null;
   } catch {

@@ -58,32 +58,58 @@ node docs/herdr-skills/probes/pi-settlement.mjs /path/to/node_modules/@earendil-
 
 Probe SDK dùng provider giả và Pi 1.5.2, không dùng profile người dùng.
 
-### Push khi agent chạy xong (`receipt.push`)
+### Push khi agent chạy xong (`receipt.push`) — theo subscription, học từ Paseo
 
 Khi `HERDGATE_PI_RECEIPTS=1`, publisher theo dõi journal (fs.watch + sweep định kỳ) và
-**tự đẩy** `{op:"receipt.push", ...publicReceipt}` tới mọi thiết bị đang trong room ngay
-khi receipt chốt (replied/failed/canceled/unknown) — controller không cần poll. Bản
-baseline khi publisher khởi động không phát lại receipt cũ. Muốn chờ settle từ CLI:
+đẩy `{op:"receipt.push", ...publicReceipt}` **chỉ tới thiết bị đã đăng ký watch cho đúng
+request ID** ngay khi receipt chốt — không broadcast cả room. Subscription là **bền**:
+ghi trong `watch.json` cạnh journal, sống qua restart của publisher và qua mất kết nối
+của thiết bị; thiết bị reconnect sẽ được **phát lại push chưa ACK**. Chỉ `receipt.ack`
+(từ thiết bị đăng ký) mới retire intent; hết hạn (mặc định 10 phút) thì tự dọn.
+
+- Đăng ký: frame `{op:"receipt.watch", id, wantBody?, ttlMs?}` → trả `{op:"receipt.watched", pending:true}`
+  hoặc kèm receipt hiện tại nếu đã chốt (chống race). Read scope đủ.
+- ACK sau khi controller đã xử lý/lưu báo cáo: `{op:"receipt.ack", id}` → `{op:"receipt.acked", retired}`.
+
+CLI tự làm trọn gói này — tra một lần, nếu chưa chốt thì đăng ký watch, chờ push
+(tải body nếu `--body`, lưu file nếu `--out`) rồi ACK:
 
 ```sh
-node experiments/pi-receipt/query.mjs --gate ... --device d --secret s --id <uuid> --wait
+node experiments/pi-receipt/query.mjs --gate ... --device d --secret s --id <uuid> \
+  --wait --body --out /path/to/new-report.md
 ```
 
-MCP có tool `herdgate_receipt_wait {id, timeoutSeconds}` với ý nghĩa tương tự. Lưu ý:
-chỉ **settle** được đẩy — trạng thái trung gian (`armed`/`received`) vẫn in-memory,
-không push; push là metadata tới mọi device trong room (cùng herd của bạn).
+MCP `herdgate_receipt_wait {id, timeoutSeconds}` cũng đăng ký watch, chờ push rồi ACK.
+Lưu ý: chỉ **settle** được đẩy; trạng thái trung gian vẫn in-memory; baseline khi publisher
+khởi động không phát lại receipt cũ — chỉ subscription chưa ACK mới được replay.
 
 ### Lưu và lấy nội dung báo cáo (`receipt.body`)
 
-Receipt cố ý chỉ là metadata. Nội dung **reply cuối** của request settle `replied`
-được lưu **mặc định** cạnh journal: `<base>/<scope>/responses/<id>.md` (0600) — bản
-answer vốn đã có trong session JSONL của Pi trên cùng máy, nên đây không mở lớp bí
-mật mới; tắt bằng `HERDGATE_PI_RECEIPT_BODY=0`. Publisher phục vụ qua op
-`receipt.body {id}` (read scope, vẫn gate ở `HERDGATE_PI_RECEIPTS=1`):
-`{text, bytes, truncated}` — serve tối đa 64KB, không có thì `body_not_retained`;
-`receipt.push` kèm `hasBody`. CLI: `query.mjs --id <uuid> --body`; MCP:
-`herdgate_receipt_body`. Lưu ý: body là answer text trần trên kênh device (đã có
-Noise nếu thiết lập); read scope vốn đã đọc được màn hình pane qua `term.read`.
+Journal và push chỉ chứa metadata. Muốn lấy **reply cuối**, gõ
+`/herdgate-arm --body` và kiểm tra JSON báo `retainBody: true` trước khi gửi. Chỉ
+request này được phép ghi reply khi `replied` vào `<base>/<scope>/responses/<id>.md`
+(0600). Không cần chỉnh env hay khởi động lại Pi để chọn lưu theo request.
+`HERDGATE_PI_RECEIPT_BODY=0` trong tiến trình Pi vô hiệu hóa `--body`; không
+ảnh hưởng `/herdgate-arm` thường. Worker riêng chỉ lưu khi được khởi chạy với
+`HERDGATE_PI_RECEIPT_BODY=1`.
+
+Publisher chỉ phục vụ `receipt.body {id}` khi chủ host bật **cả**
+`HERDGATE_PI_RECEIPTS=1` và `HERDGATE_PI_RECEIPT_BODY=1` cho publisher. Push
+báo `hasBody`, không gửi kèm text. Device đã pair có scope `read` và biết đúng
+UUID có thể lấy `{text, bytes, truncated}` (tối đa 64 KiB UTF-8; `bytes` là
+kích thước gốc); đây là text
+trên kênh device, chỉ được mã hóa đầu-cuối nếu dùng client có Noise session.
+Không bật cho room có thiết bị không được phép đọc báo cáo.
+
+```sh
+node experiments/pi-receipt/query.mjs --gate ... --device d --secret s --id <uuid> \
+  --wait --body --out /path/to/new-report.md
+```
+
+CLI truy vấn ban đầu một lần rồi nghe push, tải text và lưu vào file mới 0600
+(không ghi đè); đồng thời in JSON chứa text cho controller chuyển tiếp. Bỏ
+`--wait` để lấy body cho receipt đã chốt. MCP có `herdgate_receipt_body`.
+Nếu chưa có body, trả lý do rõ ràng, không tự đọc pane, transcript hoặc gửi lại.
 
 ### Truy vấn qua Gate (thử nghiệm)
 
@@ -104,8 +130,8 @@ Wire format: thiết bị gửi `{op:"receipt.get", id}` trong frame; publisher 
 và trả `{op:"receipt.result", id, status, reason?, requestEntryId?, responseEntryId?}`.
 Tìm theo đúng UUID, không liệt kê; scope `read` là đủ vì chỉ có metadata. Frame đi qua
 WSS của Gate dạng plaintext như các op `ssh.*`, trừ khi thiết bị đã có Noise session.
-Tắt cờ → trả `unknown/pi_receipts_disabled`. Đây vẫn là thử nghiệm: chưa có push/subscribe,
-chưa đưa vào PWA, publisher production chưa bật cờ này.
+Tắt cờ → trả `unknown/pi_receipts_disabled`. Đây vẫn là thử nghiệm: push chưa
+có subscription theo từng device và chưa có UI trong PWA.
 
 Xem thêm `experiments/pi-worker/` — worker riêng chạy request qua Pi SDK và ghi receipt
 vào cùng journal này (bước 3 của lộ trình).

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -20,8 +20,9 @@ const pi = process.env.TEST_PI_BIN;
 const root = join(import.meta.dirname, '..');
 const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
 
-type Receipt = { id: string; status: string; marker?: string; reason?: string; requestEntryId?: string; responseEntryId?: string };
-type FixtureEvent = { event: string; call?: number; aborted?: boolean; reason?: string; inputHash?: string };
+type Receipt = { id: string; status: string; marker?: string; reason?: string; requestEntryId?: string; responseEntryId?: string; retainBody?: boolean };
+type FixtureEvent = { event: string; call?: number; aborted?: boolean; reason?: string; inputHash?: string;
+  model?: string; provider?: string; thinking?: string; tools?: string[] };
 
 async function waitFor<T>(label: string, check: () => T | Promise<T>): Promise<NonNullable<T>> {
   const deadline = performance.now() + 10_000;
@@ -62,6 +63,8 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
   const hostEnv = home('host');
   const controllerEnv = home('controller');
   const fixtureDir = join(dir, 'fixture');
+  hostEnv.HG_RECEIPT_FIXTURE_DIR = fixtureDir;
+  hostEnv.HERDGATE_PI_RECEIPT_DIR = join(dir, 'receipts');
   const run = (env: NodeJS.ProcessEnv, bin: string, ...args: string[]) => exec(bin, args, { cwd: dir, env, timeout: 10_000 });
   const host = (...args: string[]) => run(hostEnv, herdr, ...args);
   const client = (...args: string[]) => run(controllerEnv, herdr, ...args);
@@ -86,10 +89,11 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     .map(match => JSON.parse(match[0]) as Receipt);
   const arm = async () => {
     const prior = new Set((await receipts()).filter(r => r.status === 'armed').map(r => r.id));
-    await send('/herdgate-arm');
+    await send('/herdgate-arm --body');
     const result = await waitFor('new remote armed receipt', async () => (await receipts()).findLast(r =>
       r.status === 'armed' && r.marker && !prior.has(r.id)));
     assert.equal(result.marker, `[herdr-request:${result.id}]`);
+    assert.equal(result.retainBody, true);
     return result as Receipt & { marker: string };
   };
   const query = async (id: string, expected: string) => {
@@ -100,6 +104,7 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
   const log: string[] = [];
   let server: ChildProcess | undefined;
   let publisher: ChildProcess | undefined;
+  let reportListener: ChildProcess | undefined;
   let cloud: Awaited<ReturnType<typeof startCloud>> | undefined;
   let stage = 'start';
   let serverStatus: unknown;
@@ -118,12 +123,21 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     const panes = JSON.parse((await host('pane', 'list')).stdout).result.panes as { pane_id: string; focused: boolean }[];
     const pane = panes.find(p => p.focused)?.pane_id;
     assert.ok(pane);
-    const command = [pi, '--offline', '--no-approve', '--no-session', '--no-tools', '--no-skills', '--no-context-files',
-      '--no-extensions', '-e', join(root, 'experiments/pi-receipt/observer.js'), '-e', join(root, 'test/fixtures/pi-receipt-provider.mjs'),
-      '--model', 'hg-receipt-fixture/test'];
-    const launchPi = () => host('pane', 'run', pane, `HG_RECEIPT_FIXTURE_DIR=${quote(fixtureDir)} HERDGATE_PI_RECEIPT_DIR=${quote(join(dir, 'receipts'))} ${command.map(quote).join(" ")}`);
-    await launchPi();
-    await waitFor('Pi fixture in isolated host pane', async () => (await host('pane', 'read', pane, '--raw')).stdout.includes('HG_RECEIPT_FIXTURE_READY'));
+    const agentDir = hostEnv.PI_CODING_AGENT_DIR!;
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({
+      defaultProvider: 'hg-receipt-fixture', defaultModel: 'test', defaultThinkingLevel: 'low',
+      extensions: [join(root, 'experiments/pi-receipt/observer.js'), join(root, 'test/fixtures/pi-receipt-provider.mjs')],
+    }));
+    const piArgs = ['--offline', '--no-approve', '--no-session', '--no-tools', '--no-skills', '--no-context-files'];
+    const launchPi = (name: string, ...overrides: string[]) => host('agent', 'start', name, '--kind', 'pi', '--pane', pane,
+      '--timeout', '9000', '--', ...piArgs, ...overrides);
+    await launchPi('receipt-fixture');
+    const started = await waitFor('Pi fixture startup from target settings', () => events().find(e => e.event === 'session_start'));
+    assert.equal(started.provider, 'hg-receipt-fixture');
+    assert.equal(started.model, 'test');
+    assert.equal(started.thinking, 'low');
+    assert.deepEqual(started.tools, [], 'no-tools applies in the spawned Pi process');
 
     stage = 'start isolated Gate and SSH/WS publisher';
     const accounts = [{ id: 'a1', name: 'test', token: 'receipt-test-owner' }];
@@ -145,7 +159,7 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     publisher = spawn(process.execPath, [join(root, 'plugin/server/index.mjs'), 'serve'], {
       cwd: dir, env: { ...hostEnv, HERDR_BIN_PATH: herdr, HERDR_PLUGIN_ID: 'dev.herdgate.host', HERDGATE_TUI_ONLY: '1',
         HERDR_PLUGIN_CONFIG_DIR: config, HERDR_PLUGIN_STATE_DIR: config, HERDGATE_PUBLISHER_CHILD: '1',
-        HERDGATE_PI_RECEIPTS: '1', HERDGATE_PI_RECEIPT_DIR: join(dir, 'receipts'),
+        HERDGATE_PI_RECEIPTS: '1', HERDGATE_PI_RECEIPT_BODY: '1', HERDGATE_PI_RECEIPT_DIR: join(dir, 'receipts'),
         HERDGATE_PI_WORKER: '1', HERDGATE_PI_WORKER_DIR: join(dir, 'worker') },
       stdio: ['ignore', 'ignore', 'pipe'],
     });
@@ -184,7 +198,26 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     const before = disconnects();
     await tmux('respawn-pane', '-k', 'sleep', '60');
     await waitFor('Gate observed SSH disconnect', () => disconnects() > before);
+    const out = join(dir, 'report.md');
+    const queryCli = [join(root, 'experiments/pi-receipt/query.mjs'), '--gate', base,
+      '--device', probe.id, '--secret', probeSecret, '--id', first.id, '--body'];
+    reportListener = spawn(process.execPath, [...queryCli, '--wait', '--out', out], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let reportJson = '';
+    let reportLog = '';
+    reportListener.stdout!.setEncoding('utf8').on('data', chunk => { reportJson += chunk; });
+    reportListener.stderr!.setEncoding('utf8').on('data', chunk => { reportLog += chunk; });
+    const reportClosed = once(reportListener, 'close');
+    // Readiness is a single initial lookup, not a poll for settlement. The fixture
+    // then finishes with no TUI controller; the next network event is the push.
+    await waitFor('CLI listener is ready', () => log.some(line => line.includes(`queried ${first.id} -> unknown`)));
     writeFileSync(join(fixtureDir, 'release'), '');
+    assert.equal((await reportClosed)[0], 0, reportLog);
+    assert.equal(JSON.parse(reportJson).text, 'SYNTHETIC_REPLY_1');
+    assert.equal(readFileSync(out, 'utf8'), 'SYNTHETIC_REPLY_1');
+    assert.equal(statSync(out).mode & 0o777, 0o600);
+    const alreadySettled = await run(controllerEnv, process.execPath, ...queryCli);
+    assert.equal(JSON.parse(alreadySettled.stdout).text, 'SYNTHETIC_REPLY_1');
+    t.diagnostic('TUI settle -> push -> CLI fetched and saved the report; --body also works after settle');
     await waitFor('Pi settles while the controller is disconnected', () => events().some(e => e.event === 'settled' && e.call === 1 && e.aborted === false));
 
     stage = 'structured device query with no TUI attached';
@@ -269,8 +302,15 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     assert.equal(kept.responseEntryId, replied.responseEntryId);
     await send('/quit');
     await waitFor('Pi exits back to the pane shell', async () => (await capture()).includes('$'));
-    await launchPi(); // a fresh Pi process opens the same workspace and journal
-    await waitFor('a new Pi process is ready', () => events().filter(e => e.event === 'session_start').length >= 3);
+    // A fresh Pi process opens the same workspace and journal, but explicit
+    // model/reasoning args override the destination's defaults.
+    await launchPi('receipt-override', '--provider', 'hg-receipt-fixture', '--model', 'override', '--thinking', 'high', '--tools', 'read');
+    const overridden = await waitFor('a new Pi process is ready', () => events().filter(e => e.event === 'session_start')[2]);
+    assert.equal(overridden.provider, 'hg-receipt-fixture');
+    assert.equal(overridden.model, 'override');
+    assert.equal(overridden.thinking, 'high');
+    assert.deepEqual(overridden.tools, ['read']);
+    t.diagnostic('Herdr agent start loaded destination defaults and honored Pi provider/model/thinking/tool overrides');
     await waitFor('the new Pi TUI accepts input', async () => /\/128k \(auto\)/.test(await capture()));
     await delay(400);
     const restarted = await query(first.id, 'replied');
@@ -314,7 +354,7 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     const runWorker = async () => {
       const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/worker.mjs'),
         '--workspace', dir, '--pi', piPackage, '--fixture-dir', workerFixture],
-        { cwd: dir, env: { ...hostEnv, HERDGATE_PI_RECEIPT_DIR: join(dir, 'receipts'), HERDGATE_PI_WORKER_DIR: join(dir, 'worker'), PI_TELEMETRY: '0' }, stdio: ['ignore', 'ignore', 'pipe'] });
+        { cwd: dir, env: { ...hostEnv, HERDGATE_PI_RECEIPT_DIR: join(dir, 'receipts'), HERDGATE_PI_WORKER_DIR: join(dir, 'worker'), HERDGATE_PI_RECEIPT_BODY: '1', PI_TELEMETRY: '0' }, stdio: ['ignore', 'ignore', 'pipe'] });
       const err: string[] = [];
       child.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
       const code = await new Promise<number | null>(resolve => child.once('exit', resolve));
@@ -487,17 +527,34 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     } finally { await readMcp.stop(); }
     t.diagnostic('MCP: act submit plus read-only tools over the same authenticated device channel');
 
-    stage = 'receipt push reaches a subscribed device when the worker settles';
+    stage = 'a durable watch routes the settle push; only the subscriber receives it';
     const pushSock = new DeviceSock(`ws://127.0.0.1:${gatePort}/v1/device/ws`);
+    const bystander = new DeviceSock(`ws://127.0.0.1:${gatePort}/v1/device/ws`);
+    const watch = async (sock: DeviceSock, id: string, wantBody = false): Promise<Record<string, unknown>> => {
+      await sock.send({ t: 'frame', payload: { op: 'receipt.watch', id, wantBody } });
+      const deadline = performance.now() + 5_000;
+      for (;;) {
+        const frame = await sock.expect('frame');
+        const payload = frame.payload as Record<string, unknown>;
+        if (payload.op === 'receipt.watched' || payload.op === 'error') return payload;
+        if (performance.now() > deadline) throw new Error('no receipt.watched in time');
+      }
+    };
     try {
       await pushSock.hello({ device: probe.id, deviceSecret: probeSecret });
+      await bystander.hello({ device: device.id, deviceSecret: actSecret });
       const pushes: Record<string, unknown>[] = [];
-      const onPush = (data: RawData): void => {
-        const m = JSON.parse(String(data)) as { t?: string; payload?: { op?: string; id?: string } };
-        if (m.t === 'frame' && m.payload?.op === 'receipt.push') pushes.push(m.payload as Record<string, unknown>);
+      const bystanderPushes: Record<string, unknown>[] = [];
+      const onPush = (data: RawData, into: Record<string, unknown>[]): void => {
+        const m = JSON.parse(String(data)) as { t?: string; payload?: { op?: string } };
+        if (m.t === 'frame' && m.payload?.op === 'receipt.push') into.push(m.payload as Record<string, unknown>);
       };
-      pushSock.ws.on('message', onPush);
+      pushSock.ws.on('message', d => onPush(d as RawData, pushes));
+      bystander.ws.on('message', d => onPush(d as RawData, bystanderPushes));
       const pushId = randomUUID();
+      const armed = await watch(pushSock, pushId, true);
+      assert.equal(armed.op, 'receipt.watched');
+      assert.equal(armed.pending, true, 'nothing settled yet');
       await act({ op: 'worker.submit', id: pushId, prompt: 'Push synthetic request' });
       await runWorker();
       const pushed = await waitFor('receipt.push for the submitted job',
@@ -505,12 +562,67 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
       assert.equal(pushed.status, 'replied');
       assert.ok(pushed.requestEntryId && pushed.responseEntryId);
       assert.equal(pushed.hasBody, true, 'the push advertises the archived body');
+      await delay(600);
+      assert.deepEqual(bystanderPushes, [], 'a device without a watch is not broadcast to');
       const pushedBody = await askBody(pushId);
       assert.match(String(pushedBody.text), /SYNTHETIC_WORKER_REPLY_/);
       assert.equal((await ask(pushId)).status, 'replied', 'the pushed receipt is also queryable');
-      pushSock.ws.off('message', onPush);
-    } finally { pushSock.close(); }
-    t.diagnostic('receipt.push arrived without polling while no TUI client was attached');
+      await pushSock.send({ t: 'frame', payload: { op: 'receipt.ack', id: pushId } });
+      const retired = await (async () => {
+        const deadline = performance.now() + 5_000;
+        for (;;) {
+          const frame = await Promise.race([pushSock.expect('frame', 2_000), delay(2_100).then(() => null)]);
+          const payload = frame?.payload as { op?: string } | undefined;
+          if (payload?.op === 'receipt.acked') return payload as Record<string, unknown>;
+          if (performance.now() > deadline) throw new Error('no receipt.acked in time');
+        }
+      })();
+      assert.equal((retired as { retired?: boolean }).retired, true);
+    } finally { pushSock.close(); bystander.close(); }
+    t.diagnostic('receipt.push reached the subscribed device only, without polling and with no TUI attached');
+
+    stage = 'a watch that outlives its connection replays once and retires on ack';
+    const replayId = randomUUID();
+    const offlineWatch = new DeviceSock(`ws://127.0.0.1:${gatePort}/v1/device/ws`);
+    await offlineWatch.hello({ device: probe.id, deviceSecret: probeSecret });
+    assert.equal((await watch(offlineWatch, replayId)).pending, true);
+    offlineWatch.close(); // the controller drops before the agent settles
+    await act({ op: 'worker.submit', id: replayId, prompt: 'Replay synthetic request' });
+    await runWorker(); // settles with no subscriber socket attached
+    assert.equal((await ask(replayId)).status, 'replied');
+    const reconnected = new DeviceSock(`ws://127.0.0.1:${gatePort}/v1/device/ws`);
+    try {
+      await reconnected.hello({ device: probe.id, deviceSecret: probeSecret });
+      const replayed = await waitFor('unacknowledged push replayed on reconnect', async () => {
+        const frame = await Promise.race([reconnected.expect('frame', 3_000), delay(3_100).then(() => null)]);
+        const payload = frame?.payload as { op?: string; id?: string } | undefined;
+        return payload?.op === 'receipt.push' && payload.id === replayId ? (payload as Record<string, unknown>) : null;
+      });
+      assert.equal(replayed.status, 'replied');
+      await reconnected.send({ t: 'frame', payload: { op: 'receipt.ack', id: replayId } });
+      const acked = await (async () => {
+        const deadline = performance.now() + 5_000;
+        for (;;) {
+          const frame = await reconnected.expect('frame');
+          if ((frame.payload as { op?: string }).op === 'receipt.acked') return frame.payload as Record<string, unknown>;
+          if (performance.now() > deadline) throw new Error('no receipt.acked in time');
+        }
+      })();
+      assert.equal(acked.retired, true);
+    } finally { reconnected.close(); }
+    const settled = new DeviceSock(`ws://127.0.0.1:${gatePort}/v1/device/ws`);
+    try {
+      await settled.hello({ device: probe.id, deviceSecret: probeSecret });
+      const deadline = performance.now() + 1_200;
+      let strayOp: string | undefined;
+      while (performance.now() < deadline) {
+        const frame = await Promise.race([settled.expect('frame', 300).catch(() => null), delay(320).then(() => null)]);
+        const payload = frame?.payload as { op?: string } | undefined;
+        if (payload?.op === 'receipt.push') { strayOp = payload.op; break; }
+      }
+      assert.equal(strayOp, undefined, 'an acknowledged watch is not replayed again');
+    } finally { settled.close(); }
+    t.diagnostic('controller offline at settle: reconnect replayed the push once; ack retired the durable intent');
   } catch (err) {
     t.diagnostic(`failed at ${stage}`);
     t.diagnostic(JSON.stringify({ events: events(), serverStatus }));
@@ -519,6 +631,7 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     throw err;
   } finally {
     await tmux('kill-server').catch(() => {});
+    await stop(reportListener);
     await stop(publisher);
     await cloud?.close();
     if (server) await host('server', 'stop').catch(() => {});

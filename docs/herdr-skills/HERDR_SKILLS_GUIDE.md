@@ -62,6 +62,16 @@ python .agents/skills/herdr/herdr_pi.py new-request
 
 Profile mẫu dùng model mặc định trên máy đích. Muốn cố định model, tạo catalog riêng từ mẫu, thêm `model` dạng `provider/id` và kiểm bằng `pi --list-models`. Có thể chuyển catalog giữa máy; không điền credentials vào notes. `profile show` chỉ in argv để skill dùng khi **được yêu cầu** chạy agent.
 
+**Cấu hình lúc gọi agent:** Pi TUI mới đọc settings, provider và tài nguyên của user/workspace **trên máy chạy Pi**. Truyền các cờ Pi đã xác minh sau `--`, dạng argv, để ghi đè giá trị cụ thể. Ví dụ (đổi model và pane theo máy đích):
+
+```sh
+herdr agent start reviewer --kind pi --pane PANE_ID -- \
+  --model 'provider/model' --thinking high --tools read,grep,find,ls
+herdr agent prompt reviewer 'Nội dung công việc'
+```
+
+Có thể truyền các cờ Pi khác như `--extension`, `--skill` hoặc `--session-dir` nếu được yêu cầu; path phải có trên máy đích. Catalog portable vẫn chỉ nhận model/thinking, không chứa cờ tùy ý. `agent prompt` vào pane đã mở dùng cấu hình đang chạy (đổi qua `/model` và phím đổi thinking của Pi trước khi gửi, hoặc khởi chạy agent riêng); không nhận cờ đổi model/thinking theo prompt. Observer receipt không ghi đè các cấu hình này. `worker.submit` là đường khác, hiện chỉ chạy fixture, không nhận các tùy chọn TUI.
+
 Khi đã tạo Pi pane và được yêu cầu gửi việc, dùng ID mới, đặt nguyên `marker` ở dòng đầu prompt rồi gửi qua Herdr bình thường. Để đối chiếu sau khi gửi:
 
 ```text

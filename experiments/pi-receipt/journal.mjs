@@ -20,7 +20,7 @@ export function loadJournal(file) {
   return { entries, receipts: new Map(entries.map(entry => [entry.id, entry])) };
 }
 
-/** Where a settled reply's text is archived (opt-in HERDGATE_PI_RECEIPT_BODY=1).
+/** Where an explicitly retained final reply is archived.
  *  The receipt itself stays metadata-only; the answer lives beside it, 0600. */
 export function bodyFile(base, cwd, id) {
   return join(base, scopeFor(cwd), 'responses', `${id}.md`);

@@ -68,9 +68,10 @@ export default function observer(pi) {
     catch (error) { receipts.set(entry.id, entry); warn(error.message); }
   }
   function finish(status, fields = {}) {
-    const { id, requestEntryId, sessionId: session, cwd, bodyText } = active;
-    if (status === 'replied' && bodyText && process.env.HERDGATE_PI_RECEIPT_BODY !== '0') {
-      try { writeBody(base, cwd, id, bodyText); } catch (error) { warn(error.message); }
+    const { id, requestEntryId, sessionId: session, cwd, retainBody, bodyText } = active;
+    if (status === 'replied' && retainBody && bodyText) {
+      try { writeBody(base, cwd, id, bodyText); }
+      catch (error) { console.error(`herdgate-receipt: body archive failed (${error.code ?? 'unknown'})`); }
     }
     const entry = { v: 1, id, status, ...(requestEntryId ? { requestEntryId } : {}), sessionId: session, ts: Date.now(), ...(paneId ? { paneId } : {}), ...fields };
     const receipt = { id, status, ...(requestEntryId ? { requestEntryId } : {}), ...fields };
@@ -100,11 +101,16 @@ export default function observer(pi) {
   pi.on('session_tree', () => { invalidate('branch_changed'); });
 
   pi.registerCommand('herdgate-arm', {
-    description: 'Prepare a one-request receipt in this Pi pane (experimental, no send)',
+    description: 'Prepare a one-request receipt; --body also retains the final reply (no send)',
     handler(args, ctx) {
       ensure(ctx);
       expire();
-      if (args.trim()) return notify(ctx, { status: 'not_armed', reason: 'usage' });
+      const option = args.trim();
+      if (option && option !== '--body') return notify(ctx, { status: 'not_armed', reason: 'usage' });
+      const retainBody = option === '--body';
+      if (retainBody && process.env.HERDGATE_PI_RECEIPT_BODY === '0') {
+        return notify(ctx, { status: 'not_armed', reason: 'body_disabled' });
+      }
       if (ctx.mode !== 'tui' || !sessionId || ctx.sessionManager.getSessionId() !== sessionId) {
         return notify(ctx, { status: 'not_armed', reason: 'requires_current_tui' });
       }
@@ -112,8 +118,8 @@ export default function observer(pi) {
       if (active) return notify(ctx, { id: active.id, status: 'not_armed', reason: 'already_armed' });
       const id = randomUUID();
       const marker = `[herdr-request:${id}]`;
-      active = { id, marker, sessionId, baseline: ctx.sessionManager.getLeafId(), deadline: performance.now() + TTL_MS, cwd: ctx.cwd };
-      notify(ctx, { id, status: 'armed', marker, expiresInSeconds: TTL_MS / 1000 });
+      active = { id, marker, sessionId, baseline: ctx.sessionManager.getLeafId(), deadline: performance.now() + TTL_MS, cwd: ctx.cwd, retainBody };
+      notify(ctx, { id, status: 'armed', marker, expiresInSeconds: TTL_MS / 1000, ...(retainBody ? { retainBody } : {}) });
     },
   });
   pi.registerCommand('herdgate-receipt', {
@@ -192,7 +198,7 @@ export default function observer(pi) {
         !content.some(block => block.type === 'text' && typeof block.text === 'string' && block.text.trim())) {
       return invalidate('no_final_reply');
     }
-    active.bodyText = content.filter(block => block.type === 'text').map(block => block.text).join('\n');
+    if (active.retainBody) active.bodyText = content.filter(block => block.type === 'text').map(block => block.text).join('\n');
     finish('replied', { responseEntryId: response.id });
   }
   pi.on('turn_start', () => {

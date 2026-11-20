@@ -314,9 +314,16 @@ test('the journal watcher reports only new settles and stops cleanly', async () 
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('a replied settle archives the answer body unless opted out', async () => {
+test('only a request explicitly armed with --body archives its reply by default', async t => {
+  const priorBody = process.env.HERDGATE_PI_RECEIPT_BODY;
+  delete process.env.HERDGATE_PI_RECEIPT_BODY;
+  t.after(() => {
+    if (priorBody === undefined) delete process.env.HERDGATE_PI_RECEIPT_BODY;
+    else process.env.HERDGATE_PI_RECEIPT_BODY = priorBody;
+  });
   const run = await worker();
-  const armed = await run.command('arm');
+  const armed = await run.command('arm', '--body');
+  assert.equal(armed.retainBody, true);
   run.user(`${armed.marker}\nviệc`);
   const response = run.assistant('stop', [{ type: 'text', text: 'BÁO CÁO THẬT' }]);
   run.turn(response);
@@ -325,23 +332,33 @@ test('a replied settle archives the answer body unless opted out', async () => {
   assert.equal(receipt.status, 'replied');
   assert.equal(receipt.responseEntryId, response);
   const body = receipts.findBody(run.root, receipt.id);
-  assert.ok(body && body.text.includes('BÁO CÁO THẬT'), 'bodies archive by default');
+  assert.ok(body && body.text.includes('BÁO CÁO THẬT'), 'the opted-in request archives the body');
   assert.equal(body.truncated, false);
   assert.ok(!readFileSync(join(run.root, receipts.scopeFor(run.cwd), 'receipts.jsonl'), 'utf8').includes('BÁO CÁO THẬT'),
     'the receipt journal stays metadata-only');
-  // With HERDGATE_PI_RECEIPT_BODY=0, a second replied request archives no body.
-  const priorBody = process.env.HERDGATE_PI_RECEIPT_BODY;
-  process.env.HERDGATE_PI_RECEIPT_BODY = '0';
   const second = await run.command('arm');
   run.user(`${second.marker}\nviệc 2`);
   const response2 = run.assistant('stop', [{ type: 'text', text: 'KHÔNG LƯU' }]);
   run.turn(response2);
   run.settle(false);
-  process.env.HERDGATE_PI_RECEIPT_BODY = priorBody;
   const secondReceipt = await run.command('receipt', second.id);
   assert.equal(secondReceipt.status, 'replied');
   assert.equal(receipts.findBody(run.root, second.id), null);
   assert.equal(receipts.findBody(run.root, 'not-a-uuid'), null);
+  process.env.HERDGATE_PI_RECEIPT_BODY = '0';
+  assert.deepEqual(await run.command('arm', '--body'), { status: 'not_armed', reason: 'body_disabled' });
+});
+
+test('archived replies are capped in bytes without cutting a UTF-8 character', async () => {
+  const run = await worker();
+  const { id, marker } = await run.command('arm', '--body');
+  const text = 'a'.repeat(receipts.MAX_BODY_BYTES - 1) + 'ộ cuối';
+  run.user(marker);
+  run.turn(run.assistant('stop', [{ type: 'text', text }]));
+  run.settle();
+  assert.deepEqual(receipts.findBody(run.root, id), {
+    text: 'a'.repeat(receipts.MAX_BODY_BYTES - 1), bytes: Buffer.byteLength(text), truncated: true,
+  });
 });
 
 test('walking the session suffix fails closed at its bound', async () => {

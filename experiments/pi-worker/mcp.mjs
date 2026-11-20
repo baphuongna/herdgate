@@ -48,12 +48,20 @@ function call(payload, op) {
   });
 }
 
-/** Ask once, then hold the socket open for the settle push (receipt.push). */
+/** Ask once; if unsettled, register a durable watch so the host pushes this
+ *  exact request on settle (or replay on reconnect), then ack once handled. */
 function waitReceipt(id, timeoutMs) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`${gate}/v1/device/ws`, { handshakeTimeout: 8_000 });
     const timer = setTimeout(() => { ws.terminate(); reject(new Error('wait timed out')); }, timeoutMs);
     const settled = p => p.status !== 'unknown' || p.reason !== 'not_retained_in_runtime';
+    let watched = false;
+    const done = payload => {
+      clearTimeout(timer);
+      if (watched) ws.send(JSON.stringify({ v: 1, t: 'frame', payload: { op: 'receipt.ack', id } }));
+      ws.close();
+      resolve(payload);
+    };
     ws.on('error', error => { clearTimeout(timer); reject(error); });
     ws.on('open', () => ws.send(JSON.stringify({ v: 1, t: 'hello', device, deviceSecret: secret })));
     ws.on('message', (data, isBinary) => {
@@ -64,8 +72,13 @@ function waitReceipt(id, timeoutMs) {
       if (message.t === 'error') { clearTimeout(timer); ws.close(); return resolve({ op: 'error', code: message.code ?? 'gate', message: message.message ?? '' }); }
       if (message.t !== 'frame') return;
       const payload = message.payload ?? {};
-      if (payload.op === 'receipt.result' && settled(payload)) { clearTimeout(timer); ws.close(); return resolve(payload); }
-      if (payload.op === 'receipt.push' && payload.id === id) { clearTimeout(timer); ws.close(); resolve(payload); }
+      if (payload.op === 'receipt.result' && settled(payload)) return done(payload);
+      if (payload.op === 'receipt.result' && !watched) {
+        watched = true;
+        return ws.send(JSON.stringify({ v: 1, t: 'frame', payload: { op: 'receipt.watch', id, wantBody: false, ttlMs: timeoutMs + 60_000 } }));
+      }
+      if (payload.op === 'receipt.watched' && payload.id === id && settled(payload)) return done(payload);
+      if (payload.op === 'receipt.push' && payload.id === id) done(payload);
     });
   });
 }
@@ -84,7 +97,7 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
     invoke: args => call({ op: 'receipt.get', id: args.id }, 'receipt.result') },
   { name: 'herdgate_receipt_wait',
-    description: 'Wait for one request to settle: returns the current receipt if already settled, otherwise holds the connection until the host pushes the settle (receipt.push). Timeout returns the last known state.',
+    description: 'Wait for one request to settle: registers a durable per-request watch, returns the current receipt if already settled, otherwise holds the connection until the host pushes the settle (receipt.push), then acks. Timeout returns the last known state.',
     inputSchema: { type: 'object', properties: { id: { type: 'string' }, timeoutSeconds: { type: 'number', default: 60, maximum: 300 } }, required: ['id'] },
     invoke: args => waitReceipt(args.id, Math.min(300, Math.max(5, Number(args.timeoutSeconds) || 60)) * 1000)
       .catch(() => call({ op: 'receipt.get', id: args.id }, 'receipt.result')) },

@@ -14,7 +14,7 @@ export default function fixture(pi) {
   let held = false;
   pi.registerProvider('hg-receipt-fixture', {
     api: 'openai-completions', apiKey: 'dummy', baseUrl: 'https://no-network.invalid',
-    models: [{ id: 'test', name: 'Fixture', input: ['text'], reasoning: false, cost, contextWindow: 128000, maxTokens: 4096 }],
+    models: ['test', 'override'].map(id => ({ id, name: id, input: ['text'], reasoning: true, cost, contextWindow: 128000, maxTokens: 4096 })),
     streamSimple(model, context, options) {
       const call = ++count;
       const content = context.messages.findLast(message => message.role === 'user')?.content;
@@ -47,7 +47,8 @@ export default function fixture(pi) {
     },
   });
   pi.on('session_start', ({ reason }, ctx) => {
-    log('session_start', { reason });
+    log('session_start', { reason, model: ctx.model?.id, provider: ctx.model?.provider,
+      thinking: pi.getThinkingLevel(), tools: pi.getActiveTools() });
     ctx.ui.notify('HG_RECEIPT_FIXTURE_READY', 'info');
   });
   pi.on('agent_before_settle', async () => {

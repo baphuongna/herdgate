@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead } from "./common.mjs";
 import { createSshBridge } from "./ssh.mjs";
 import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
+import { openWatchStore } from "./pi-receipt-watch.mjs";
 import { JOB_ID, MAX_PENDING, MAX_PROMPT, appendJob, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, workerBase } from "./pi-worker.mjs";
 import { registerPublisher } from "./publisher-tui-lifecycle.mjs";
 import { HostChannel, b64d, b64e, fingerprint, generateKeyPair } from "./e2e.mjs";
@@ -294,14 +295,48 @@ async function publisherLoop() {
     }
   };
 
-  /** Push each new settle to every device in the room (experimental, same opt-in
-   *  flag as receipt.get): the controller learns "agent finished" without polling. */
+  /** Push receipt settles only to devices that registered a durable watch for
+   *  that request (Paseo-style finish subscriptions): delivery targets the
+   *  subscriber, survives publisher restarts, and only an ack retires the
+   *  intent. No broadcast to the whole room. */
   let receiptWatch = null;
+  let watchStore = null;
+  const receiptsEnabled = () => process.env.HERDGATE_PI_RECEIPTS === "1";
+  const receiptBodyEnabled = () => receiptsEnabled() && process.env.HERDGATE_PI_RECEIPT_BODY === "1";
+  const watches = () => {
+    if (!receiptsEnabled()) return null;
+    watchStore ??= openWatchStore(receiptJournalBase());
+    return watchStore;
+  };
+  const pushReceiptTo = (device, entry) => {
+    const body = receiptBodyEnabled() && entry.status === "replied" ? findBody(receiptJournalBase(), entry.id) : null;
+    log(`receipts: pushed ${entry.status} ${entry.id} -> ${device}${body ? " (+body)" : ""}`);
+    void sendPayload(wsRef, device, { op: "receipt.push", hasBody: Boolean(body), ...publicReceipt(entry) });
+  };
+  const flushWatches = (device) => {
+    const store = watches();
+    if (!store) return;
+    store.sweep();
+    let replayed = 0;
+    for (const sub of store.pendingFor(device)) {
+      const entry = findReceipt(receiptJournalBase(), sub.requestId);
+      if (!entry) continue; // not settled yet; the watcher routes the settle
+      store.markDelivered(device, sub.requestId);
+      pushReceiptTo(device, entry);
+      replayed++;
+    }
+    if (replayed) log(`receipts: replayed ${replayed} unacknowledged push(es) to ${device}`);
+  };
   const pushReceipt = (entry) => {
-    const body = findBody(receiptJournalBase(), entry.id);
-    const payload = { op: "receipt.push", hasBody: Boolean(body), ...publicReceipt(entry) };
-    log(`receipts: settled ${entry.status} ${entry.id}${body ? " (+body)" : ""} — pushing to ${devices.length} device(s)`);
-    for (const d of devices) void sendPayload(wsRef, d.id, payload);
+    const store = watches();
+    if (!store) return;
+    store.sweep();
+    const targets = store.pendingAll().filter(sub => sub.requestId === entry.id);
+    if (!targets.length) return log(`receipts: settled ${entry.status} ${entry.id} (no subscriber)`);
+    for (const sub of targets) {
+      store.markDelivered(sub.device, entry.id);
+      pushReceiptTo(sub.device, entry);
+    }
   };
 
   /** Wake phones that are away when something actually changed (throttled per device). */
@@ -357,6 +392,7 @@ async function publisherLoop() {
           receiptWatch = watchReceipts(receiptJournalBase(), pushReceipt);
           log(`receipts: journal push enabled (${receiptJournalBase()})`);
         }
+        for (const d of devices) flushWatches(d.id);
         void publish(ws);
         if (timer) clearInterval(timer);
         timer = setInterval(() => void publish(ws), 30_000);
@@ -370,6 +406,7 @@ async function publisherLoop() {
           e2eSessions.delete(d.id);
         }
         devices = next;
+        for (const d of devices) flushWatches(d.id);
         void publish(ws);
         return;
       }
@@ -403,6 +440,30 @@ async function publisherLoop() {
           return void replyTo({ op: "receipt.result", id: id || null,
             ...publicReceipt(entry), ...(enabled ? {} : { reason: "pi_receipts_disabled" }) });
         }
+        if (op === "receipt.watch" || op === "receipt.ack") {
+          // Experimental (opt-in HERDGATE_PI_RECEIPTS=1): durable per-request push
+          // subscriptions. Registering targets receipt.push at this device only;
+          // an ack retires the intent after the controller has handled the report.
+          const id = typeof payload.id === "string" && JOB_ID.test(payload.id) ? payload.id : "";
+          if (!receiptsEnabled()) return void replyTo({ op: "receipt.watched", id: id || null, status: "unknown", reason: "pi_receipts_disabled" });
+          if (!id) return void replyTo({ op: "error", code: "receipt.watch", message: "invalid request id" });
+          const store = watches();
+          if (op === "receipt.ack") {
+            const retired = Boolean(store?.ack(m.device, id));
+            log(`receipts: ack ${id} from ${m.device} -> ${retired ? "retired" : "no pending intent"}`);
+            return void replyTo({ op: "receipt.acked", id, retired });
+          }
+          let subscription;
+          try {
+            subscription = store.register({ device: m.device, requestId: id, wantBody: payload.wantBody === true,
+              ...(Number.isFinite(payload.ttlMs) && payload.ttlMs > 0 ? { ttlMs: Math.min(payload.ttlMs, 24 * 60 * 60 * 1000) } : {}) });
+          } catch (error) {
+            return void replyTo({ op: "error", code: "receipt.watch", message: error.message });
+          }
+          const entry = findReceipt(receiptJournalBase(), id);
+          log(`receipts: ${m.device} watches ${id}${subscription.wantBody ? " (+body)" : ""} -> ${entry ? entry.status : "pending"}`);
+          return void replyTo({ op: "receipt.watched", id, ...(entry ? publicReceipt(entry) : { pending: true }) });
+        }
         if (op === "worker.health") {
           // Experimental (opt-in HERDGATE_PI_WORKER=1): liveness for the owner — queue
           // depth plus the last heartbeat written by the scheduler/worker experiment.
@@ -424,20 +485,16 @@ async function publisherLoop() {
               : { reason: "pi_worker_disabled" }) });
         }
         if (op === "receipt.body") {
-          // Experimental (opt-in): serve the archived reply text for one settled
-          // request. Bodies exist only where the writer ran with
-          // HERDGATE_PI_RECEIPT_BODY=1; the receipt itself stays metadata-only.
-          const enabled = process.env.HERDGATE_PI_RECEIPTS === "1";
+          // Experimental: serving archived replies is separate from metadata push.
           const id = typeof payload.id === "string" && JOB_ID.test(payload.id) ? payload.id : "";
-          let body = null;
-          if (enabled && id) {
-            try { body = findBody(receiptJournalBase(), id); } catch { body = null; }
-          }
+          const base = receiptJournalBase();
+          const body = receiptBodyEnabled() && id && findReceipt(base, id)?.status === 'replied' ? findBody(base, id) : null;
           log(`receipts: ${m.device} body ${id || "?"} -> ${body ? `${body.bytes}B${body.truncated ? " (capped)" : ""}` : "none"}`);
           return void replyTo({ op: "receipt.body.result", id: id || null,
             ...(body
               ? { text: body.text, bytes: body.bytes, truncated: body.truncated }
-              : { reason: enabled ? "body_not_retained" : "pi_receipts_disabled" }) });
+              : { reason: receiptBodyEnabled() ? "body_not_retained"
+                : process.env.HERDGATE_PI_RECEIPTS === "1" ? "pi_receipt_body_disabled" : "pi_receipts_disabled" }) });
         }
         if (op === "worker.submit" || op === "worker.status") {
           // Experimental (opt-in HERDGATE_PI_WORKER=1): admission to the local Pi worker
