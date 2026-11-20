@@ -412,6 +412,25 @@ test('usage metadata survives the journal even when a provider reports only some
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('an explicit controller-chosen id arms that exact request', async () => {
+  const run = await worker();
+  const chosen = '00000000-0000-4000-8000-000000000011';
+  const armed = await run.command('arm', `--id ${chosen} --body`);
+  assert.deepEqual(armed, { id: chosen, status: 'armed', marker: `[herdr-request:${chosen}]`,
+    expiresInSeconds: 600, retainBody: true });
+  run.user(`${armed.marker}\nviệc`);
+  const response = run.assistant();
+  run.turn(response);
+  run.settle();
+  assert.deepEqual(await run.command('receipt', chosen),
+    { id: chosen, status: 'replied', requestEntryId: '1', responseEntryId: response });
+  // The same id cannot be reused while known, and junk stays usage errors.
+  assert.deepEqual(await run.command('arm', `--id ${chosen}`),
+    { status: 'not_armed', reason: 'duplicate_id', id: chosen });
+  assert.equal((await run.command('arm', '--id not-a-uuid')).reason, 'usage');
+  assert.equal((await run.command('arm', '--body --extra')).reason, 'usage');
+});
+
 test('walking the session suffix fails closed at its bound', async () => {
   const w = await worker();
   const { id, marker } = await w.command('arm');

@@ -6,7 +6,8 @@
 // closed pane reopens with one command using the same --session-id flag.
 //
 //   node experiments/pi-spawn/spawn.mjs spawn <name> [--cwd DIR] [--parent-session ID] [-- extra pi args]
-//   node experiments/pi-spawn/spawn.mjs list
+//   node experiments/pi-spawn/spawn.mjs arm <name-or-id> [--body]   # /herdgate-arm with THE spawn id
+//   node experiments/pi-spawn/spawn.mjs list                        # + receipt status per child
 //   node experiments/pi-spawn/spawn.mjs restore <name-or-id>
 //
 // spawn: splits a sibling pane (from HERDR_PANE_ID when inside Herdr), starts a
@@ -16,6 +17,7 @@
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { findSpawn, recordSpawn, readSpawns, spawnBase, spawnsFile, updateSpawn } from './registry.mjs';
+import { findReceipt } from '../../plugin/server/pi-receipts.mjs';
 
 const herdr = () => process.env.HERDR_BIN_PATH || 'herdr';
 const run = (...args) => JSON.parse(execFileSync(herdr(), args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }));
@@ -50,9 +52,10 @@ if (command === 'spawn') {
   const { myPane, parentSessionId } = myBinding();
   const parent = flag('parent-session', parentSessionId);
   const id = randomUUID(); // one id: receipt request == Pi session
+  // Stacked split keeps full terminal width (side-by-side wraps notifications mid-JSON).
   const splitArgs = myPane
-    ? ['pane', 'split', '--pane', myPane, '--direction', 'right', '--no-focus', '--cwd', cwd]
-    : ['pane', 'split', '--current', '--direction', 'right', '--no-focus', '--cwd', cwd];
+    ? ['pane', 'split', '--pane', myPane, '--direction', 'down', '--no-focus', '--cwd', cwd]
+    : ['pane', 'split', '--current', '--direction', 'down', '--no-focus', '--cwd', cwd];
   const pane = run(...splitArgs).result.pane.pane_id;
   try {
     run('agent', 'start', name, '--kind', 'pi', '--pane', pane, '--timeout', '45000',
@@ -64,11 +67,45 @@ if (command === 'spawn') {
     ...(parent ? { parentSessionId: parent } : {}), cwd, ts: Date.now() });
   console.log(JSON.stringify({ ...entry, parent: parent ?? null,
     bound: bindingOf(run('pane', 'list').result.panes ?? [], pane) === id }));
+} else if (command === 'arm') {
+  if (!arg) fail('usage: arm <name-or-id> [--body]');
+  const entry = findSpawn(spawnBase(), arg);
+  if (!entry) fail(`no spawn record for ${arg}`);
+  const { panes } = myBinding();
+  if (!panes.some(p => p.pane_id === entry.paneId)) fail(`pane ${entry.paneId} is gone — restore first`);
+  const wantBody = process.argv.includes('--body');
+  const agent = run('agent', 'get', entry.paneId).result.agent;
+  if (agent?.agent_status !== 'idle') fail(`agent is ${agent?.agent_status ?? 'unknown'} — arm when idle`);
+  execFileSync(herdr(), ['pane', 'run', entry.paneId, `/herdgate-arm --id ${entry.id}${wantBody ? ' --body' : ''}`], { stdio: 'ignore' });
+  // Notifications wrap in narrow panes; match on whitespace-stripped text instead of line regexes.
+  const readPane = () => {
+    try {
+      return execFileSync(herdr(), ['pane', 'read', entry.paneId, '--source', 'recent-unwrapped', '--lines', '30', '--format', 'text', '--raw'],
+        { encoding: 'utf8' }).replace(/\u001b\[[0-9;]*[A-Za-z]/g, '').replace(/\s+/g, '');
+    } catch { return ''; }
+  };
+  const deadline = Date.now() + 10_000;
+  let confirmed = false;
+  while (Date.now() < deadline) {
+    const flat = readPane();
+    if (flat.includes('"status":"not_armed"')) {
+      // Arming the same spawn id twice is idempotent: the first intent is still ours.
+      if (flat.includes('"reason":"duplicate_id"') && flat.includes(`"id":"${entry.id}"`)) { confirmed = true; break; }
+      fail(`arm refused: ${flat.slice(-160)}`);
+    }
+    if (flat.includes(`herdr-request:${entry.id}`) && flat.includes('"status":"armed"')) { confirmed = true; break; }
+    if (flat.includes(`"id":"${entry.id}","status":"armed"`)) { confirmed = true; break; }
+    await new Promise(r => setTimeout(r, 300));
+  }
+  if (!confirmed) fail('the pane did not confirm the armed marker in time');
+  console.log(JSON.stringify({ id: entry.id, status: 'armed', pane: entry.paneId,
+    marker: `[herdr-request:${entry.id}]`, retainBody: wantBody }));
 } else if (command === 'list') {
   const { panes } = myBinding();
   const rows = readSpawns(spawnsFile(spawnBase())).map(e => ({
     name: e.name, id: e.id, pane: e.paneId, status: e.status,
     live: panes.some(p => p.pane_id === e.paneId) ? 'attached' : 'gone',
+    receipt: findReceipt(spawnBase(), e.id)?.status ?? 'none',
     parent: (e.parentSessionId ?? '').slice(0, 8) || null, ts: e.ts,
   }));
   console.log(JSON.stringify(rows, null, 2));
@@ -78,8 +115,8 @@ if (command === 'spawn') {
   if (!entry) fail(`no spawn record for ${arg}`);
   const { myPane } = myBinding();
   const splitArgs = myPane
-    ? ['pane', 'split', '--pane', myPane, '--direction', 'right', '--no-focus', '--cwd', entry.cwd ?? process.cwd()]
-    : ['pane', 'split', '--current', '--direction', 'right', '--no-focus', '--cwd', entry.cwd ?? process.cwd()];
+    ? ['pane', 'split', '--pane', myPane, '--direction', 'down', '--no-focus', '--cwd', entry.cwd ?? process.cwd()]
+    : ['pane', 'split', '--current', '--direction', 'down', '--no-focus', '--cwd', entry.cwd ?? process.cwd()];
   const pane = run(...splitArgs).result.pane.pane_id;
   try {
     run('agent', 'start', entry.name, '--kind', 'pi', '--pane', pane, '--timeout', '45000',

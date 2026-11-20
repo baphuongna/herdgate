@@ -111,13 +111,24 @@ export default function observer(pi) {
   pi.on('session_tree', () => { invalidate('branch_changed'); });
 
   pi.registerCommand('herdgate-arm', {
-    description: 'Prepare a one-request receipt; --body also retains the final reply (no send)',
+    description: 'Prepare a one-request receipt; --body also retains the reply, --id <uuid> reuses a controller-chosen id (no send)',
     handler(args, ctx) {
       ensure(ctx);
       expire();
-      const option = args.trim();
-      if (option && option !== '--body') return notify(ctx, { status: 'not_armed', reason: 'usage' });
-      const retainBody = option === '--body';
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      let retainBody = false;
+      let explicitId = null;
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i] === '--body') retainBody = true;
+        else if (parts[i] === '--id' && i + 1 < parts.length) explicitId = parts[++i];
+        else return notify(ctx, { status: 'not_armed', reason: 'usage' });
+      }
+      if (explicitId !== null) {
+        if (!UUID.test(explicitId)) return notify(ctx, { status: 'not_armed', reason: 'usage' });
+        if (active?.id === explicitId || receipts.has(explicitId)) {
+          return notify(ctx, { status: 'not_armed', reason: 'duplicate_id', id: explicitId });
+        }
+      }
       if (retainBody && process.env.HERDGATE_PI_RECEIPT_BODY === '0') {
         return notify(ctx, { status: 'not_armed', reason: 'body_disabled' });
       }
@@ -126,7 +137,7 @@ export default function observer(pi) {
       }
       if (!ctx.isIdle() || ctx.hasPendingMessages()) return notify(ctx, { status: 'not_armed', reason: 'busy' });
       if (active) return notify(ctx, { id: active.id, status: 'not_armed', reason: 'already_armed' });
-      const id = randomUUID();
+      const id = explicitId ?? randomUUID();
       const marker = `[herdr-request:${id}]`;
       active = { id, marker, sessionId, baseline: ctx.sessionManager.getLeafId(), deadline: performance.now() + TTL_MS, cwd: ctx.cwd, retainBody };
       notify(ctx, { id, status: 'armed', marker, expiresInSeconds: TTL_MS / 1000, ...(retainBody ? { retainBody } : {}) });
