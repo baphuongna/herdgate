@@ -11,7 +11,7 @@ Herdr TUI có đủ thao tác nền để chạy workflow **advisor, committee v
 |---|---|---|
 | Host, workspace, worktree | Saved SSH machines, named sessions, workspace/tab/pane, Git worktree create/open | Có các thao tác tương ứng; không giả định project registry, archive hay checkout PR theo hợp đồng Paseo. |
 | Workspace scripts | `pane run`, `pane wait-output`, plugin actions | Chạy lệnh được; không có lifecycle/registry workspace scripts kiểu Paseo được xác minh. |
-| Tạo agent, gửi việc, chờ, đọc kết quả | `agent start`/`agent prompt`; helper tùy chọn đọc reply Pi JSONL theo request ID | Không phải RPC hay receipt bền. Khi không có session Pi, đọc terminal và nêu giới hạn. |
+| Tạo agent, gửi việc, nhận kết quả | `agent start`; `agent prompt` **không `--wait`** — subagent tự báo cáo qua watch receipt (`query.mjs --wait --body --out`, MCP `herdgate_receipt_wait`, frame `receipt.watch/ack`) | Receipt bền theo request ID, push đúng thiết bị đăng ký; không polling hay chờ đồng bộ trên controller. Khi host chưa bật watch: ghi rõ đã submit và giới hạn. |
 | Agent profiles, provider/model discovery | Helper tùy chọn đọc catalog TOML; xác minh model bằng `pi --list-models` ở máy đích | Dùng lại notes/model/thinking cho Pi; không có registry toàn daemon hoặc đồng bộ tài khoản. |
 | Advisor, committee | Một hoặc hai pane do agent gọi quản lý; mỗi agent phân tích độc lập | Tương đương về workflow. Read-only trong brief là ràng buộc tác vụ, không phải sandbox. |
 | Handoff | Agent mới nhận brief; có thể đặt ở worktree riêng theo yêu cầu | Tương đương về chuyển việc; không chuyển session/authority, không tự tạo quan hệ parent-child. |

@@ -5,6 +5,10 @@ không có lệnh cài, không bật integration hoặc mở API. Chỉ dùng �
 
 ## Thử trong một phiên mới
 
+Mỗi nhiệm vụ một **agent mới + ID mới**: mở pane riêng, khởi chạy agentfresh cho task
+(không gửi vào agent phiên chính đang chạy việc khác — session dài sẽ tốn context
+và mưu phạm quy trình đối chiếu); arm ngay trong agent mới đó rồi mới dispatch.
+
 Tại checkout Herdgate trên **máy chạy Pi đích**, mở một Pi TUI mới:
 
 ```sh
