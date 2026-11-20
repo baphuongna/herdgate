@@ -314,31 +314,30 @@ test('the journal watcher reports only new settles and stops cleanly', async () 
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('a replied settle archives the answer body only when opted in', async () => {
+test('a replied settle archives the answer body unless opted out', async () => {
   const run = await worker();
   const armed = await run.command('arm');
   run.user(`${armed.marker}\nviệc`);
   const response = run.assistant('stop', [{ type: 'text', text: 'BÁO CÁO THẬT' }]);
+  run.turn(response);
+  run.settle(false);
+  const receipt = await run.command('receipt', armed.id);
+  assert.equal(receipt.status, 'replied');
+  assert.equal(receipt.responseEntryId, response);
+  const body = receipts.findBody(run.root, receipt.id);
+  assert.ok(body && body.text.includes('BÁO CÁO THẬT'), 'bodies archive by default');
+  assert.equal(body.truncated, false);
+  assert.ok(!readFileSync(join(run.root, receipts.scopeFor(run.cwd), 'receipts.jsonl'), 'utf8').includes('BÁO CÁO THẬT'),
+    'the receipt journal stays metadata-only');
+  // With HERDGATE_PI_RECEIPT_BODY=0, a second replied request archives no body.
   const priorBody = process.env.HERDGATE_PI_RECEIPT_BODY;
-  process.env.HERDGATE_PI_RECEIPT_BODY = '1';
-  try {
-    run.turn(response);
-    run.settle(false);
-    const receipt = await run.command('receipt', armed.id);
-    assert.equal(receipt.status, 'replied');
-    assert.equal(receipt.responseEntryId, response);
-    const body = receipts.findBody(run.root, receipt.id);
-    assert.ok(body && body.text.includes('BÁO CÁO THẬT'));
-    assert.equal(body.truncated, false);
-    assert.ok(!readFileSync(join(run.root, receipts.scopeFor(run.cwd), 'receipts.jsonl'), 'utf8').includes('BÁO CÁO THẬT'),
-      'the receipt journal stays metadata-only');
-  } finally { process.env.HERDGATE_PI_RECEIPT_BODY = priorBody; }
-  // Without the flag, a second replied request archives no body.
+  process.env.HERDGATE_PI_RECEIPT_BODY = '0';
   const second = await run.command('arm');
   run.user(`${second.marker}\nviệc 2`);
   const response2 = run.assistant('stop', [{ type: 'text', text: 'KHÔNG LƯU' }]);
   run.turn(response2);
   run.settle(false);
+  process.env.HERDGATE_PI_RECEIPT_BODY = priorBody;
   const secondReceipt = await run.command('receipt', second.id);
   assert.equal(secondReceipt.status, 'replied');
   assert.equal(receipts.findBody(run.root, second.id), null);

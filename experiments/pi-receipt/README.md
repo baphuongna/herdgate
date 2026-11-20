@@ -75,14 +75,15 @@ không push; push là metadata tới mọi device trong room (cùng herd của b
 
 ### Lưu và lấy nội dung báo cáo (`receipt.body`)
 
-Receipt cố ý chỉ là metadata. Khi writer chạy với `HERDGATE_PI_RECEIPT_BODY=1`, nội dung
-**reply cuối** của request được settle thành công được lưu cạnh journal:
-`<base>/<scope>/responses/<id>.md` (0600, chỉ status `replied`). Publisher phục vụ qua
-op `receipt.body {id}` (read scope): `{text, bytes, truncated}` — serve tối đa 64KB,
-không có thì `body_not_retained`; `receipt.push` kèm `hasBody` để controller biết có
-muốn kéo body không. CLI: `query.mjs --id <uuid> --body`; MCP: `herdgate_receipt_body`.
-Lưu ý: body là answer text trần trên kênh device (đã có Noise nếu thiết lập); read
-scope vốn đã đọc được màn hình pane qua `term.read` nên không phải lớp bí mật mới.
+Receipt cố ý chỉ là metadata. Nội dung **reply cuối** của request settle `replied`
+được lưu **mặc định** cạnh journal: `<base>/<scope>/responses/<id>.md` (0600) — bản
+answer vốn đã có trong session JSONL của Pi trên cùng máy, nên đây không mở lớp bí
+mật mới; tắt bằng `HERDGATE_PI_RECEIPT_BODY=0`. Publisher phục vụ qua op
+`receipt.body {id}` (read scope, vẫn gate ở `HERDGATE_PI_RECEIPTS=1`):
+`{text, bytes, truncated}` — serve tối đa 64KB, không có thì `body_not_retained`;
+`receipt.push` kèm `hasBody`. CLI: `query.mjs --id <uuid> --body`; MCP:
+`herdgate_receipt_body`. Lưu ý: body là answer text trần trên kênh device (đã có
+Noise nếu thiết lập); read scope vốn đã đọc được màn hình pane qua `term.read`.
 
 ### Truy vấn qua Gate (thử nghiệm)
 

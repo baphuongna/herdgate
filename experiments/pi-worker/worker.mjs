@@ -213,7 +213,7 @@ for (const job of queued) {
   } finally {
     session.dispose();
   }
-  if (verdict.status === 'replied' && verdict.bodyText && process.env.HERDGATE_PI_RECEIPT_BODY === '1') {
+  if (verdict.status === 'replied' && verdict.bodyText && process.env.HERDGATE_PI_RECEIPT_BODY !== '0') {
     try { writeBody(receiptsBase, workspace, job.id, verdict.bodyText); } catch (error) { log(`body archive failed: ${error.message}`); }
   }
   writeReceipt(job.id, verdict.status, sessionId,

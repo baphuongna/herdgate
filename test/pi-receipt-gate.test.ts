@@ -121,7 +121,7 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     const command = [pi, '--offline', '--no-approve', '--no-session', '--no-tools', '--no-skills', '--no-context-files',
       '--no-extensions', '-e', join(root, 'experiments/pi-receipt/observer.js'), '-e', join(root, 'test/fixtures/pi-receipt-provider.mjs'),
       '--model', 'hg-receipt-fixture/test'];
-    const launchPi = () => host('pane', 'run', pane, `HG_RECEIPT_FIXTURE_DIR=${quote(fixtureDir)} HERDGATE_PI_RECEIPT_DIR=${quote(join(dir, 'receipts'))} HERDGATE_PI_RECEIPT_BODY=1 ${command.map(quote).join(' ')}`);
+    const launchPi = () => host('pane', 'run', pane, `HG_RECEIPT_FIXTURE_DIR=${quote(fixtureDir)} HERDGATE_PI_RECEIPT_DIR=${quote(join(dir, 'receipts'))} ${command.map(quote).join(" ")}`);
     await launchPi();
     await waitFor('Pi fixture in isolated host pane', async () => (await host('pane', 'read', pane, '--raw')).stdout.includes('HG_RECEIPT_FIXTURE_READY'));
 
@@ -314,7 +314,7 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     const runWorker = async () => {
       const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/worker.mjs'),
         '--workspace', dir, '--pi', piPackage, '--fixture-dir', workerFixture],
-        { cwd: dir, env: { ...hostEnv, HERDGATE_PI_RECEIPT_DIR: join(dir, 'receipts'), HERDGATE_PI_WORKER_DIR: join(dir, 'worker'), HERDGATE_PI_RECEIPT_BODY: '1', PI_TELEMETRY: '0' }, stdio: ['ignore', 'ignore', 'pipe'] });
+        { cwd: dir, env: { ...hostEnv, HERDGATE_PI_RECEIPT_DIR: join(dir, 'receipts'), HERDGATE_PI_WORKER_DIR: join(dir, 'worker'), PI_TELEMETRY: '0' }, stdio: ['ignore', 'ignore', 'pipe'] });
       const err: string[] = [];
       child.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
       const code = await new Promise<number | null>(resolve => child.once('exit', resolve));

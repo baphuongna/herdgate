@@ -69,7 +69,7 @@ export default function observer(pi) {
   }
   function finish(status, fields = {}) {
     const { id, requestEntryId, sessionId: session, cwd, bodyText } = active;
-    if (status === 'replied' && bodyText && process.env.HERDGATE_PI_RECEIPT_BODY === '1') {
+    if (status === 'replied' && bodyText && process.env.HERDGATE_PI_RECEIPT_BODY !== '0') {
       try { writeBody(base, cwd, id, bodyText); } catch (error) { warn(error.message); }
     }
     const entry = { v: 1, id, status, ...(requestEntryId ? { requestEntryId } : {}), sessionId: session, ts: Date.now(), ...(paneId ? { paneId } : {}), ...fields };
