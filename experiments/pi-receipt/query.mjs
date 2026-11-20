@@ -6,9 +6,10 @@
 //     --device d_xxx --secret <device secret> --id <request uuid> [--wait [--timeout 300]]
 //
 // --wait keeps the socket open: if the receipt has not settled yet, the script
-// prints the publisher's receipt.push the moment the agent finishes. The secret
-// is the device's own pairing secret (read scope is enough); it is used only in
-// memory. Nothing is printed besides the receipt JSON.
+// prints the publisher's receipt.push the moment the agent finishes. --body also
+// fetches the archived reply text when the host kept one (receipt.body.result).
+// The secret is the device's own pairing secret (read scope is enough); it is used
+// only in memory. Nothing is printed besides the receipt JSON.
 import WebSocket from 'ws';
 
 const arg = name => {
@@ -44,7 +45,11 @@ ws.on('message', (data, isBinary) => {
     if (!wait || settled(payload)) { finish(payload); }
     return; // waiting: fall through and listen for the settle push
   }
-  if (payload.op === 'receipt.push' && payload.id === id) finish(payload);
+  if (payload.op === 'receipt.push' && payload.id === id) {
+    if (opt('body') && payload.hasBody) { ws.send(JSON.stringify({ v: 1, t: 'frame', payload: { op: 'receipt.body', id } })); return; }
+    finish(payload);
+  }
+  if (payload.op === 'receipt.body.result' && payload.id === id) finish(payload);
 });
 function finish(payload) {
   clearTimeout(timer);

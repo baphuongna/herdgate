@@ -6,6 +6,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync, readdirSync, watch } from 'node:fs';
 
+export const MAX_BODY_BYTES = 64 * 1024; // served size cap for one archived reply
+
 export const RECEIPT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RECEIPTS = 'receipts.jsonl';
 
@@ -74,6 +76,28 @@ export function publicReceipt(entry) {
   if (!entry) return { status: 'unknown', reason: 'not_retained_in_runtime' };
   const { v, ts, sessionId, paneId, ...rest } = entry;
   return rest;
+}
+
+/**
+ * Find the archived reply text for a request id across workspace scopes.
+ * Bodies exist only when the writer ran with HERDGATE_PI_RECEIPT_BODY=1; the
+ * served text is capped at MAX_BODY_BYTES (truncated flags the cut). Exact id
+ * only, no enumeration; unreadable -> null (fail closed).
+ */
+export function findBody(base, id) {
+  if (!RECEIPT_ID.test(id ?? '')) return null;
+  try {
+    for (const name of readdirSync(base)) {
+      if (!/^[0-9a-f]{16}$/.test(name)) continue;
+      let raw;
+      try { raw = readFileSync(join(base, name, 'responses', `${id}.md`), 'utf8'); }
+      catch { continue; }
+      return { text: raw.slice(0, MAX_BODY_BYTES), truncated: raw.length > MAX_BODY_BYTES, bytes: raw.length };
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**

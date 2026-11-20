@@ -60,7 +60,7 @@ if (check) {
 }
 
 const { journalBase, scopeFor, findReceipt } = await import('../../plugin/server/pi-receipts.mjs');
-const { appendReceipt, loadJournal, openScope } = await import('../pi-receipt/journal.mjs');
+const { appendReceipt, loadJournal, openScope, writeBody } = await import('../pi-receipt/journal.mjs');
 const { appendJob, jobsFile, readJobs, workerBase } = await import('../../plugin/server/pi-worker.mjs');
 
 const base = workerBase();
@@ -204,13 +204,17 @@ for (const job of queued) {
       || !Array.isArray(response.message.content)
       || !response.message.content.some(block => block.type === 'text' && typeof block.text === 'string' && block.text.trim())) {
       verdict = { status: 'unknown', reason: 'no_final_reply', responseEntryId: response.id };
-    } else verdict = { status: 'replied', responseEntryId: response.id };
+    } else verdict = { status: 'replied', responseEntryId: response.id, bodyText: Array.isArray(response.message.content)
+      ? response.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n') : '' };
     if (requestEntryId) verdict.requestEntryId = requestEntryId;
   } catch (error) {
     if (error?.name === 'AbortError') verdict = { status: 'canceled', reason: 'aborted' };
     else log(`job ${job.id} prompt threw: ${error?.message ?? error}`);
   } finally {
     session.dispose();
+  }
+  if (verdict.status === 'replied' && verdict.bodyText && process.env.HERDGATE_PI_RECEIPT_BODY === '1') {
+    try { writeBody(receiptsBase, workspace, job.id, verdict.bodyText); } catch (error) { log(`body archive failed: ${error.message}`); }
   }
   writeReceipt(job.id, verdict.status, sessionId,
     { ...('reason' in verdict ? { reason: verdict.reason } : {}),

@@ -6,7 +6,7 @@
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { journalBase } from '../../plugin/server/pi-receipts.mjs';
-import { MAX_JOURNAL, appendReceipt, compact as compactJournal, loadJournal, openScope } from './journal.mjs';
+import { MAX_JOURNAL, appendReceipt, compact as compactJournal, loadJournal, openScope, writeBody } from './journal.mjs';
 
 const TTL_MS = 10 * 60 * 1000;
 const MAX_SUFFIX = 256;
@@ -68,7 +68,10 @@ export default function observer(pi) {
     catch (error) { receipts.set(entry.id, entry); warn(error.message); }
   }
   function finish(status, fields = {}) {
-    const { id, requestEntryId, sessionId: session } = active;
+    const { id, requestEntryId, sessionId: session, cwd, bodyText } = active;
+    if (status === 'replied' && bodyText && process.env.HERDGATE_PI_RECEIPT_BODY === '1') {
+      try { writeBody(base, cwd, id, bodyText); } catch (error) { warn(error.message); }
+    }
     const entry = { v: 1, id, status, ...(requestEntryId ? { requestEntryId } : {}), sessionId: session, ts: Date.now(), ...(paneId ? { paneId } : {}), ...fields };
     const receipt = { id, status, ...(requestEntryId ? { requestEntryId } : {}), ...fields };
     active = undefined;
@@ -109,7 +112,7 @@ export default function observer(pi) {
       if (active) return notify(ctx, { id: active.id, status: 'not_armed', reason: 'already_armed' });
       const id = randomUUID();
       const marker = `[herdr-request:${id}]`;
-      active = { id, marker, sessionId, baseline: ctx.sessionManager.getLeafId(), deadline: performance.now() + TTL_MS };
+      active = { id, marker, sessionId, baseline: ctx.sessionManager.getLeafId(), deadline: performance.now() + TTL_MS, cwd: ctx.cwd };
       notify(ctx, { id, status: 'armed', marker, expiresInSeconds: TTL_MS / 1000 });
     },
   });
@@ -189,6 +192,7 @@ export default function observer(pi) {
         !content.some(block => block.type === 'text' && typeof block.text === 'string' && block.text.trim())) {
       return invalidate('no_final_reply');
     }
+    active.bodyText = content.filter(block => block.type === 'text').map(block => block.text).join('\n');
     finish('replied', { responseEntryId: response.id });
   }
   pi.on('turn_start', () => {

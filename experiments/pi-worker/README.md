@@ -70,7 +70,8 @@ node experiments/pi-worker/remote.mjs --gate ... --device d_read --secret ... --
 - `mcp.mjs --gate --device --secret`: MCP stdio server (JSON-RPC newline) nối **OUT**
   tới Gate, không listener. Tools: `herdgate_worker_submit` (act), `herdgate_worker_status`,
   `herdgate_receipt`, `herdgate_receipt_wait` (chờ settle push, timeout trả trạng thái
-  hiện tại), `herdgate_worker_health` (read). Dùng được từ bất kỳ MCP client nào
+  hiện tại), `herdgate_receipt_body` (answer đã lưu khi host bật
+  `HERDGATE_PI_RECEIPT_BODY=1`), `herdgate_worker_health` (read). Dùng được từ bất kỳ MCP client nào
   (kể cả Pi qua cấu hình MCP).
 
 Cả hai đều đã nghiệm thu E2E loopback trong giai đoạn scheduler và MCP của

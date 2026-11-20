@@ -31,3 +31,10 @@ export function watchReceipts(
   onEntry: (entry: JournalEntry) => void,
   options?: { intervalMs?: number },
 ): () => void;
+export const MAX_BODY_BYTES: number;
+export interface ReceiptBody {
+  text: string;
+  truncated: boolean;
+  bytes: number;
+}
+export function findBody(base: string, id: string): ReceiptBody | null;

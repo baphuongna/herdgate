@@ -14,7 +14,7 @@ import { hostname, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead } from "./common.mjs";
 import { createSshBridge } from "./ssh.mjs";
-import { findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
+import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
 import { JOB_ID, MAX_PENDING, MAX_PROMPT, appendJob, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, workerBase } from "./pi-worker.mjs";
 import { registerPublisher } from "./publisher-tui-lifecycle.mjs";
 import { HostChannel, b64d, b64e, fingerprint, generateKeyPair } from "./e2e.mjs";
@@ -298,8 +298,9 @@ async function publisherLoop() {
    *  flag as receipt.get): the controller learns "agent finished" without polling. */
   let receiptWatch = null;
   const pushReceipt = (entry) => {
-    const payload = { op: "receipt.push", ...publicReceipt(entry) };
-    log(`receipts: settled ${entry.status} ${entry.id} — pushing to ${devices.length} device(s)`);
+    const body = findBody(receiptJournalBase(), entry.id);
+    const payload = { op: "receipt.push", hasBody: Boolean(body), ...publicReceipt(entry) };
+    log(`receipts: settled ${entry.status} ${entry.id}${body ? " (+body)" : ""} — pushing to ${devices.length} device(s)`);
     for (const d of devices) void sendPayload(wsRef, d.id, payload);
   };
 
@@ -421,6 +422,22 @@ async function publisherLoop() {
             ...(enabled
               ? { queued, running, heartbeat: beat ? { ts: beat.ts, source: beat.source, ageSeconds: age } : null }
               : { reason: "pi_worker_disabled" }) });
+        }
+        if (op === "receipt.body") {
+          // Experimental (opt-in): serve the archived reply text for one settled
+          // request. Bodies exist only where the writer ran with
+          // HERDGATE_PI_RECEIPT_BODY=1; the receipt itself stays metadata-only.
+          const enabled = process.env.HERDGATE_PI_RECEIPTS === "1";
+          const id = typeof payload.id === "string" && JOB_ID.test(payload.id) ? payload.id : "";
+          let body = null;
+          if (enabled && id) {
+            try { body = findBody(receiptJournalBase(), id); } catch { body = null; }
+          }
+          log(`receipts: ${m.device} body ${id || "?"} -> ${body ? `${body.bytes}B${body.truncated ? " (capped)" : ""}` : "none"}`);
+          return void replyTo({ op: "receipt.body.result", id: id || null,
+            ...(body
+              ? { text: body.text, bytes: body.bytes, truncated: body.truncated }
+              : { reason: enabled ? "body_not_retained" : "pi_receipts_disabled" }) });
         }
         if (op === "worker.submit" || op === "worker.status") {
           // Experimental (opt-in HERDGATE_PI_WORKER=1): admission to the local Pi worker

@@ -88,6 +88,10 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { id: { type: 'string' }, timeoutSeconds: { type: 'number', default: 60, maximum: 300 } }, required: ['id'] },
     invoke: args => waitReceipt(args.id, Math.min(300, Math.max(5, Number(args.timeoutSeconds) || 60)) * 1000)
       .catch(() => call({ op: 'receipt.get', id: args.id }, 'receipt.result')) },
+  { name: 'herdgate_receipt_body',
+    description: 'The archived reply text for one settled request (only where the host opted in to keep bodies); capped at 64KB with a truncated flag.',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+    invoke: args => call({ op: 'receipt.body', id: args.id }, 'receipt.body.result') },
   { name: 'herdgate_worker_health',
     description: 'Host worker liveness: queue depth and the last heartbeat written by the scheduler/worker experiment.',
     inputSchema: { type: 'object', properties: {} },

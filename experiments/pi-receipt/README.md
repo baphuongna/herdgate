@@ -73,6 +73,17 @@ MCP có tool `herdgate_receipt_wait {id, timeoutSeconds}` với ý nghĩa tươn
 chỉ **settle** được đẩy — trạng thái trung gian (`armed`/`received`) vẫn in-memory,
 không push; push là metadata tới mọi device trong room (cùng herd của bạn).
 
+### Lưu và lấy nội dung báo cáo (`receipt.body`)
+
+Receipt cố ý chỉ là metadata. Khi writer chạy với `HERDGATE_PI_RECEIPT_BODY=1`, nội dung
+**reply cuối** của request được settle thành công được lưu cạnh journal:
+`<base>/<scope>/responses/<id>.md` (0600, chỉ status `replied`). Publisher phục vụ qua
+op `receipt.body {id}` (read scope): `{text, bytes, truncated}` — serve tối đa 64KB,
+không có thì `body_not_retained`; `receipt.push` kèm `hasBody` để controller biết có
+muốn kéo body không. CLI: `query.mjs --id <uuid> --body`; MCP: `herdgate_receipt_body`.
+Lưu ý: body là answer text trần trên kênh device (đã có Noise nếu thiết lập); read
+scope vốn đã đọc được màn hình pane qua `term.read` nên không phải lớp bí mật mới.
+
 ### Truy vấn qua Gate (thử nghiệm)
 
 Publisher trả lời frame JSON `receipt.get` từ **thiết bị đã pair** — không cần mở TUI,

@@ -2,7 +2,7 @@
 // Extracted from the observer so the pi-worker experiment (experiments/pi-worker)
 // can append the exact same per-workspace format. No network access here.
 import { appendFileSync, mkdirSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { readJournal, scopeFor } from '../../plugin/server/pi-receipts.mjs';
 
 export const MAX_JOURNAL = 200;   // receipts kept per workspace
@@ -18,6 +18,18 @@ export function openScope(base, cwd) {
 export function loadJournal(file) {
   const entries = readJournal(file);
   return { entries, receipts: new Map(entries.map(entry => [entry.id, entry])) };
+}
+
+/** Where a settled reply's text is archived (opt-in HERDGATE_PI_RECEIPT_BODY=1).
+ *  The receipt itself stays metadata-only; the answer lives beside it, 0600. */
+export function bodyFile(base, cwd, id) {
+  return join(base, scopeFor(cwd), 'responses', `${id}.md`);
+}
+
+export function writeBody(base, cwd, id, text) {
+  const file = bodyFile(base, cwd, id);
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  writeFileSync(file, text, { mode: 0o600 });
 }
 
 /**

@@ -121,7 +121,7 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     const command = [pi, '--offline', '--no-approve', '--no-session', '--no-tools', '--no-skills', '--no-context-files',
       '--no-extensions', '-e', join(root, 'experiments/pi-receipt/observer.js'), '-e', join(root, 'test/fixtures/pi-receipt-provider.mjs'),
       '--model', 'hg-receipt-fixture/test'];
-    const launchPi = () => host('pane', 'run', pane, `HG_RECEIPT_FIXTURE_DIR=${quote(fixtureDir)} HERDGATE_PI_RECEIPT_DIR=${quote(join(dir, 'receipts'))} ${command.map(quote).join(' ')}`);
+    const launchPi = () => host('pane', 'run', pane, `HG_RECEIPT_FIXTURE_DIR=${quote(fixtureDir)} HERDGATE_PI_RECEIPT_DIR=${quote(join(dir, 'receipts'))} HERDGATE_PI_RECEIPT_BODY=1 ${command.map(quote).join(' ')}`);
     await launchPi();
     await waitFor('Pi fixture in isolated host pane', async () => (await host('pane', 'read', pane, '--raw')).stdout.includes('HG_RECEIPT_FIXTURE_READY'));
 
@@ -209,6 +209,14 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
         return await recvOp(sock, 'receipt.result');
       } finally { sock.close(); }
     };
+    const askBody = async (id: string) => {
+      const sock = new DeviceSock(`ws://127.0.0.1:${gatePort}/v1/device/ws`);
+      try {
+        await sock.hello({ device: probe.id, deviceSecret: probeSecret });
+        await sock.send({ t: 'frame', payload: { op: 'receipt.body', id } });
+        return await recvOp(sock, 'receipt.body.result');
+      } finally { sock.close(); }
+    };
     const offline = await ask(first.id);
     assert.equal(offline.op, 'receipt.result');
     assert.equal(offline.id, first.id);
@@ -225,6 +233,13 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     assert.ok(replied.responseEntryId);
     assert.deepEqual(calls(), [1], 'reattach and query must not send a second model input');
     t.diagnostic('Gate confirmed disconnect; Pi settled while offline; reconnect returned the same receipt with one provider call');
+    const firstBody = await askBody(first.id);
+    assert.equal(firstBody.op, 'receipt.body.result');
+    assert.match(String(firstBody.text), /SYNTHETIC_REPLY_1/);
+    assert.equal(firstBody.truncated, false);
+    const noBody = await askBody(randomUUID());
+    assert.equal(noBody.reason, 'body_not_retained');
+    t.diagnostic('receipt.body served the archived reply; unknown ids fail closed');
 
     stage = 'wrong marker cannot get a reply receipt';
     const wrong = await arm();
@@ -299,7 +314,7 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     const runWorker = async () => {
       const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/worker.mjs'),
         '--workspace', dir, '--pi', piPackage, '--fixture-dir', workerFixture],
-        { cwd: dir, env: { ...hostEnv, HERDGATE_PI_RECEIPT_DIR: join(dir, 'receipts'), HERDGATE_PI_WORKER_DIR: join(dir, 'worker'), PI_TELEMETRY: '0' }, stdio: ['ignore', 'ignore', 'pipe'] });
+        { cwd: dir, env: { ...hostEnv, HERDGATE_PI_RECEIPT_DIR: join(dir, 'receipts'), HERDGATE_PI_WORKER_DIR: join(dir, 'worker'), HERDGATE_PI_RECEIPT_BODY: '1', PI_TELEMETRY: '0' }, stdio: ['ignore', 'ignore', 'pipe'] });
       const err: string[] = [];
       child.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
       const code = await new Promise<number | null>(resolve => child.once('exit', resolve));
@@ -443,7 +458,7 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
       assert.equal(init.result!.protocolVersion, '2024-11-05');
       const list = await mcp.request('tools/list');
       assert.deepEqual(list.result!.tools!.map(tool => tool.name).sort(),
-        ['herdgate_receipt', 'herdgate_receipt_wait', 'herdgate_worker_health', 'herdgate_worker_status', 'herdgate_worker_submit']);
+        ['herdgate_receipt', 'herdgate_receipt_body', 'herdgate_receipt_wait', 'herdgate_worker_health', 'herdgate_worker_status', 'herdgate_worker_submit']);
       const receiptReply = toolText(await mcp.request('tools/call', { name: 'herdgate_receipt', arguments: { id: first.id } }));
       assert.equal(receiptReply.op, 'receipt.result');
       assert.equal(receiptReply.status, 'replied');
@@ -459,6 +474,8 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
       assert.equal(status.state, 'replied');
       assert.ok(!('prompt' in status));
       assert.equal(toolText(await mcp.request('tools/call', { name: 'herdgate_receipt', arguments: { id: admission.id } })).status, 'replied');
+      const viaBody = toolText(await mcp.request('tools/call', { name: 'herdgate_receipt_body', arguments: { id: first.id } }));
+      assert.match(String(viaBody.text), /SYNTHETIC_REPLY_1/);
     } finally { await mcp.stop(); }
     const readMcp = mcpClient({ device: probe.id, secret: probeSecret });
     try {
@@ -487,6 +504,9 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
         () => pushes.find(p => p.id === pushId) ?? null);
       assert.equal(pushed.status, 'replied');
       assert.ok(pushed.requestEntryId && pushed.responseEntryId);
+      assert.equal(pushed.hasBody, true, 'the push advertises the archived body');
+      const pushedBody = await askBody(pushId);
+      assert.match(String(pushedBody.text), /SYNTHETIC_WORKER_REPLY_/);
       assert.equal((await ask(pushId)).status, 'replied', 'the pushed receipt is also queryable');
       pushSock.ws.off('message', onPush);
     } finally { pushSock.close(); }
