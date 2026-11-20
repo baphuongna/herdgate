@@ -84,7 +84,25 @@ Nếu có Python 3.11+ và file `herdr_pi.py` đi kèm **trong thư mục của 
    Cấm: `agent prompt --wait`/`--timeout` để chờ nhiệm vụ (đó là chờ đồng bộ trên controller), vòng lặp `agent get`/`agent read`, `sleep`, polling pane. `agent start --timeout` chỉ chờ readiness khi khởi tạo agent — vẫn hợp lệ. `agent prompt` trả ok chứng nhận input đã xếp, không phải agent đã nhận việc hay hoàn thành. Khi báo cáo về: `replied` chứng minh có reply cuối đúng request (kèm usage), không khẳng định task nghiệp vụ thành công; `observe`/`agent read` chỉ để đối chiếu bổ sung sau khi báo cáo đến, hoặc khi người dùng yêu cầu tra cứu. Nếu chưa có watch/forwarder nào: ghi rõ "đã submit, báo cáo sẽ tự về" và kết thúc lượt, không chuyển sang chờ.
 5. Báo tên agent, pane, cùng kết quả hoặc trạng thái chưa xác minh; dừng đúng giới hạn. Không tự đóng pane có việc đang chạy hay pane người dùng; không dọn tài nguyên nếu chưa được yêu cầu. Worktree là checkout riêng, **không phải OS sandbox**.
 
-## Mở lại session sau khi pane đóng
+## Spawn subagent và mở lại session (Herdgate helper)
+
+Pane chết không mất session — nhưng tra cứu tay thì phiến nghiệp. Dùng helper Herdgate
+(`experiments/pi-spawn/spawn.mjs`): **một UUID làm cả request id lẫn `pi --session-id`**,
+biết session ngay lúc spawn, quan hệ cha-con (session controller → session con) ghi bền
+vào `spawns.jsonl` cạnh journal receipt:
+
+```bash
+node experiments/pi-spawn/spawn.mjs spawn reviewer --cwd /home/bom/source   # trả {id, paneId, bound:true}
+# ... arm/watch/gửi việc theo id đó như quy trình trên ...
+node experiments/pi-spawn/spawn.mjs list                                     # cây con + pane còn sống không
+node experiments/pi-spawn/spawn.mjs restore reviewer                          # mở lại ĐÚNG session, một lệnh
+```
+
+Helper dùng `pi --session-id <id>` (mở session có id đó, không có thì tạo — idempotent);
+chạy bên trong pane Herdr thì tự nhận parent session. Không lưu prompt/answer trong registry.
+
+Thủ công (fallback khi không có helper):
+
 
 Pane chết không mất session — Pi session là file. Khôi phục đúng quy trình (khác với quy tắc
 "không resume cho agent mới": đây là trả lại đúng session cũ của pane đó):
