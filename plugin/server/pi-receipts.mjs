@@ -38,8 +38,9 @@ function validEntryShape(entry) {
     && typeof entry.sessionId === 'string' && typeof entry.ts === 'number'
     && ['reason', 'requestEntryId', 'responseEntryId', 'paneId'].every(key => entry[key] === undefined || typeof entry[key] === 'string')
     && (entry.usage === undefined || (typeof entry.usage === 'object' && entry.usage !== null
-      && Number.isFinite(entry.usage.totalTokens) && Number.isFinite(entry.usage.costUsd)
-      && Object.keys(entry.usage).every(key => ['totalTokens', 'costUsd', 'durationMs'].includes(key)))));
+      && Object.keys(entry.usage).length > 0
+      && Object.keys(entry.usage).every(key => ['totalTokens', 'costUsd', 'durationMs'].includes(key))
+      && Object.values(entry.usage).every(value => Number.isFinite(value)))));
 }
 
 /** Parse a journal file; tolerate a torn tail and skip corrupt lines. */

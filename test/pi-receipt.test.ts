@@ -394,6 +394,24 @@ test('a settled reply carries its consumption numbers as receipt metadata', asyn
   assert.equal('usage' in (await run.command('receipt', second.id)), false);
 });
 
+test('usage metadata survives the journal even when a provider reports only some fields', () => {
+  const root = mkdtempSync(join(tmpdir(), 'hg-pi-usage-'));
+  try {
+    const dir = join(root, receipts.scopeFor(root));
+    mkdirSync(dir, { recursive: true });
+    const id = '00000000-0000-4000-8000-00000000000a';
+    const line = (usage: Record<string, unknown>) => JSON.stringify({ v: 1, id, status: 'replied', sessionId: 's', ts: Date.now(), usage }) + '\n';
+    writeFileSync(join(dir, 'receipts.jsonl'), line({ totalTokens: 5 }));
+    assert.deepEqual(receipts.findReceipt(root, id)?.usage, { totalTokens: 5 }, 'tokens without a cost figure stay valid');
+    writeFileSync(join(dir, 'receipts.jsonl'), line({ costUsd: 0.02 }));
+    assert.deepEqual(receipts.findReceipt(root, id)?.usage, { costUsd: 0.02 });
+    writeFileSync(join(dir, 'receipts.jsonl'), line({ totalTokens: 5, extra: 'no' }));
+    assert.equal(receipts.findReceipt(root, id), null, 'unknown usage fields still fail closed');
+    writeFileSync(join(dir, 'receipts.jsonl'), line({}));
+    assert.equal(receipts.findReceipt(root, id), null, 'empty usage is rejected');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('walking the session suffix fails closed at its bound', async () => {
   const w = await worker();
   const { id, marker } = await w.command('arm');
