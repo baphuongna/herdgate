@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -62,8 +62,8 @@ async function worker(options: { persistRoot?: string; cwd?: string } = {}) {
   function user(text: string) {
     return append('message', { message: { role: 'user', content: [{ type: 'text', text }] } });
   }
-  function assistant(stopReason = 'stop', content: Array<Record<string, unknown>> = [{ type: 'text', text: 'private reply' }]) {
-    return append('message', { message: { role: 'assistant', stopReason, content, errorMessage: 'private error' } });
+  function assistant(stopReason = 'stop', content: Array<Record<string, unknown>> = [{ type: 'text', text: 'private reply' }], usage?: Record<string, unknown>) {
+    return append('message', { message: { role: 'assistant', stopReason, content, errorMessage: 'private error', ...(usage ? { usage } : {}) } });
   }
   emit('session_start');
   return {
@@ -359,6 +359,39 @@ test('archived replies are capped in bytes without cutting a UTF-8 character', a
   assert.deepEqual(receipts.findBody(run.root, id), {
     text: 'a'.repeat(receipts.MAX_BODY_BYTES - 1), bytes: Buffer.byteLength(text), truncated: true,
   });
+});
+
+test('a symlinked entry path converges on the same journal scope as the real path', () => {
+  const root = mkdtempSync(join(tmpdir(), 'hg-pi-scope-'));
+  try {
+    const work = join(root, 'work');
+    mkdirSync(work);
+    const link = join(root, 'link-to-work');
+    try { symlinkSync(work, link, 'dir'); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EPERM') throw error; }
+    assert.equal(receipts.scopeFor(link), receipts.scopeFor(work), 'both entry paths hash to one scope');
+    assert.match(receipts.scopeFor(work), /^[0-9a-f]{16}$/);
+    assert.equal(receipts.scopeFor(join(root, 'deleted-but-hashed')), receipts.scopeFor(join(root, 'deleted-but-hashed')),
+      'an unresolvable path falls back to hashing the raw path');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a settled reply carries its consumption numbers as receipt metadata', async () => {
+  const run = await worker();
+  const armed = await run.command('arm');
+  run.user(`${armed.marker}\nviệc`);
+  const response = run.assistant('stop', [{ type: 'text', text: 'việc' }], { totalTokens: 57_018, cost: { total: 0.0638 } });
+  run.turn(response);
+  run.settle();
+  const receipt = await run.command('receipt', armed.id);
+  assert.equal(receipt.status, 'replied');
+  assert.deepEqual(receipt.usage, { totalTokens: 57_018, costUsd: 0.0638 });
+  // A reply without usage numbers simply omits the field.
+  const second = await run.command('arm');
+  run.user(`${second.marker}\nviệc 2`);
+  const response2 = run.assistant();
+  run.turn(response2);
+  run.settle();
+  assert.equal('usage' in (await run.command('receipt', second.id)), false);
 });
 
 test('walking the session suffix fails closed at its bound', async () => {

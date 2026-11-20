@@ -206,6 +206,12 @@ for (const job of queued) {
       verdict = { status: 'unknown', reason: 'no_final_reply', responseEntryId: response.id };
     } else verdict = { status: 'replied', responseEntryId: response.id, bodyText: Array.isArray(response.message.content)
       ? response.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n') : '' };
+    const usage = verdict.status === 'replied' && response.message.usage && typeof response.message.usage === 'object'
+      && (Number.isFinite(response.message.usage.totalTokens) || Number.isFinite(response.message.usage.cost?.total))
+      ? { ...(Number.isFinite(response.message.usage.totalTokens) ? { totalTokens: response.message.usage.totalTokens } : {}),
+          ...(Number.isFinite(response.message.usage.cost?.total) ? { costUsd: response.message.usage.cost.total } : {}) }
+      : undefined;
+    if (usage) verdict.usage = usage;
     if (requestEntryId) verdict.requestEntryId = requestEntryId;
   } catch (error) {
     if (error?.name === 'AbortError') verdict = { status: 'canceled', reason: 'aborted' };
@@ -219,7 +225,8 @@ for (const job of queued) {
   writeReceipt(job.id, verdict.status, sessionId,
     { ...('reason' in verdict ? { reason: verdict.reason } : {}),
       ...('requestEntryId' in verdict ? { requestEntryId: verdict.requestEntryId } : {}),
-      ...('responseEntryId' in verdict ? { responseEntryId: verdict.responseEntryId } : {}) });
+      ...('responseEntryId' in verdict ? { responseEntryId: verdict.responseEntryId } : {}),
+      ...('usage' in verdict ? { usage: verdict.usage } : {}) });
   appendJob(file, { ...job, state: verdict.status, sessionId,
     ...('reason' in verdict ? { reason: verdict.reason } : {}),
     ...('requestEntryId' in verdict ? { requestEntryId: verdict.requestEntryId } : {}),

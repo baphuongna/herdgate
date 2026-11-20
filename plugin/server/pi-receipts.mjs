@@ -4,7 +4,7 @@
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, readdirSync, watch } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, watch } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 
 export const MAX_BODY_BYTES = 64 * 1024; // served size cap for one archived reply
@@ -20,7 +20,12 @@ export function journalBase(env = process.env) {
 }
 
 export function scopeFor(cwd) {
-  return createHash('sha256').update(cwd).digest('hex').slice(0, 16);
+  // Resolve symlinks before hashing (Paseo's import-matcher lesson): two panes
+  // entering the same workspace through different link paths must share one
+  // journal scope. Reads already scan every scope, so this only converges writes.
+  let real = cwd;
+  try { real = realpathSync(cwd); } catch { /* deleted cwd: keep the raw path */ }
+  return createHash('sha256').update(real).digest('hex').slice(0, 16);
 }
 
 export function validEntry(entry) {
@@ -31,7 +36,10 @@ function validEntryShape(entry) {
   return Boolean(entry && entry.v === 1 && RECEIPT_ID.test(entry.id ?? '')
     && ['replied', 'failed', 'canceled', 'unknown'].includes(entry.status)
     && typeof entry.sessionId === 'string' && typeof entry.ts === 'number'
-    && ['reason', 'requestEntryId', 'responseEntryId', 'paneId'].every(key => entry[key] === undefined || typeof entry[key] === 'string'));
+    && ['reason', 'requestEntryId', 'responseEntryId', 'paneId'].every(key => entry[key] === undefined || typeof entry[key] === 'string')
+    && (entry.usage === undefined || (typeof entry.usage === 'object' && entry.usage !== null
+      && Number.isFinite(entry.usage.totalTokens) && Number.isFinite(entry.usage.costUsd)
+      && Object.keys(entry.usage).every(key => ['totalTokens', 'costUsd', 'durationMs'].includes(key)))));
 }
 
 /** Parse a journal file; tolerate a torn tail and skip corrupt lines. */

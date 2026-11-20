@@ -14,6 +14,16 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 const STATUSES = new Set(['replied', 'failed', 'canceled', 'unknown']);
 const METADATA = new Set(['model_change', 'thinking_level_change', 'usage', 'custom', 'label', 'session_info']);
 
+// Consumption numbers are legitimate receipt metadata (Paseo surfaces per-turn
+// usage); they carry no prompt or answer text. Kept small and validated.
+function summarizeUsage(usage) {
+  if (!usage || typeof usage !== 'object') return undefined;
+  const totalTokens = Number.isFinite(usage.totalTokens) ? usage.totalTokens : undefined;
+  const costUsd = Number.isFinite(usage.cost?.total) ? usage.cost.total : undefined;
+  if (totalTokens === undefined && costUsd === undefined) return undefined;
+  return { ...(totalTokens !== undefined ? { totalTokens } : {}), ...(costUsd !== undefined ? { costUsd } : {}) };
+}
+
 function hasMarker(content, marker) {
   const text = typeof content === 'string' ? content : content?.[0]?.type === 'text' ? content[0].text : undefined;
   if (typeof text !== 'string' || !text.startsWith(marker)) return false;
@@ -199,7 +209,8 @@ export default function observer(pi) {
       return invalidate('no_final_reply');
     }
     if (active.retainBody) active.bodyText = content.filter(block => block.type === 'text').map(block => block.text).join('\n');
-    finish('replied', { responseEntryId: response.id });
+    const usage = summarizeUsage(response.message.usage);
+    finish('replied', { responseEntryId: response.id, ...(usage ? { usage } : {}) });
   }
   pi.on('turn_start', () => {
     // A new turn can fail before it appends an assistant entry or reaches turn_end.

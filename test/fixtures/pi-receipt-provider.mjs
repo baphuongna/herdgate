@@ -9,7 +9,7 @@ export default function fixture(pi) {
   const dir = process.env.HG_RECEIPT_FIXTURE_DIR;
   if (!dir) throw new Error('pi receipt fixture requires a temporary test directory');
   const log = (event, fields = {}) => appendFileSync(join(dir, 'events.jsonl'), JSON.stringify({ event, ...fields }) + '\n');
-  const cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+  const cost = { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 };
   let count = 0;
   let held = false;
   pi.registerProvider('hg-receipt-fixture', {
@@ -26,14 +26,14 @@ export default function fixture(pi) {
           role: 'assistant', api: model.api, model: model.id, provider: model.provider,
           content: aborted ? [] : [{ type: 'text', text: `SYNTHETIC_REPLY_${call}` }],
           stopReason: aborted ? 'aborted' : 'stop', timestamp: Date.now(),
-          usage: { ...cost, totalTokens: 0, cost },
+          usage: { ...cost, totalTokens: 48_585, cost },
         };
         stream.push(aborted ? { type: 'error', reason: 'aborted', error: message } : { type: 'done', reason: 'stop', message });
         stream.end(message);
       };
       stream.push({ type: 'start', partial: {
         role: 'assistant', api: model.api, model: model.id, provider: model.provider, content: [],
-        stopReason: 'stop', timestamp: Date.now(), usage: { ...cost, totalTokens: 0, cost },
+        stopReason: 'stop', timestamp: Date.now(), usage: { ...cost, totalTokens: 48_585, cost },
       } });
       if (call === 3) {
         // Hold the model stream open so Escape traverses the real TUI cancellation path.

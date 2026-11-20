@@ -20,7 +20,8 @@ const pi = process.env.TEST_PI_BIN;
 const root = join(import.meta.dirname, '..');
 const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
 
-type Receipt = { id: string; status: string; marker?: string; reason?: string; requestEntryId?: string; responseEntryId?: string; retainBody?: boolean };
+type Receipt = { id: string; status: string; marker?: string; reason?: string; requestEntryId?: string; responseEntryId?: string; retainBody?: boolean;
+  usage?: { totalTokens: number; costUsd: number } };
 type FixtureEvent = { event: string; call?: number; aborted?: boolean; reason?: string; inputHash?: string;
   model?: string; provider?: string; thinking?: string; tools?: string[] };
 
@@ -85,8 +86,35 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     await tmux('paste-buffer', '-d', '-p', '-r', '-b', 'receipt-input');
     await tmux('send-keys', 'Enter');
   };
-  const receipts = async () => [...(await capture()).matchAll(/\{"id":"[0-9a-f-]+","status":"[^"\n]+"[^}\n]*\}/g)]
-    .map(match => JSON.parse(match[0]) as Receipt);
+  const receipts = async () => {
+    const text = await capture();
+    const found: Receipt[] = [];
+    let at = text.indexOf('{"id":"');
+    while (at !== -1) {
+      // Balanced-brace scan: notification JSON may nest (e.g. usage totals).
+      let depth = 0, end = -1, inString = false, escaped = false;
+      for (let i = at; i < text.length; i++) {
+        const c = text[i]!;
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (c === '\\') escaped = true;
+          else if (c === '"') inString = false;
+          continue;
+        }
+        if (c === '"') inString = true;
+        else if (c === '{') depth++;
+        else if (c === '}') { depth--; if (!depth) { end = i; break; } }
+      }
+      if (end === -1) break;
+      const slice = text.slice(at, end + 1);
+      try {
+        const parsed = JSON.parse(slice) as Receipt;
+        if (/^[0-9a-f-]{36}$/.test(parsed.id ?? '') && parsed.status) found.push(parsed);
+      } catch { /* not a notification */ }
+      at = text.indexOf('{"id":"', end + 1);
+    }
+    return found;
+  };
   const arm = async () => {
     const prior = new Set((await receipts()).filter(r => r.status === 'armed').map(r => r.id));
     await send('/herdgate-arm --body');
@@ -254,6 +282,7 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     assert.equal(offline.op, 'receipt.result');
     assert.equal(offline.id, first.id);
     assert.equal(offline.status, 'replied');
+    assert.deepEqual(offline.usage, { totalTokens: 48_585, costUsd: 0.03 }, 'consumption totals ride the receipt');
     const missing = await ask(randomUUID());
     assert.deepEqual(missing, { op: 'receipt.result', id: missing.id, status: 'unknown', reason: 'not_retained_in_runtime' });
     assert.deepEqual(calls(), [1], 'a structured query is not a model input');
@@ -301,7 +330,10 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     assert.equal(kept.requestEntryId, received.requestEntryId);
     assert.equal(kept.responseEntryId, replied.responseEntryId);
     await send('/quit');
-    await waitFor('Pi exits back to the pane shell', async () => (await capture()).includes('$'));
+    await waitFor("Pi exits back to the pane shell", async () => {
+      const agents = JSON.parse((await host("agent", "list")).stdout).result.agents as { pane_id?: string }[];
+      return !agents.some(a => a.pane_id === pane);
+    });
     // A fresh Pi process opens the same workspace and journal, but explicit
     // model/reasoning args override the destination's defaults.
     await launchPi('receipt-override', '--provider', 'hg-receipt-fixture', '--model', 'override', '--thinking', 'high', '--tools', 'read');
@@ -318,7 +350,8 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     assert.equal(restarted.responseEntryId, replied.responseEntryId);
     const remoteAfterRestart = await ask(first.id);
     assert.deepEqual(remoteAfterRestart, { op: 'receipt.result', id: first.id, status: 'replied',
-      requestEntryId: received.requestEntryId, responseEntryId: replied.responseEntryId });
+      requestEntryId: received.requestEntryId, responseEntryId: replied.responseEntryId,
+      usage: { totalTokens: 48_585, costUsd: 0.03 } });
     assert.deepEqual(calls(), [1, 2, 3]);
     t.diagnostic('remote reload and Pi restart: the journaled receipt survived with no extra provider call');
 
