@@ -148,6 +148,17 @@ so the host is the last trusted decision point. `act` scope is denied unless `HE
 
 ## Herdr TUI → an existing Herdr session
 
+On the controlling machine, `herdgate connect` does the whole client side in one
+command: device pairing (read or act), one SSH key per cloud, and the matching
+`~/.ssh/config` blocks. The owner token is asked once on a hidden prompt and is
+never stored; afterwards only per-device SSH keys remain on that machine.
+
+```sh
+herdgate connect --cloud <name> --room home --scope act
+```
+
+The manual equivalent, kept for reference and for non-CLI clients:
+
 This is separate from `hc machine add` and the PWA. On the client use the official
 [Herdr v0.9.5 release](https://github.com/herdrdev/herdr/releases/tag/v0.9.5), including the native Windows ZIP if applicable. On the host run the matching Herdr server and the updated Herdgate publisher. The publisher exposes one session (`default`, or `HERDGATE_HERDR_SESSION` in its environment/config); the SSH device must have **act** scope and its own registered SSH key. `act` can type into panes and control Herdr as the host user.
 

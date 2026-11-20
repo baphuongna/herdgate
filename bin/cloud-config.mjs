@@ -12,8 +12,11 @@ export function cloudOrigin(raw) {
   let url;
   try { url = new URL(raw); }
   catch { throw new Error('cloud must be a credential-free HTTPS origin'); }
-  if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
-    throw new Error('cloud must be a credential-free HTTPS origin');
+  // Plain HTTP only for local development against a loopback gate (same rule as templates/herdgate-via.mjs).
+  const loopbackHttp = url.protocol === 'http:' && ['127.0.0.1', 'localhost', '::1'].includes(url.hostname);
+  if (url.username || url.password || url.pathname !== '/' || url.search || url.hash ||
+      (url.protocol !== 'https:' && !loopbackHttp)) {
+    throw new Error('cloud must be a credential-free HTTPS origin (HTTP only for local development)');
   }
   return url.origin;
 }
@@ -27,6 +30,10 @@ function load() {
     if (!validName.test(name)) throw new Error('invalid name in cloud config');
     return [name, cloudOrigin(origin)];
   }));
+}
+
+export function listClouds() {
+  return [...load()];
 }
 
 export function resolveCloud(input) {
