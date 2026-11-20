@@ -37,10 +37,14 @@ async function panes() {
   cache = parsed.result.panes.filter((p) => typeof p?.pane_id === "string" && /^[a-zA-Z0-9_:.-]{1,128}$/.test(p.pane_id) && !p.pane_id.startsWith("-"))
     .slice(0, 180).map((p) => {
       const title = clip(p.terminal_title_stripped || p.terminal_title || p.pane_id, 120);
-      return { id: p.pane_id, target: typeof p.terminal_id === "string" && /^term_[a-zA-Z0-9]{1,96}$/.test(p.terminal_id) ? p.terminal_id : null, terminal: {
+      const ws = typeof p.workspace_id === "string" && /^[a-zA-Z0-9_:.-]{1,128}$/.test(p.workspace_id) ? p.workspace_id : null;
+      const tab = typeof p.tab_id === "string" && /^[a-zA-Z0-9_:.-]{1,128}$/.test(p.tab_id) ? p.tab_id : null;
+      // The desktop app seats terminals by these labels; ids stay stable per workspace/tab.
+      const labels = { ...(ws && tab ? { "herdr.space": "sp" + digest("space:" + ws).slice(0, 30), "herdr.tab": "tb" + digest("tab:" + tab).slice(0, 30) } : {}), where: clip(p.workspace_id, 128) };
+      return { id: p.pane_id, workspace: ws, tab, target: typeof p.terminal_id === "string" && /^term_[a-zA-Z0-9]{1,96}$/.test(p.terminal_id) ? p.terminal_id : null, terminal: {
         address: "t" + digest(p.pane_id).slice(0, 12), title, name: null, argv: [], cwd: clip(p.cwd, 512),
         state: "live", created_ms: 0, screen: "inexact", cols: 80, rows: 24,
-        labels: { where: clip(p.workspace_id, 128) }, turn: 0,
+        labels, turn: 0,
       } };
     });
   cacheUntil = Date.now() + 1_000;
@@ -48,6 +52,44 @@ async function panes() {
 }
 
 function clip(x, n) { return typeof x === "string" ? x.slice(0, n) : ""; }
+
+let wsLabels = new Map();
+let wsLabelsUntil = 0;
+/** workspace_id → label; empty when the TUI lacks `workspace list` (spaces then go unnamed). */
+async function workspaceLabels() {
+  if (Date.now() < wsLabelsUntil) return wsLabels;
+  try {
+    const parsed = JSON.parse(await run(["workspace", "list"]));
+    wsLabels = new Map((Array.isArray(parsed?.result?.workspaces) ? parsed.result.workspaces : [])
+      .filter((w) => typeof w?.workspace_id === "string" && typeof w?.label === "string")
+      .map((w) => [w.workspace_id, clip(w.label, 120)]));
+  } catch { wsLabels = new Map(); }
+  wsLabelsUntil = Date.now() + 5_000;
+  return wsLabels;
+}
+
+/**
+ * The `herdr-app` layout document the desktop app renders: each TUI workspace becomes a
+ * space (named by its label, placed by its first pane's cwd), each tab a tab, each pane a
+ * terminal block. Read-only: structural edits stay in the TUI (doc.set is not offered).
+ */
+async function layoutDoc() {
+  const labels = await workspaceLabels();
+  const spaces = new Map();
+  for (const p of await panes()) {
+    if (!p.workspace || !p.tab) continue; // a pane outside every workspace stays off the app's screens
+    if (!spaces.has(p.workspace)) spaces.set(p.workspace, { id: p.terminal.labels["herdr.space"], name: labels.get(p.workspace) || "", folder: p.terminal.cwd, tabs: new Map() });
+    const space = spaces.get(p.workspace);
+    if (!space.folder && p.terminal.cwd) space.folder = p.terminal.cwd;
+    if (!space.tabs.has(p.tab)) {
+      const id = p.terminal.labels["herdr.tab"];
+      space.tabs.set(p.tab, { id, name: "", root: { id, type: "row", children: [] } });
+    }
+    space.tabs.get(p.tab).root.children.push({ id: "p" + digest("pane:" + p.id).slice(0, 30), type: "block", content: { terminal: p.terminal.address } });
+  }
+  return { spaces: [...spaces.values()].map((s) => ({ id: s.id, name: s.name, folder: s.folder, tabs: [...s.tabs.values()] })) };
+}
+
 const status = async () => ({ core, version, pid: process.pid, uptime_ms: Date.now() - startedAt, holders: [], live: (await panes()).length, finished: 0, keeps_running_after_logout: true });
 class RpcError extends Error {
   constructor(code, message, kind) { super(message); this.code = code; this.kind = kind; }
@@ -109,7 +151,13 @@ async function call(method, p, framed, attach) {
     }
     case "templates.list": return { templates: [] };
     case "machine.list": return { machines: [] };
-    case "doc.get": return { value: null, version: 0 };
+    case "doc.get": {
+      if (typeof p.name !== "string" || !p.name || p.name.length > 128) throw invalid();
+      if (p.name !== "herdr-app") return { value: null, version: 0 };
+      const value = await layoutDoc();
+      // Content-derived, so the version is stable while the layout is unchanged.
+      return { value, version: Number.parseInt(digest(JSON.stringify(value)).slice(0, 12), 16) };
+    }
     default: throw new RpcError(-32601, "Method not available on this TUI adapter", "forbidden");
   }
 }

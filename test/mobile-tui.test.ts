@@ -197,3 +197,56 @@ test("mobile TUI adapter negotiates plain Core RPC, exposes a pane, and refuses 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("desktop layout: the herdr-app doc mirrors TUI workspaces and seats every pane by label", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hg-mobile-doc-"));
+  try {
+    const herdr = join(dir, "herdr");
+    writeFileSync(herdr, `#!/bin/sh
+case "$1/$2" in
+pane/list) printf '%s\\n' '{"result":{"panes":[{"pane_id":"w2:p1","workspace_id":"w2","tab_id":"w2:t1","cwd":"/home/x/app","terminal_title":"app one"},{"pane_id":"w2:p2","workspace_id":"w2","tab_id":"w2:t1","cwd":"/home/x/app","terminal_title":"app two"},{"pane_id":"w3:p9","workspace_id":"w3","tab_id":"w3:t2","cwd":"/home/x/db","terminal_title":"db"},{"pane_id":"w9:pX"}]}}';;
+workspace/list) printf '%s\\n' '{"result":{"workspaces":[{"workspace_id":"w2","label":"app"},{"workspace_id":"w3","label":"database"}]}}';;
+pane/read) printf 'screen\\n';;
+*) exit 9;;
+esac
+`, { mode: 0o700 });
+    const ask = (...requests: object[]) => {
+      const result = spawnSync(process.execPath, [adapter, "connect"], { encoding: "utf8", input: requests.map((r) => JSON.stringify(r)).join("\n") + "\n", env: { ...process.env, HERDR_BIN_PATH: herdr } });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim().split("\n").map((line: string) => JSON.parse(line));
+    };
+    const [list, doc, again, other, bad] = ask(
+      rpc(1, "terminal.list"),
+      rpc(2, "doc.get", { name: "herdr-app" }),
+      rpc(3, "doc.get", { name: "herdr-app" }),
+      rpc(4, "doc.get", { name: "scratch" }),
+      rpc(5, "doc.get", {}),
+    );
+    const [one, two, three, loose] = list.result.terminals;
+    assert.equal(list.result.terminals.length, 4);
+    // Seating labels exist only for panes inside a workspace, in the app's id shape.
+    assert.match(one.labels["herdr.space"], /^sp[0-9a-f]{30}$/);
+    assert.match(one.labels["herdr.tab"], /^tb[0-9a-f]{30}$/);
+    assert.equal(one.labels["herdr.space"], two.labels["herdr.space"]);
+    assert.equal(one.labels["herdr.tab"], two.labels["herdr.tab"]);
+    assert.notEqual(one.labels["herdr.space"], three.labels["herdr.space"]);
+    assert.equal(loose.labels["herdr.space"], undefined);
+    const value = doc.result.value;
+    assert.deepEqual(value.spaces.map((s: { name: string }) => s.name), ["app", "database"]);
+    assert.deepEqual(value.spaces.map((s: { folder: string }) => s.folder), ["/home/x/app", "/home/x/db"]);
+    const [appSpace, dbSpace] = value.spaces;
+    assert.equal(appSpace.id, one.labels["herdr.space"]);
+    assert.equal(appSpace.tabs[0].id, one.labels["herdr.tab"]);
+    assert.equal(appSpace.tabs[0].root.id, appSpace.tabs[0].id);
+    assert.deepEqual(appSpace.tabs[0].root.children.map((c: { content: { terminal: string } }) => c.content.terminal), [one.address, two.address]);
+    assert.deepEqual(dbSpace.tabs[0].root.children.map((c: { content: { terminal: string } }) => c.content.terminal), [three.address]);
+    // Stable across calls, and only herdr-app is served; a nameless doc.get is a usage error.
+    assert.deepEqual(again.result.value, value);
+    assert.equal(again.result.version, doc.result.version);
+    assert.ok(Number.isInteger(doc.result.version) && doc.result.version > 0);
+    assert.deepEqual(other.result, { value: null, version: 0 });
+    assert.equal(bad.error.data.kind, "usage");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

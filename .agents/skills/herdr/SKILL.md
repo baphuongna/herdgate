@@ -83,3 +83,20 @@ Nếu có Python 3.11+ và file `herdr_pi.py` đi kèm **trong thư mục của 
 
    Cấm: `agent prompt --wait`/`--timeout` để chờ nhiệm vụ (đó là chờ đồng bộ trên controller), vòng lặp `agent get`/`agent read`, `sleep`, polling pane. `agent start --timeout` chỉ chờ readiness khi khởi tạo agent — vẫn hợp lệ. `agent prompt` trả ok chứng nhận input đã xếp, không phải agent đã nhận việc hay hoàn thành. Khi báo cáo về: `replied` chứng minh có reply cuối đúng request (kèm usage), không khẳng định task nghiệp vụ thành công; `observe`/`agent read` chỉ để đối chiếu bổ sung sau khi báo cáo đến, hoặc khi người dùng yêu cầu tra cứu. Nếu chưa có watch/forwarder nào: ghi rõ "đã submit, báo cáo sẽ tự về" và kết thúc lượt, không chuyển sang chờ.
 5. Báo tên agent, pane, cùng kết quả hoặc trạng thái chưa xác minh; dừng đúng giới hạn. Không tự đóng pane có việc đang chạy hay pane người dùng; không dọn tài nguyên nếu chưa được yêu cầu. Worktree là checkout riêng, **không phải OS sandbox**.
+
+## Mở lại session sau khi pane đóng
+
+Pane chết không mất session — Pi session là file. Khôi phục đúng quy trình (khác với quy tắc
+"không resume cho agent mới": đây là trả lại đúng session cũ của pane đó):
+
+```bash
+PANE=$("$H" pane split --current --direction right --no-focus --cwd /home/bom/source | jq -r .result.pane.pane_id)
+"$H" agent start <tên> --kind pi --pane "$PANE" --timeout 45000 -- --session <session-id|đường-dẫn-file>
+"$H" pane list   # xác minh agent_session trỏ đúng file session cũ
+```
+
+Cờ sau `--` truyền thẳng cho Pi; **dùng `--session <id|path>`** — `--resume` không nhận id,
+nó mở menu chọn tương tác và agent sẽ không ràng buộc session. **Không dùng `pane run 'pi …'`
+để khởi chạy/khôi phục agent**: phản hồi của `pane run` chỉ là "input đã xếp", không chờ readiness,
+không ràng buộc agent — agent sẽ hiện không có session và controller không quản lý được.
+Muốn đóng agent: `/quit` trong pane đó, đợi shell prompt; đóng pane phải do người dùng quyết định.
