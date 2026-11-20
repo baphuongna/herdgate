@@ -270,4 +270,204 @@ test('a worker killed mid-run fails closed on restart and resumes the next job',
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('rpc mode: ping/stats/drain over JSONL, junk tolerated, oversize frame kills, EOF exits cleanly', {
+  skip: (!piBin || process.platform !== 'linux') && 'requires TEST_PI_BIN on Linux',
+  timeout: 90_000,
+}, async () => {
+  const pkg = piPackage();
+  assert.ok(pkg, 'resolvable Pi package');
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-rpc-'));
+  const workspace = join(dir, 'ws');
+  const workerDir = join(dir, 'worker');
+  const receiptsDir = join(dir, 'receipts');
+  const fixtureDir = join(dir, 'fixture');
+  mkdirSync(workspace, { recursive: true });
+  const file = jobsFile(workerDir);
+  const one = '00000000-0000-4000-8000-000000000031';
+  appendJob(file, { v: 1, id: one, prompt: 'Rpc synthetic request', ts: 1, state: 'queued' });
+
+  const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/worker.mjs'),
+    '--workspace', workspace, '--pi', pkg, '--fixture-dir', fixtureDir, '--mode', 'rpc'],
+    { env: { PATH: process.env.PATH, HOME: dir, HERDGATE_PI_WORKER_DIR: workerDir, HERDGATE_PI_RECEIPT_DIR: receiptsDir, PI_TELEMETRY: '0' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const err: string[] = [];
+  child.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
+  const frames: Record<string, any>[] = [];
+  child.stdout!.setEncoding('utf8');
+  let stdoutBuffer = '';
+  child.stdout!.on('data', chunk => {
+    stdoutBuffer += chunk;
+    let nl: number;
+    while ((nl = stdoutBuffer.indexOf('\n')) >= 0) {
+      const frame = stdoutBuffer.slice(0, nl);
+      stdoutBuffer = stdoutBuffer.slice(nl + 1);
+      try { frames.push(JSON.parse(frame)); } catch { /* torn */ }
+    }
+  });
+  const send = (payload: unknown) => child.stdin!.write(`${JSON.stringify(payload)}\n`);
+  const reply = async (id: string, op: string, extra?: Record<string, unknown>) => {
+    const before = frames.length;
+    send({ id, op, ...extra });
+    return waitFor(`reply to ${op}`, () => frames.slice(before).find(f => f.id === id));
+  };
+
+  const pong = await reply('p1', 'ping');
+  assert.equal(pong.ok, true);
+  assert.equal(pong.result.pong, true);
+  assert.equal(pong.result.pid, child.pid);
+
+  // The seeded job drains at startup; stats must reflect exactly one replied verdict.
+  await waitFor('job settled', () => findReceipt(receiptsDir, one)?.status === 'replied');
+  const stats = await reply('s1', 'stats');
+  assert.equal(stats.result.started, 1);
+  assert.equal(stats.result.verdicts.replied, 1);
+  assert.equal(stats.result.queued, 0);
+  assert.equal(stats.result.running, null);
+  assert.equal(stats.result.busy, false);
+
+  // steer without a running job is an explicit error, not a queue write.
+  const steer = await reply('st1', 'steer', { text: 'nope' });
+  assert.equal(steer.ok, false);
+  assert.match(steer.error, /not_running/);
+
+  // Junk frames answer with an error and never kill the loop.
+  child.stdin!.write('this is not json\n');
+  const after = await reply('p2', 'ping');
+  assert.equal(after.ok, true);
+  assert.equal(frames.filter(f => f.ok === false && f.error === 'bad_json').length, 1);
+
+  // drain while idle is a no-op that reports zero runs.
+  const drain = await reply('d1', 'drain', { wait: true });
+  assert.deepEqual(drain.result, { started: true, ran: 0 });
+
+  // stdin EOF shuts down gracefully with exit 0 (pid lock released).
+  child.stdin!.end();
+  const code = await new Promise<number | null>(resolve => child.once('exit', resolve));
+  assert.equal(code, 0, err.join(''));
+  assert.equal(existsSync(join(workerDir, 'worker.pid')), false, 'pid lock released on exit');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('rpc mode: abort cancels a held run into a receipt; an oversize frame exits fail-closed', {
+  skip: (!piBin || process.platform !== 'linux') && 'requires TEST_PI_BIN on Linux',
+  timeout: 90_000,
+}, async () => {
+  const pkg = piPackage();
+  assert.ok(pkg, 'resolvable Pi package');
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-rpc2-'));
+  const workspace = join(dir, 'ws');
+  const workerDir = join(dir, 'worker');
+  const receiptsDir = join(dir, 'receipts');
+  const fixtureDir = join(dir, 'fixture');
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(fixtureDir, { recursive: true });
+  writeFileSync(join(fixtureDir, 'hold'), '', { mode: 0o600 });
+  const file = jobsFile(workerDir);
+  const held = '00000000-0000-4000-8000-000000000041';
+  appendJob(file, { v: 1, id: held, prompt: 'Held synthetic request', ts: 1, state: 'queued' });
+
+  const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/worker.mjs'),
+    '--workspace', workspace, '--pi', pkg, '--fixture-dir', fixtureDir, '--mode', 'rpc'],
+    { env: { PATH: process.env.PATH, HOME: dir, HERDGATE_PI_WORKER_DIR: workerDir, HERDGATE_PI_RECEIPT_DIR: receiptsDir, PI_TELEMETRY: '0' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const err: string[] = [];
+  child.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
+  const frames: Record<string, any>[] = [];
+  child.stdout!.setEncoding('utf8');
+  let stdoutBuffer = '';
+  child.stdout!.on('data', chunk => {
+    stdoutBuffer += chunk;
+    let nl: number;
+    while ((nl = stdoutBuffer.indexOf('\n')) >= 0) {
+      const frame = stdoutBuffer.slice(0, nl);
+      stdoutBuffer = stdoutBuffer.slice(nl + 1);
+      try { frames.push(JSON.parse(frame)); } catch { /* torn */ }
+    }
+  });
+  const send = (payload: unknown) => child.stdin!.write(`${JSON.stringify(payload)}\n`);
+  const reply = async (id: string, op: string, extra?: Record<string, unknown>) => {
+    const before = frames.length;
+    send({ id, op, ...extra });
+    return waitFor(`reply to ${op}`, () => frames.slice(before).find(f => f.id === id));
+  };
+
+  await waitFor('fixture holds the call', () => events(fixtureDir).some(e => e.event === 'holding'));
+  const busy = await reply('s0', 'stats');
+  assert.equal(busy.result.running, held);
+
+  const aborted = await reply('a1', 'abort');
+  assert.equal(aborted.ok, true, JSON.stringify(aborted));
+  assert.equal(aborted.result.aborted, true);
+  assert.equal(aborted.result.job.id, held);
+  assert.equal(aborted.result.job.status, 'canceled');
+  assert.equal(aborted.result.job.reason, 'aborted');
+  const receipt = findReceipt(receiptsDir, held);
+  assert.equal(receipt?.status, 'canceled');
+  assert.equal(receipt?.reason, 'aborted');
+  assert.equal(readJobs(file).get(held)?.state, 'canceled');
+  const settled = events(fixtureDir).find(e => e.event === 'settled' && e.call === 1);
+  assert.ok(!settled, 'the held call never settled — the abort cut it');
+
+  // A frame over the cap kills the worker instead of desyncing the protocol.
+  child.stdin!.write(`{"id":"big","op":"ping","pad":"${'x'.repeat(70 * 1024)}"}\n`);
+  const code = await new Promise<number | null>(resolve => child.once('exit', resolve));
+  assert.equal(code, 3, `oversize frame must exit 3 (stderr: ${err.join('')})`);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('rpc mode: steer injects input into the held turn and the receipt still settles', {
+  skip: (!piBin || process.platform !== 'linux') && 'requires TEST_PI_BIN on Linux',
+  timeout: 90_000,
+}, async () => {
+  const pkg = piPackage();
+  assert.ok(pkg, 'resolvable Pi package');
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-rpc3-'));
+  const workspace = join(dir, 'ws');
+  const workerDir = join(dir, 'worker');
+  const receiptsDir = join(dir, 'receipts');
+  const fixtureDir = join(dir, 'fixture');
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(fixtureDir, { recursive: true });
+  writeFileSync(join(fixtureDir, 'hold'), '', { mode: 0o600 });
+  const file = jobsFile(workerDir);
+  const held = '00000000-0000-4000-8000-000000000051';
+  appendJob(file, { v: 1, id: held, prompt: 'Steered synthetic request', ts: 1, state: 'queued' });
+
+  const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/worker.mjs'),
+    '--workspace', workspace, '--pi', pkg, '--fixture-dir', fixtureDir, '--mode', 'rpc'],
+    { env: { PATH: process.env.PATH, HOME: dir, HERDGATE_PI_WORKER_DIR: workerDir, HERDGATE_PI_RECEIPT_DIR: receiptsDir, PI_TELEMETRY: '0' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const frames: Record<string, any>[] = [];
+  child.stdout!.setEncoding('utf8');
+  let stdoutBuffer = '';
+  child.stdout!.on('data', chunk => {
+    stdoutBuffer += chunk;
+    let nl: number;
+    while ((nl = stdoutBuffer.indexOf('\n')) >= 0) {
+      const frame = stdoutBuffer.slice(0, nl);
+      stdoutBuffer = stdoutBuffer.slice(nl + 1);
+      try { frames.push(JSON.parse(frame)); } catch { /* torn */ }
+    }
+  });
+  const send = (payload: unknown) => child.stdin!.write(`${JSON.stringify(payload)}\n`);
+  const reply = async (id: string, op: string, extra?: Record<string, unknown>) => {
+    const before = frames.length;
+    send({ id, op, ...extra });
+    return waitFor(`reply to ${op}`, () => frames.slice(before).find(f => f.id === id));
+  };
+
+  await waitFor('fixture holds the call', () => events(fixtureDir).some(e => e.event === 'holding'));
+  const steered = await reply('st1', 'steer', { text: 'nghĩ ngắn hơn' });
+  assert.equal(steered.ok, true, JSON.stringify(steered));
+  assert.equal(steered.result.job, held);
+  // The steer message queues into the live session; once the held turn settles it is
+  // delivered and the fixture is called a second time within the same job.
+  writeFileSync(join(fixtureDir, 'release'), '', { mode: 0o600 });
+  await waitFor('steer re-prompted the fixture', () => events(fixtureDir).filter(e => e.event === 'call').length >= 2);
+  await waitFor('job settled after steer', () => findReceipt(receiptsDir, held)?.status === 'replied');
+  const stats = await reply('s1', 'stats');
+  assert.equal(stats.result.verdicts.replied, 1);
+  send({ id: 'x1', op: 'shutdown' });
+  const code = await new Promise<number | null>(resolve => child.once('exit', resolve));
+  assert.equal(code, 0);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 assert.ok(journalBase({}) || homedir()); // keep the receipts import honest

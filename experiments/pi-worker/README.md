@@ -40,8 +40,34 @@ thiết bị ──receipt.get──▶ publisher ──▶ receipts.jsonl (như
   chạy không đổi code). Wire provider thật là slice sau.
 - Receipt chỉ chứa `id/status/reason/entry IDs/sessionId`. Prompt chỉ nằm trong
   `jobs.jsonl` local 0600 và session JSONL của host.
-- Worker là binary một-lần-drain (drain xong exit 0) — không daemon, không scheduler,
-  không listener mạng. Người chủ tự chạy nó (service/test/SSH) khi muốn.
+- Worker có hai chế độ: **once** (mặc định — drain xong exit 0, không daemon, không
+  scheduler, không listener mạng) và **rpc** (daemon JSONL trên stdio cho chủ host —
+  xem dưới). Người chủ tự chạy nó (service/test/SSH) khi muốn.
+
+## Chế độ rpc (daemon JSONL, bài học jsonl-rpc của Paseo)
+
+```sh
+node experiments/pi-worker/worker.mjs --workspace <dir> --fixture-dir <dir> \
+  --mode rpc [--idle-exit 3600]
+```
+
+Một request JSON một dòng vào stdin, một response một dòng ra stdout:
+`{"type":"response","id":…,"ok":true,"result":…}` (hoặc `"error"`). stderr là log chẩn đoán.
+
+| op | ý nghĩa |
+|---|---|
+| `ping` | `{pong, pid, rpc, pi, uptimeMs}` — không tác dụng phụ |
+| `stats` | queue/verdict counters, job đang chạy (chỉ id), scope |
+| `drain {wait}` | kích hoạt một pass drain; `wait:true` chờ xong (op dài) |
+| `steer {text}` | **chỉ khi đang chạy job**: `sendUserMessage` vào session đang chạy; hàng đợi headless được flush thành turn theo sau trong cùng job |
+| `abort` | **chỉ khi đang chạy job**: `session.abort()` → receipt `canceled/aborted`; response trả SAU khi verdict ghi xong |
+| `shutdown` | graceful: abort job đang chạy, nhả pid-lock, exit 0 |
+
+Nguyên tắc bền vững (từ jsonl-rpc-process của Paseo): frame quá 64 KiB → **tiến trình
+exit 3 thay vì bỏ frame** (mất state còn an toàn hơn desync); dòng rác → response lỗi,
+không chết; EOF stdin / SIGTERM / SIGINT → graceful shutdown; queue tự kích hoạt pass
+mới khi rảnh (watchFile). Session tạo/hủy mỗi job nên "idle cleanup" ở đây là chính
+daemon: `--idle-exit <giây>` thoát graceful khi hết việc.
 
 ## Dùng thử
 

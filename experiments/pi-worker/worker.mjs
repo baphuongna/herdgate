@@ -7,14 +7,24 @@
 // scheduler and never resends. Fixture provider only in this prototype: no network.
 //
 //   node experiments/pi-worker/worker.mjs --workspace <dir> [--pi <pi-coding-agent pkg>] \
-//     [--fixture-dir <dir>] [--check]
+//     [--fixture-dir <dir>] [--check] [--mode once|rpc] [--idle-exit <seconds>]
+//
+// once (default): drain what is queued, then exit 0 — the original one-shot binary.
+// rpc: stay resident and speak one JSON request/response pair per line on stdio
+//      (Paseo jsonl-rpc lessons: a frame over 64 KiB kills the process instead of
+//      being skipped — losing state beats desync; stdin EOF and SIGTERM/SIGINT shut
+//      down gracefully, aborting the running job into a canceled receipt; junk lines
+//      get an error response and never kill the loop). Ops: ping, stats, drain,
+//      steer, abort, shutdown. Queue growth auto-triggers a drain pass when idle.
+// Sessions are created and disposed per job, so idle cleanup here means the daemon
+// itself: --idle-exit <seconds> exits through the same graceful path.
 //
 // Queue:     <HERDGATE_PI_WORKER_DIR | ~/.local/state/herdgate/pi-worker>/jobs.jsonl
 // Receipts:  the shared journal (HERDGATE_PI_RECEIPT_DIR | XDG default), per workspace.
 // Sessions:  persistent JSONL audit trail under the worker dir (one session per job).
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, unwatchFile, watchFile, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { MIN_PI_VERSION, versionAtLeast } from '../../plugin/server/pi-worker.mjs';
@@ -43,6 +53,10 @@ function piPackage() {
 const workspace = resolve(arg('workspace') ?? '');
 const fixtureDir = resolve(arg('fixture-dir') ?? '');
 const check = process.argv.includes('--check');
+const mode = arg('mode') ?? 'once';
+const idleExitSeconds = Number(arg('idle-exit') ?? 0);
+assert.ok(['once', 'rpc'].includes(mode), 'pass --mode once|rpc');
+assert.ok(Number.isFinite(idleExitSeconds) && idleExitSeconds >= 0, '--idle-exit expects seconds');
 assert.ok(workspace, 'pass --workspace <dir> (the Pi workspace whose receipt scope to use)');
 assert.ok(fixtureDir || check, 'pass --fixture-dir <dir> (this prototype runs the synthetic provider only)');
 
@@ -116,7 +130,7 @@ async function makeSession() {
     baseUrl: 'https://no-network.invalid', apiKey: 'fake', api: 'openai-completions',
     models: [{ id: 'fixture', name: 'Fixture', input: ['text'], reasoning: false,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 4096 }],
-    streamSimple(model) {
+    streamSimple(model, _context, options) {
       const stream = createAssistantMessageEventStream();
       const call = ++calls;
       note({ event: 'call', call, inputHash: createHash('sha256').update(currentPrompt).digest('hex') });
@@ -125,7 +139,17 @@ async function makeSession() {
           if (existsSync(join(fixtureDir, 'hold')) && !existsSync(join(fixtureDir, 'release'))) {
             note({ event: 'holding', call });
             const deadline = Date.now() + 120_000;
-            while (!existsSync(join(fixtureDir, 'release')) && Date.now() < deadline) await delay(100);
+            while (!existsSync(join(fixtureDir, 'release')) && !options?.signal?.aborted && Date.now() < deadline) await delay(100);
+          }
+          if (options?.signal?.aborted) {
+            // Real providers surface an aborted stopReason; the fixture must too,
+            // or session.abort() waits forever for a stream that never ends.
+            const cut = message(model, '');
+            cut.stopReason = 'aborted';
+            note({ event: 'aborted', call });
+            stream.push({ type: 'done', reason: 'aborted', message: cut });
+            stream.end(cut);
+            return;
           }
           const output = message(model, `SYNTHETIC_WORKER_REPLY_${call}`);
           note({ event: 'settled', call, aborted: false });
@@ -165,8 +189,8 @@ function writeReceipt(id, status, sessionId, fields = {}) {
 
 // Resume pass: a job left `running` by a dead worker fails closed. It is never resent;
 // if a receipt was journaled before the crash, that verdict stands.
-const jobs = readJobs(file);
-for (const job of jobs.values()) {
+const initialJobs = readJobs(file);
+for (const job of initialJobs.values()) {
   if (job.state !== 'running') continue;
   const settled = findReceipt(receiptsBase, job.id);
   if (settled) {
@@ -182,42 +206,63 @@ for (const job of jobs.values()) {
   log(`job ${job.id} was running when the previous worker died -> unknown/worker_restarted`);
 }
 
-// Drain queued jobs in admission order. One job at a time; terminal state mirrors the receipt.
-const queued = [...jobs.values()].filter(job => job.state === 'queued').sort((a, b) => a.ts - b.ts);
-if (!queued.length) log('no queued jobs');
-for (const job of queued) {
+// Live run state, shared with the RPC ops (steer/abort reach the running session).
+let running = null; // { job, session, done: Promise<verdict> } while a job executes
+let passActive = false;
+let shuttingDown = false; // set by the rpc shutdown paths; stops new jobs mid-pass
+const counters = { started: 0, verdicts: { replied: 0, unknown: 0, failed: 0, canceled: 0 } };
+const startedAt = Date.now();
+
+async function runJob(job) {
   const { session, sessionManager } = await makeSession();
   const sessionId = sessionManager.getSessionId();
   appendJob(file, { ...job, state: 'running', sessionId });
   let verdict = { status: 'failed', reason: 'worker_error' };
+  const done = (async () => {
+    try {
+      currentPrompt = job.prompt;
+      await session.prompt(job.prompt);
+      // Steered input queues in the interactive message queue; a bare headless
+      // prompt() does not consume it, so deliver queued messages as follow-up
+      // turns inside the same job (the receipt reflects the final turn).
+      const queuedIn = session.clearQueue();
+      for (const text of [...queuedIn.steering, ...queuedIn.followUp]) {
+        await session.sendUserMessage(text);
+      }
+      const branch = sessionManager.getBranch();
+      const request = branch.filter(e => e.type === 'message' && e.message.role === 'user').at(-1);
+      const response = branch.filter(e => e.type === 'message' && e.message.role === 'assistant').at(-1);
+      const requestEntryId = request?.id;
+      if (!response) verdict = { status: 'unknown', reason: 'no_final_reply' };
+      else if (response.message.stopReason === 'error') verdict = { status: 'failed', reason: 'pi_error', responseEntryId: response.id };
+      else if (response.message.stopReason === 'length') verdict = { status: 'failed', reason: 'pi_length', responseEntryId: response.id };
+      else if (response.message.stopReason === 'aborted') verdict = { status: 'canceled', reason: 'aborted', responseEntryId: response.id };
+      else if (response.message.stopReason !== 'stop'
+        || !Array.isArray(response.message.content)
+        || !response.message.content.some(block => block.type === 'text' && typeof block.text === 'string' && block.text.trim())) {
+        verdict = { status: 'unknown', reason: 'no_final_reply', responseEntryId: response.id };
+      } else verdict = { status: 'replied', responseEntryId: response.id, bodyText: Array.isArray(response.message.content)
+        ? response.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n') : '' };
+      const usage = verdict.status === 'replied' && response.message.usage && typeof response.message.usage === 'object'
+        && (Number.isFinite(response.message.usage.totalTokens) || Number.isFinite(response.message.usage.cost?.total))
+        ? { ...(Number.isFinite(response.message.usage.totalTokens) ? { totalTokens: response.message.usage.totalTokens } : {}),
+            ...(Number.isFinite(response.message.usage.cost?.total) ? { costUsd: response.message.usage.cost.total } : {}) }
+        : undefined;
+      if (usage) verdict.usage = usage;
+      if (requestEntryId) verdict.requestEntryId = requestEntryId;
+    } catch (error) {
+      if (error?.name === 'AbortError') verdict = { status: 'canceled', reason: 'aborted' };
+      else log(`job ${job.id} prompt threw: ${error?.message ?? error}`);
+    }
+    return verdict;
+  })();
+  running = { job, session, done };
+  counters.started += 1;
   try {
-    currentPrompt = job.prompt;
-    await session.prompt(job.prompt);
-    const branch = sessionManager.getBranch();
-    const request = branch.filter(e => e.type === 'message' && e.message.role === 'user').at(-1);
-    const response = branch.filter(e => e.type === 'message' && e.message.role === 'assistant').at(-1);
-    const requestEntryId = request?.id;
-    if (!response) verdict = { status: 'unknown', reason: 'no_final_reply' };
-    else if (response.message.stopReason === 'error') verdict = { status: 'failed', reason: 'pi_error', responseEntryId: response.id };
-    else if (response.message.stopReason === 'length') verdict = { status: 'failed', reason: 'pi_length', responseEntryId: response.id };
-    else if (response.message.stopReason !== 'stop'
-      || !Array.isArray(response.message.content)
-      || !response.message.content.some(block => block.type === 'text' && typeof block.text === 'string' && block.text.trim())) {
-      verdict = { status: 'unknown', reason: 'no_final_reply', responseEntryId: response.id };
-    } else verdict = { status: 'replied', responseEntryId: response.id, bodyText: Array.isArray(response.message.content)
-      ? response.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n') : '' };
-    const usage = verdict.status === 'replied' && response.message.usage && typeof response.message.usage === 'object'
-      && (Number.isFinite(response.message.usage.totalTokens) || Number.isFinite(response.message.usage.cost?.total))
-      ? { ...(Number.isFinite(response.message.usage.totalTokens) ? { totalTokens: response.message.usage.totalTokens } : {}),
-          ...(Number.isFinite(response.message.usage.cost?.total) ? { costUsd: response.message.usage.cost.total } : {}) }
-      : undefined;
-    if (usage) verdict.usage = usage;
-    if (requestEntryId) verdict.requestEntryId = requestEntryId;
-  } catch (error) {
-    if (error?.name === 'AbortError') verdict = { status: 'canceled', reason: 'aborted' };
-    else log(`job ${job.id} prompt threw: ${error?.message ?? error}`);
+    await done;
   } finally {
     session.dispose();
+    running = null;
   }
   if (verdict.status === 'replied' && verdict.bodyText && process.env.HERDGATE_PI_RECEIPT_BODY === '1') {
     try { writeBody(receiptsBase, workspace, job.id, verdict.bodyText); } catch (error) { log(`body archive failed: ${error.message}`); }
@@ -231,8 +276,152 @@ for (const job of queued) {
     ...('reason' in verdict ? { reason: verdict.reason } : {}),
     ...('requestEntryId' in verdict ? { requestEntryId: verdict.requestEntryId } : {}),
     ...('responseEntryId' in verdict ? { responseEntryId: verdict.responseEntryId } : {}) });
+  counters.verdicts[verdict.status] = (counters.verdicts[verdict.status] ?? 0) + 1;
   log(`job ${job.id} -> ${verdict.status}${verdict.reason ? `/${verdict.reason}` : ''}`);
+  return verdict;
 }
 
-rmSync(pidFile, { force: true });
-log(`done (${queued.length} job(s), scope ${scopeFor(workspace)})`);
+/** One admission-order pass over the queue; one job at a time. Returns jobs started. */
+async function drainPass() {
+  passActive = true;
+  let ran = 0;
+  try {
+    const jobs = readJobs(file);
+    const queued = [...jobs.values()].filter(job => job.state === 'queued').sort((a, b) => a.ts - b.ts);
+    for (const job of queued) {
+      if (shuttingDown) break; // a shutdown mid-pass must not start the next job
+      await runJob(job); ran += 1;
+    }
+  } finally {
+    passActive = false;
+  }
+  return ran;
+}
+
+if (mode === 'once') {
+  const ran = await drainPass();
+  rmSync(pidFile, { force: true });
+  log(`done (${ran} job(s), scope ${scopeFor(workspace)})`);
+  process.exit(0);
+}
+
+// --- rpc mode: one JSON frame per line in, one response per frame out (stdout). ---
+const MAX_FRAME = 64 * 1024;
+const RPC_VERSION = 'pi-worker-rpc-1';
+let idleTimer = null;
+
+const respond = (id, ok, payload) => {
+  process.stdout.write(`${JSON.stringify({ type: 'response', id: id ?? null, ok, ...(ok ? { result: payload } : { error: String(payload) }) })}\n`);
+};
+const touchIdleTimer = () => {
+  if (idleTimer) clearTimeout(idleTimer);
+  if (idleExitSeconds > 0) idleTimer = setTimeout(() => void shutdown(`idle_exit after ${idleExitSeconds}s`), idleExitSeconds * 1000);
+  if (idleTimer) idleTimer.unref();
+};
+
+async function shutdown(reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (idleTimer) clearTimeout(idleTimer);
+  try { unwatchFile(file); } catch { /* not watching */ }
+  log(`shutting down (${reason})`);
+  if (running) {
+    try { await running.session.abort(); await running.done; }
+    catch (error) { log(`shutdown abort failed: ${error?.message ?? error}`); }
+  }
+  rmSync(pidFile, { force: true });
+  process.exit(0);
+}
+process.on('SIGTERM', () => void shutdown('sigterm'));
+process.on('SIGINT', () => void shutdown('sigint'));
+
+let passPromise = null;
+const startPass = () => {
+  if (passActive || passPromise || shuttingDown) return passPromise;
+  passPromise = drainPass().finally(() => { passPromise = null; touchIdleTimer(); });
+  return passPromise;
+};
+
+const ops = {
+  async ping() {
+    return { pong: true, pid: process.pid, rpc: RPC_VERSION, pi: VERSION, mode: 'rpc',
+      uptimeMs: Date.now() - startedAt, shuttingDown };
+  },
+  async stats() {
+    const jobs = readJobs(file);
+    let queued = 0;
+    for (const job of jobs.values()) if (job.state === 'queued') queued += 1;
+    return { pid: process.pid, uptimeMs: Date.now() - startedAt, queued,
+      running: running?.job.id ?? null, runningSinceMs: running ? Date.now() - startedAt : null,
+      busy: passActive, started: counters.started, verdicts: { ...counters.verdicts },
+      scope: scopeFor(workspace), rpc: RPC_VERSION };
+  },
+  async drain({ wait } = {}) {
+    if (passActive || passPromise) return { started: false, busy: true, current: running?.job.id ?? null };
+    const pass = startPass();
+    if (!wait) return { started: true };
+    const ran = await pass;
+    return { started: true, ran };
+  },
+  async steer({ text } = {}) {
+    if (!running) throw new Error('not_running');
+    if (typeof text !== 'string' || !text.trim() || text.length > 16 * 1024) throw new Error('bad_text');
+    await running.session.sendUserMessage(text, { deliverAs: 'steer' });
+    return { ok: true, job: running.job.id };
+  },
+  async abort() {
+    if (!running) throw new Error('not_running');
+    const job = running.job;
+    const done = running.done;
+    await running.session.abort();
+    const verdict = await done;
+    return { aborted: true, job: { id: job.id, status: verdict.status, ...('reason' in verdict ? { reason: verdict.reason } : {}) } };
+  },
+  async shutdown() {
+    setImmediate(() => void shutdown('rpc'));
+    return { ok: true };
+  },
+};
+
+let stdinBuffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => {
+  stdinBuffer += chunk;
+  let newline;
+  while ((newline = stdinBuffer.indexOf('\n')) >= 0) {
+    const frame = stdinBuffer.slice(0, newline);
+    stdinBuffer = stdinBuffer.slice(newline + 1);
+    if (frame.length > MAX_FRAME) {
+      log(`frame of ${frame.length} bytes over ${MAX_FRAME} — exiting instead of desyncing`);
+      process.exit(3);
+    }
+    handleFrame(frame);
+  }
+  if (stdinBuffer.length > MAX_FRAME) {
+    log(`frame over ${MAX_FRAME} bytes (unterminated) — exiting instead of desyncing`);
+    process.exit(3);
+  }
+});
+process.stdin.on('end', () => void shutdown('stdin_closed'));
+process.stdin.resume();
+
+function handleFrame(frame) {
+  touchIdleTimer();
+  if (shuttingDown) { respond(null, false, 'shutting_down'); return; }
+  let request = null;
+  try { request = JSON.parse(frame); } catch { respond(null, false, 'bad_json'); return; }
+  const { id, op } = request ?? {};
+  const handler = ops[op];
+  if (!handler || typeof op !== 'string') { respond(id ?? null, false, `unknown_op:${String(op)}`); return; }
+  void handler(request).then(
+    result => respond(id ?? null, true, result),
+    error => respond(id ?? null, false, error?.message ?? String(error)));
+}
+
+// Queue growth starts a pass when idle; tests and owners can also call drain directly.
+watchFile(file, { interval: 400 }, () => { if (!passActive && !passPromise && !shuttingDown) startPass(); });
+touchIdleTimer();
+
+// Drain anything already queued (same startup behavior as one-shot mode).
+startPass();
+log(`rpc ready (pid ${process.pid}, Pi ${VERSION}, scope ${scopeFor(workspace)}${idleExitSeconds ? `, idle-exit ${idleExitSeconds}s` : ''})`);

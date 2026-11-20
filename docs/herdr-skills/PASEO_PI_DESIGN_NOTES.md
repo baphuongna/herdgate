@@ -43,8 +43,8 @@ Khảo sát thêm schedule, runtime lifecycle, RPC, session import và relay tro
 
 ### Ưu tiên áp dụng tiếp theo (theo giá trị/rủi ro)
 
-1. **realpath trước khi băm scope journal** — sửa rủi ro thật, nhỏ, có test được.
+1. **realpath trước khi băm scope journal** — sửa rủi ro thật, nhỏ, có test được. *(đã áp dụng: `scopeFor` realpath, commit `3a0c62e`)*
 2. **Scheduler: bỏ qua bucket lỡ + target-gone là vĩnh viễn** — trước khi dùng scheduler ngoài thử nghiệm.
-3. **Receipt kèm usage/cost metadata** — tăng giá trị báo cáo không mở lớp bí mật.
-4. Idle-cleanup + JSONL-RPC patterns — khi worker chuyển daemon/RPC.
+3. **Receipt kèm usage/cost metadata** — tăng giá trị báo cáo không mở lớp bí mật. *(đã áp dụng: validator-gated `usage {totalTokens, costUsd}`, commits `3a0c62e` + `6967a91`)*
+4. Idle-cleanup + JSONL-RPC patterns — khi worker chuyển daemon/RPC. *(đã áp dụng: worker `--mode rpc` — frame >64 KiB exit 3 thay vì bỏ frame, junk line trả lỗi không chết, EOF/SIGTERM/SIGINT graceful abort job đang chạy, `--idle-exit`; session mỗi-job nên không cần family-sweep)*
 5. Fixture replay thật cho observer test — tăng độ tin cậy nâng cấp Pi.
