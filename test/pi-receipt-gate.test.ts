@@ -11,6 +11,7 @@ import { promisify } from 'node:util';
 import { startCloud } from '../src/cloud/gateway.ts';
 import { State } from '../src/cloud/stores.ts';
 import { DeviceSock } from './util2.ts';
+import type { RawData } from 'ws';
 import { MIN_PI_VERSION, scheduledRunId, versionAtLeast } from '../plugin/server/pi-worker.mjs';
 
 const exec = promisify(execFile);
@@ -442,7 +443,7 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
       assert.equal(init.result!.protocolVersion, '2024-11-05');
       const list = await mcp.request('tools/list');
       assert.deepEqual(list.result!.tools!.map(tool => tool.name).sort(),
-        ['herdgate_receipt', 'herdgate_worker_health', 'herdgate_worker_status', 'herdgate_worker_submit']);
+        ['herdgate_receipt', 'herdgate_receipt_wait', 'herdgate_worker_health', 'herdgate_worker_status', 'herdgate_worker_submit']);
       const receiptReply = toolText(await mcp.request('tools/call', { name: 'herdgate_receipt', arguments: { id: first.id } }));
       assert.equal(receiptReply.op, 'receipt.result');
       assert.equal(receiptReply.status, 'replied');
@@ -468,6 +469,28 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
       assert.equal(alive.enabled, true);
     } finally { await readMcp.stop(); }
     t.diagnostic('MCP: act submit plus read-only tools over the same authenticated device channel');
+
+    stage = 'receipt push reaches a subscribed device when the worker settles';
+    const pushSock = new DeviceSock(`ws://127.0.0.1:${gatePort}/v1/device/ws`);
+    try {
+      await pushSock.hello({ device: probe.id, deviceSecret: probeSecret });
+      const pushes: Record<string, unknown>[] = [];
+      const onPush = (data: RawData): void => {
+        const m = JSON.parse(String(data)) as { t?: string; payload?: { op?: string; id?: string } };
+        if (m.t === 'frame' && m.payload?.op === 'receipt.push') pushes.push(m.payload as Record<string, unknown>);
+      };
+      pushSock.ws.on('message', onPush);
+      const pushId = randomUUID();
+      await act({ op: 'worker.submit', id: pushId, prompt: 'Push synthetic request' });
+      await runWorker();
+      const pushed = await waitFor('receipt.push for the submitted job',
+        () => pushes.find(p => p.id === pushId) ?? null);
+      assert.equal(pushed.status, 'replied');
+      assert.ok(pushed.requestEntryId && pushed.responseEntryId);
+      assert.equal((await ask(pushId)).status, 'replied', 'the pushed receipt is also queryable');
+      pushSock.ws.off('message', onPush);
+    } finally { pushSock.close(); }
+    t.diagnostic('receipt.push arrived without polling while no TUI client was attached');
   } catch (err) {
     t.diagnostic(`failed at ${stage}`);
     t.diagnostic(JSON.stringify({ events: events(), serverStatus }));

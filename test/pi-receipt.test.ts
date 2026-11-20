@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -282,6 +282,36 @@ test('the shared journal reader finds newest receipts by exact UUID without enum
   assert.equal(receipts.journalBase({ HERDGATE_PI_RECEIPT_DIR: '/x' }), '/x');
   assert.ok(receipts.journalBase({}).includes(join('herdgate', 'pi-receipts')));
   assert.equal(receipts.scopeFor('/a').length, 16);
+});
+
+test('the journal watcher reports only new settles and stops cleanly', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-watch-'));
+  const base = join(dir, 'base');
+  const scope = join(base, 'a'.repeat(16));
+  mkdirSync(scope, { recursive: true, mode: 0o700 });
+  const file = join(scope, 'receipts.jsonl');
+  const line = (entry: object) => `${JSON.stringify(entry)}\n`;
+  const entry = (id: string, status = 'replied', ts = Date.now()) =>
+    ({ v: 1, id, status, sessionId: 's', ts });
+  writeFileSync(file, line(entry('00000000-0000-4000-8000-000000000001')), { mode: 0o600 }); // baseline
+  const seen: { id: string; status: string }[] = [];
+  const delay = (ms: number) => new Promise(done => setTimeout(done, ms));
+  const stop = receipts.watchReceipts(base, (e: { id: string; status: string }) => seen.push({ id: e.id, status: e.status }), { intervalMs: 150 });
+  await delay(300);
+  assert.equal(seen.length, 0, 'the baseline must not replay');
+  appendFileSync(file, line(entry('00000000-0000-4000-8000-000000000002')));
+  const first = async () => { while (seen.length < 1) await delay(50); };
+  await Promise.race([first(), delay(5000).then(() => { throw new Error('watcher did not fire'); })]);
+  assert.equal(seen[0]?.id, '00000000-0000-4000-8000-000000000002');
+  appendFileSync(file, '{corrupt\n' + line(entry('00000000-0000-4000-8000-000000000003', 'failed')));
+  const second = async () => { while (seen.length < 2) await delay(50); };
+  await Promise.race([second(), delay(5000).then(() => { throw new Error('watcher missed the second settle'); })]);
+  assert.equal(seen[1]?.status, 'failed');
+  stop();
+  appendFileSync(file, line(entry('00000000-0000-4000-8000-000000000004')));
+  await delay(500);
+  assert.equal(seen.length, 2, 'a stopped watcher stays silent');
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test('walking the session suffix fails closed at its bound', async () => {

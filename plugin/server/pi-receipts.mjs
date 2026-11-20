@@ -4,7 +4,7 @@
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, watch } from 'node:fs';
 
 export const RECEIPT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RECEIPTS = 'receipts.jsonl';
@@ -74,4 +74,61 @@ export function publicReceipt(entry) {
   if (!entry) return { status: 'unknown', reason: 'not_retained_in_runtime' };
   const { v, ts, sessionId, paneId, ...rest } = entry;
   return rest;
+}
+
+/**
+ * Watch every workspace journal under base and hand each NEW settle to onEntry
+ * (unseen id, or a newer ts for a known id). The first scan is a baseline and
+ * emits nothing, so a restarting publisher does not replay old receipts.
+ * fs.watch (recursive where supported) gives low latency; a slow interval sweep
+ * covers missed events and platforms without recursive watch. A missing base
+ * directory just means the next sweep retries. Never throws to the caller.
+ */
+export function watchReceipts(base, onEntry, { intervalMs = 4000 } = {}) {
+  let stopped = false;
+  const seen = new Map(); // id -> ts
+  let watcher = null;
+  let timer = null;
+  let sweepScheduled = false;
+  const sweep = emit => {
+    if (stopped) return;
+    let scopes = [];
+    try { scopes = readdirSync(base).filter(name => /^[0-9a-f]{16}$/.test(name)); }
+    catch { /* base not created yet */ }
+    for (const name of scopes) {
+      let entries;
+      try { entries = readJournal(join(base, name, RECEIPTS)); } catch { continue; }
+      for (const entry of entries) {
+        const prior = seen.get(entry.id);
+        if (prior !== undefined && prior >= entry.ts) continue;
+        seen.set(entry.id, entry.ts);
+        if (emit) { try { onEntry(entry); } catch { /* listener errors must not kill the sweep */ } }
+      }
+    }
+  };
+  const ensureWatcher = () => {
+    if (watcher || stopped) return;
+    try {
+      watcher = watch(base, { recursive: true }, () => {
+        if (sweepScheduled || stopped) return;
+        sweepScheduled = true;
+        const late = setTimeout(() => { sweepScheduled = false; sweep(true); }, 250);
+        late.unref?.();
+      });
+      watcher.on('error', () => { try { watcher?.close(); } catch { /* already closed */ } watcher = null; });
+    } catch { /* base missing or unsupported here; the interval retries */ }
+  };
+  sweep(false); // baseline only
+  ensureWatcher();
+  timer = setInterval(() => {
+    if (stopped) return;
+    ensureWatcher();
+    sweep(true);
+  }, intervalMs);
+  timer.unref?.();
+  return () => {
+    stopped = true;
+    try { watcher?.close(); } catch { /* already closed */ }
+    if (timer) clearInterval(timer);
+  };
 }

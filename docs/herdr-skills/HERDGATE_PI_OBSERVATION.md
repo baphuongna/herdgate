@@ -87,8 +87,11 @@ Local, read-only checks on Pi 1.5.2, Herdr 0.9.5, Python 3.12 (no model calls, n
    fails closed to `unknown`.
 3. **Structured status channel (prototype, opt-in).** With `HERDGATE_PI_RECEIPTS=1`, the
    publisher answers `receipt.get` device frames from the local journal — no TUI, no SSH, exact
-   UUID lookup only, metadata only, read scope sufficient, disabled by default. The observer
-   itself still opens no socket. Verified over loopback; not yet in the PWA or the production
+   UUID lookup only, metadata only, read scope sufficient, disabled by default — and pushes
+   `receipt.push` to the room's devices the moment a receipt settles, so a controller learns
+   "agent finished" without polling (settles only; intermediate states stay in-memory; no
+   replay of the pre-start baseline). The observer itself still opens no socket. Verified over
+   loopback; not yet in the PWA or the production
    publisher config. A two-host trial still needs a separate test window. Do not implement a
    remote file read or repurpose the Mobile Core adapter. Read-only scope gains only this
    deliberately published metadata, nothing else.

@@ -48,6 +48,28 @@ function call(payload, op) {
   });
 }
 
+/** Ask once, then hold the socket open for the settle push (receipt.push). */
+function waitReceipt(id, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`${gate}/v1/device/ws`, { handshakeTimeout: 8_000 });
+    const timer = setTimeout(() => { ws.terminate(); reject(new Error('wait timed out')); }, timeoutMs);
+    const settled = p => p.status !== 'unknown' || p.reason !== 'not_retained_in_runtime';
+    ws.on('error', error => { clearTimeout(timer); reject(error); });
+    ws.on('open', () => ws.send(JSON.stringify({ v: 1, t: 'hello', device, deviceSecret: secret })));
+    ws.on('message', (data, isBinary) => {
+      if (isBinary) return;
+      let message;
+      try { message = JSON.parse(String(data)); } catch { return; }
+      if (message.t === 'hello') { ws.send(JSON.stringify({ v: 1, t: 'frame', payload: { op: 'receipt.get', id } })); return; }
+      if (message.t === 'error') { clearTimeout(timer); ws.close(); return resolve({ op: 'error', code: message.code ?? 'gate', message: message.message ?? '' }); }
+      if (message.t !== 'frame') return;
+      const payload = message.payload ?? {};
+      if (payload.op === 'receipt.result' && settled(payload)) { clearTimeout(timer); ws.close(); return resolve(payload); }
+      if (payload.op === 'receipt.push' && payload.id === id) { clearTimeout(timer); ws.close(); resolve(payload); }
+    });
+  });
+}
+
 const TOOLS = [
   { name: 'herdgate_worker_submit',
     description: 'Submit a prompt to the Herdgate host Pi worker queue. Admission is idempotent by request id; the run settles asynchronously — poll herdgate_worker_status or herdgate_receipt. Needs an act device.',
@@ -61,6 +83,11 @@ const TOOLS = [
     description: 'Pi receipt metadata for one request UUID: status replied/failed/canceled/unknown plus reason and entry ids.',
     inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
     invoke: args => call({ op: 'receipt.get', id: args.id }, 'receipt.result') },
+  { name: 'herdgate_receipt_wait',
+    description: 'Wait for one request to settle: returns the current receipt if already settled, otherwise holds the connection until the host pushes the settle (receipt.push). Timeout returns the last known state.',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' }, timeoutSeconds: { type: 'number', default: 60, maximum: 300 } }, required: ['id'] },
+    invoke: args => waitReceipt(args.id, Math.min(300, Math.max(5, Number(args.timeoutSeconds) || 60)) * 1000)
+      .catch(() => call({ op: 'receipt.get', id: args.id }, 'receipt.result')) },
   { name: 'herdgate_worker_health',
     description: 'Host worker liveness: queue depth and the last heartbeat written by the scheduler/worker experiment.',
     inputSchema: { type: 'object', properties: {} },

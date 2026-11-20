@@ -14,7 +14,7 @@ import { hostname, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead } from "./common.mjs";
 import { createSshBridge } from "./ssh.mjs";
-import { findReceipt, journalBase as receiptJournalBase, publicReceipt } from "./pi-receipts.mjs";
+import { findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
 import { JOB_ID, MAX_PENDING, MAX_PROMPT, appendJob, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, workerBase } from "./pi-worker.mjs";
 import { registerPublisher } from "./publisher-tui-lifecycle.mjs";
 import { HostChannel, b64d, b64e, fingerprint, generateKeyPair } from "./e2e.mjs";
@@ -294,6 +294,15 @@ async function publisherLoop() {
     }
   };
 
+  /** Push each new settle to every device in the room (experimental, same opt-in
+   *  flag as receipt.get): the controller learns "agent finished" without polling. */
+  let receiptWatch = null;
+  const pushReceipt = (entry) => {
+    const payload = { op: "receipt.push", ...publicReceipt(entry) };
+    log(`receipts: settled ${entry.status} ${entry.id} — pushing to ${devices.length} device(s)`);
+    for (const d of devices) void sendPayload(wsRef, d.id, payload);
+  };
+
   /** Wake phones that are away when something actually changed (throttled per device). */
   const lastWake = new Map(); // deviceId → epoch ms
   const wakeAway = (changed) => {
@@ -343,6 +352,10 @@ async function publisherLoop() {
         devices = m.devices ?? [];
         lifecycle?.setConnected(true);
         log(`connected to ${url}${loopbackPort ? ` via loopback 127.0.0.1:${loopbackPort}` : ""} (room ${m.roomId}, ${devices.length} device(s))`);
+        if (process.env.HERDGATE_PI_RECEIPTS === "1" && !receiptWatch) {
+          receiptWatch = watchReceipts(receiptJournalBase(), pushReceipt);
+          log(`receipts: journal push enabled (${receiptJournalBase()})`);
+        }
         void publish(ws);
         if (timer) clearInterval(timer);
         timer = setInterval(() => void publish(ws), 30_000);

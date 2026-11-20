@@ -58,6 +58,21 @@ node docs/herdr-skills/probes/pi-settlement.mjs /path/to/node_modules/@earendil-
 
 Probe SDK dùng provider giả và Pi 1.5.2, không dùng profile người dùng.
 
+### Push khi agent chạy xong (`receipt.push`)
+
+Khi `HERDGATE_PI_RECEIPTS=1`, publisher theo dõi journal (fs.watch + sweep định kỳ) và
+**tự đẩy** `{op:"receipt.push", ...publicReceipt}` tới mọi thiết bị đang trong room ngay
+khi receipt chốt (replied/failed/canceled/unknown) — controller không cần poll. Bản
+baseline khi publisher khởi động không phát lại receipt cũ. Muốn chờ settle từ CLI:
+
+```sh
+node experiments/pi-receipt/query.mjs --gate ... --device d --secret s --id <uuid> --wait
+```
+
+MCP có tool `herdgate_receipt_wait {id, timeoutSeconds}` với ý nghĩa tương tự. Lưu ý:
+chỉ **settle** được đẩy — trạng thái trung gian (`armed`/`received`) vẫn in-memory,
+không push; push là metadata tới mọi device trong room (cùng herd của bạn).
+
 ### Truy vấn qua Gate (thử nghiệm)
 
 Publisher trả lời frame JSON `receipt.get` từ **thiết bị đã pair** — không cần mở TUI,

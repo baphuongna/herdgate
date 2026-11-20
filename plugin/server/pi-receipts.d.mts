@@ -26,3 +26,8 @@ export function validEntry(entry: unknown): JournalEntry | null;
 export function readJournal(dir: string): JournalEntry[];
 export function findReceipt(base: string, id: string): JournalEntry | null;
 export function publicReceipt(entry: JournalEntry | null): PublicReceipt;
+export function watchReceipts(
+  base: string,
+  onEntry: (entry: JournalEntry) => void,
+  options?: { intervalMs?: number },
+): () => void;
