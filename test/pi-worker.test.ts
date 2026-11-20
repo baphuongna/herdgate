@@ -1,0 +1,273 @@
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import test from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
+import { appendJob, heartbeatPath, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, scheduledRunId, validJob, versionAtLeast, writeHeartbeat, workerBase, JOB_ID, MIN_PI_VERSION } from '../plugin/server/pi-worker.mjs';
+import { findReceipt, journalBase, scopeFor } from '../plugin/server/pi-receipts.mjs';
+
+const root = join(import.meta.dirname, '..');
+const piBin = process.env.TEST_PI_BIN;
+
+/** Resolve the installed Pi coding-agent package from the pi binary path. */
+function piPackage(): string | undefined {
+  if (!piBin) return undefined;
+  let dir = dirname(realpathSync(piBin));
+  for (let up = 0; up < 6; up++) {
+    const releases = join(dir, 'install', 'releases');
+    if (existsSync(releases)) {
+      const versions = readdirSync(releases).filter(v => /^\d+\.\d+\.\d+$/.test(v))
+        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+      const pkg = versions.length ? join(releases, versions[versions.length - 1], 'node_modules', '@earendil-works', 'pi-coding-agent') : '';
+      return pkg && existsSync(pkg) ? pkg : undefined;
+    }
+    dir = dirname(dir);
+  }
+  return undefined;
+}
+
+async function waitFor<T>(label: string, check: () => T | Promise<T>): Promise<NonNullable<T>> {
+  const deadline = performance.now() + 20_000;
+  while (performance.now() < deadline) {
+    const result = await check();
+    if (result) return result;
+    await delay(50);
+  }
+  throw new Error(`timed out: ${label}`);
+}
+
+type FixtureEvent = { event: string; call?: number; inputHash?: string };
+const events = (dir: string): FixtureEvent[] => {
+  const path = join(dir, 'events.jsonl');
+  if (!existsSync(path)) return [];
+  const lines = readFileSync(path, 'utf8').split('\n');
+  lines.pop();
+  return lines.map(line => JSON.parse(line) as FixtureEvent);
+};
+
+test('the worker queue format is bounded, newest-wins and never leaks prompts', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-jobs-'));
+  const file = jobsFile(dir);
+  const id = '00000000-0000-4000-8000-00000000000a';
+  assert.equal(workerBase({ HERDGATE_PI_WORKER_DIR: '/x' }), '/x');
+  assert.match(workerBase({}), /herdgate.*pi-worker$/);
+  assert.equal(validJob({ v: 1, id: 'nope', prompt: 'x', ts: 1, state: 'queued' }), null);
+  assert.equal(validJob({ v: 1, id, prompt: 'x', ts: 1, state: 'sideways' }), null);
+  appendJob(file, { v: 1, id, prompt: 'first', ts: 1, state: 'queued' });
+  appendJob(file, { v: 1, id, prompt: 'first', ts: 1, state: 'running', sessionId: 's1' });
+  writeFileSync(file, '{corrupt\n' + readFileSync(file, 'utf8'), { mode: 0o600 });
+  const jobs = readJobs(file);
+  assert.equal(jobs.size, 1);
+  assert.equal(jobs.get(id)?.state, 'running');
+  assert.deepEqual(publicJob(jobs.get(id) ?? null), { id, ts: 1, state: 'running', sessionId: 's1' });
+  assert.deepEqual(publicJob(null), { state: 'unknown', reason: 'not_admitted' });
+  assert.throws(() => appendJob(file, { v: 1, id: '00000000-0000-4000-8000-00000000000b', prompt: 'x'.repeat(16 * 1024 + 1), ts: 1, state: 'queued' }));
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('the Pi version gate is a floor, not a pin', () => {
+  assert.equal(MIN_PI_VERSION, '1.5.2');
+  assert.ok(versionAtLeast('1.5.2'));
+  assert.ok(versionAtLeast('1.5.3'));
+  assert.ok(versionAtLeast('1.6.0'));
+  assert.ok(versionAtLeast('2.0.0'));
+  assert.ok(versionAtLeast('v1.5.2'));
+  assert.ok(versionAtLeast('1.5.3-beta.1'));
+  assert.ok(versionAtLeast('1.5.2', '1.5.2'));
+  assert.equal(versionAtLeast('1.5.1'), false);
+  assert.equal(versionAtLeast('1.4.9'), false);
+  assert.equal(versionAtLeast('1.5.2-rc1'), false, 'a pre-release of the floor does not pass');
+  assert.equal(versionAtLeast('garbage'), false);
+  assert.equal(versionAtLeast('1.x.0'), false);
+});
+
+test('heartbeat, queue depth and deterministic run ids round-trip', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-beat-'));
+  assert.equal(readHeartbeat(dir), null, 'no heartbeat yet');
+  writeHeartbeat(dir, { v: 1, ts: 123, source: 'test', note: 'x' });
+  assert.deepEqual(readHeartbeat(dir), { v: 1, ts: 123, source: 'test', note: 'x' });
+  writeFileSync(heartbeatPath(dir), '{corrupt', { mode: 0o600 });
+  assert.equal(readHeartbeat(dir), null, 'corrupt heartbeat fails closed');
+  assert.throws(() => writeHeartbeat(dir, JSON.parse('{\"v\":1,\"ts\":\"x\",\"source\":\"test\"}')));
+  const jobs = new Map();
+  jobs.set('a', { v: 1, id: 'a', prompt: 'p', ts: 1, state: 'queued' });
+  jobs.set('b', { v: 1, id: 'b', prompt: 'p', ts: 2, state: 'running' });
+  jobs.set('c', { v: 1, id: 'c', prompt: 'p', ts: 3, state: 'replied' });
+  assert.deepEqual(queueDepth(jobs), { queued: 1, running: 1 });
+  const run = scheduledRunId('morning-summary', 42);
+  assert.match(run, JOB_ID);
+  assert.equal(run, scheduledRunId('morning-summary', 42));
+  assert.notEqual(run, scheduledRunId('morning-summary', 43));
+  assert.notEqual(run, scheduledRunId('evening-summary', 42));
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('the scheduler admits one deterministic run per bucket and heartbeats', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-sched-'));
+  const workerDir = join(dir, 'worker');
+  const receiptsDir = join(dir, 'receipts');
+  const config = join(dir, 'schedule.json');
+  writeFileSync(config, JSON.stringify({ schedules: [
+    { id: 'synthetic-hourly', everySeconds: 3600, prompt: 'Scheduled synthetic request' },
+    { id: 'broken', everySeconds: 0, prompt: 'never admitted' },
+    { id: 'too-long', everySeconds: 60, prompt: 'x'.repeat(16 * 1024 + 1) },
+  ] }), { mode: 0o600 });
+  const file = jobsFile(workerDir);
+  const runScheduler = async (now: number) => {
+    const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/scheduler.mjs'),
+      '--config', config, '--once', '--now', String(now)],
+      { env: { PATH: process.env.PATH, HOME: dir, HERDGATE_PI_WORKER_DIR: workerDir, HERDGATE_PI_RECEIPT_DIR: receiptsDir }, stdio: ['ignore', 'ignore', 'pipe'] });
+    const err: string[] = [];
+    child.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
+    const code = await new Promise<number | null>(resolve => child.once('exit', resolve));
+    assert.equal(code, 0, err.join(''));
+    return err.join('');
+  };
+  const t0 = 1_700_000_000_000;
+  const bucket0 = Math.floor(t0 / 3_600_000);
+  const expected = scheduledRunId('synthetic-hourly', bucket0);
+  await runScheduler(t0);
+  let jobs = readJobs(file);
+  assert.deepEqual([...jobs.keys()], [expected], 'only the valid schedule is admitted');
+  assert.equal(jobs.get(expected)?.prompt, 'Scheduled synthetic request');
+  await runScheduler(t0 + 60_000); // same bucket -> idempotent
+  assert.equal(readJobs(file).size, 1, 'a restarted tick in the same bucket must not duplicate');
+  await runScheduler(t0 + 3_600_000); // next bucket -> new deterministic id
+  jobs = readJobs(file);
+  assert.deepEqual([...jobs.keys()], [expected, scheduledRunId('synthetic-hourly', bucket0 + 1)]);
+  const beat = readHeartbeat(workerDir);
+  assert.ok(beat && beat.source === 'herdgate-scheduler' && typeof beat.ts === 'number');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('a second worker refuses to start while a live pid owns the queue', { skip: !piBin && 'requires TEST_PI_BIN' }, async () => {
+  const pkg = piPackage();
+  assert.ok(pkg, 'resolvable Pi package');
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-worker-'));
+  const workerDir = join(dir, 'worker');
+  const fixtureDir = join(dir, 'fixture');
+  mkdirSync(join(workerDir), { recursive: true });
+  writeFileSync(join(workerDir, 'worker.pid'), `${process.pid}\n`, { mode: 0o600 }); // this test process is alive
+  const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/worker.mjs'),
+    '--workspace', dir, '--pi', pkg, '--fixture-dir', fixtureDir],
+    { env: { PATH: process.env.PATH, HOME: dir, HERDGATE_PI_WORKER_DIR: workerDir, HERDGATE_PI_RECEIPT_DIR: join(dir, 'receipts') }, stdio: ['ignore', 'ignore', 'pipe'] });
+  const err: string[] = [];
+  child.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
+  const [code] = await Promise.all([new Promise<number | null>(resolve => child.once('exit', resolve)), new Promise(r => child.stderr!.once('end', r))]);
+  assert.equal(code, 1);
+  assert.match(err.join(''), /another worker is running/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('the worker drains a seeded queue once and journals metadata-only receipts', {
+  skip: (!piBin || process.platform !== 'linux') && 'requires TEST_PI_BIN on Linux',
+  timeout: 60_000,
+}, async () => {
+  const pkg = piPackage();
+  assert.ok(pkg, 'resolvable Pi package');
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-worker-'));
+  const workspace = join(dir, 'ws');
+  const workerDir = join(dir, 'worker');
+  const receiptsDir = join(dir, 'receipts');
+  const fixtureDir = join(dir, 'fixture');
+  mkdirSync(workspace, { recursive: true });
+  const file = jobsFile(workerDir);
+  const one = '00000000-0000-4000-8000-000000000011';
+  const two = '00000000-0000-4000-8000-000000000012';
+  appendJob(file, { v: 1, id: one, prompt: 'Synthetic worker request: tiếng Việt', ts: 1, state: 'queued' });
+  appendJob(file, { v: 1, id: two, prompt: 'Second synthetic request', ts: 2, state: 'queued' });
+
+  const run = () => {
+    const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/worker.mjs'),
+      '--workspace', workspace, '--pi', pkg, '--fixture-dir', fixtureDir],
+      { env: { PATH: process.env.PATH, HOME: dir, HERDGATE_PI_WORKER_DIR: workerDir, HERDGATE_PI_RECEIPT_DIR: receiptsDir, PI_TELEMETRY: '0' }, stdio: ['ignore', 'ignore', 'pipe'] });
+    const err: string[] = [];
+    child.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
+    const done = new Promise<{ code: number | null; err: string }>(resolve =>
+      child.once('exit', code => resolve({ code, err: err.join('') })));
+    return { child, done };
+  };
+
+  const first = await run().done;
+  assert.equal(first.code, 0, first.err);
+  assert.equal((first.err.match(/job [0-9a-f-]+ -> replied/g) ?? []).length, 2);
+  const jobs = readJobs(file);
+  assert.deepEqual([...jobs.values()].map(j => j.state), ['replied', 'replied']);
+  const oneHash = jobs.get(one)!;
+  const twoHash = jobs.get(two)!;
+  assert.ok(oneHash.requestEntryId && oneHash.responseEntryId);
+  assert.ok(twoHash.requestEntryId && twoHash.responseEntryId);
+  assert.ok(oneHash.sessionId && twoHash.sessionId && oneHash.sessionId !== twoHash.sessionId);
+  const journal = join(receiptsDir, scopeFor(workspace), 'receipts.jsonl');
+  const raw = readFileSync(journal, 'utf8');
+  assert.ok(!raw.includes('tiếng Việt') && !raw.includes('synthetic'), 'receipts must not contain prompt text');
+  assert.equal(findReceipt(receiptsDir, one)?.status, 'replied');
+  assert.equal(findReceipt(receiptsDir, one)?.responseEntryId, oneHash.responseEntryId);
+  const calls = () => events(fixtureDir).filter(e => e.event === 'call').length;
+  assert.equal(calls(), 2);
+  assert.equal(events(fixtureDir).find(e => e.event === 'call')?.inputHash,
+    createHash('sha256').update('Synthetic worker request: tiếng Việt').digest('hex'));
+
+  const second = await run().done; // nothing queued: idempotent no-op
+  assert.equal(second.code, 0, second.err);
+  assert.equal(calls(), 2, 'a drained queue must not resend');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('a worker killed mid-run fails closed on restart and resumes the next job', {
+  skip: (!piBin || process.platform !== 'linux') && 'requires TEST_PI_BIN on Linux',
+  timeout: 90_000,
+}, async () => {
+  const pkg = piPackage();
+  assert.ok(pkg, 'resolvable Pi package');
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-worker-'));
+  const workspace = join(dir, 'ws');
+  const workerDir = join(dir, 'worker');
+  const receiptsDir = join(dir, 'receipts');
+  const fixtureDir = join(dir, 'fixture');
+  mkdirSync(workspace, { recursive: true });
+  const file = jobsFile(workerDir);
+  const held = '00000000-0000-4000-8000-000000000021';
+  const next = '00000000-0000-4000-8000-000000000022';
+  appendJob(file, { v: 1, id: held, prompt: 'Synthetic held request', ts: 1, state: 'queued' });
+  appendJob(file, { v: 1, id: next, prompt: 'Synthetic next request', ts: 2, state: 'queued' });
+  mkdirSync(fixtureDir, { recursive: true });
+  writeFileSync(join(fixtureDir, 'hold'), '', { mode: 0o600 });
+
+  const spawnWorker = () => spawn(process.execPath, [join(root, 'experiments/pi-worker/worker.mjs'),
+    '--workspace', workspace, '--pi', pkg, '--fixture-dir', fixtureDir],
+    { env: { PATH: process.env.PATH, HOME: dir, HERDGATE_PI_WORKER_DIR: workerDir, HERDGATE_PI_RECEIPT_DIR: receiptsDir, PI_TELEMETRY: '0' }, stdio: ['ignore', 'ignore', 'pipe'] });
+
+  const stuck = spawnWorker();
+  await waitFor('fixture holds the first call', () => events(fixtureDir).some(e => e.event === 'holding' && e.call === 1));
+  stuck.kill('SIGKILL');
+  await new Promise(resolve => stuck.once('exit', resolve));
+  assert.equal(readJobs(file).get(held)?.state, 'running');
+
+  rmSync(join(fixtureDir, 'hold')); // the restart must not resend the held request anyway
+  const rerun = spawnWorker();
+  const err: string[] = [];
+  rerun.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
+  const code = await new Promise<number | null>(resolve => rerun.once('exit', resolve));
+  assert.equal(code, 0, err.join(''));
+
+  const jobs = readJobs(file);
+  assert.equal(jobs.get(held)?.state, 'unknown');
+  assert.equal(jobs.get(held)?.reason, 'worker_restarted');
+  assert.equal(jobs.get(next)?.state, 'replied');
+  const receipt = findReceipt(receiptsDir, held);
+  assert.equal(receipt?.status, 'unknown');
+  assert.equal(receipt?.reason, 'worker_restarted');
+  assert.equal(findReceipt(receiptsDir, next)?.status, 'replied');
+  const hashOf = (prompt: string) => createHash('sha256').update(prompt).digest('hex');
+  const callCount = (prompt: string) => events(fixtureDir).filter(e => e.event === 'call' && e.inputHash === hashOf(prompt)).length;
+  assert.equal(callCount('Synthetic held request'), 1, 'the held request ran exactly once');
+  assert.equal(callCount('Synthetic next request'), 1, 'only the next job ran after the restart');
+  assert.ok(!readFileSync(join(receiptsDir, scopeFor(workspace), 'receipts.jsonl'), 'utf8').includes('Synthetic'));
+  rmSync(dir, { recursive: true, force: true });
+});
+
+assert.ok(journalBase({}) || homedir()); // keep the receipts import honest
