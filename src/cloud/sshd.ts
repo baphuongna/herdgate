@@ -206,7 +206,7 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
   /** To the HOST, addressed as the device (the bridge on the host consumes these). */
   const toHost = (deviceId: string, payload: Record<string, unknown>): boolean => deps.sendAsDevice(deviceId, payload);
 
-  const server = new Server({ hostKeys: [hostKey.private] }, (client, info) => {
+  const server = new Server({ hostKeys: [hostKey.private], ...(process.env.HERDGATE_SSH_AUTH_DEBUG === "1" ? { debug: (msg: string) => console.error(`ssh2: ${msg}`) } : {}) }, (client, info) => {
     // ssh2's server-side Client stores the socket supplied to injectSocket as
     // _sock (1.17). Do not authorize a connection if that transport is unknown.
     const socket = (client as unknown as { _sock?: Transport })._sock;
@@ -223,19 +223,16 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
       const id = ctx.username.trim();
       const rec = /^d_[A-Za-z0-9]+$/.test(id) ? deps.state.deviceById(id) : null;
       if (ctx.method === "publickey") {
-        // Non-interactive clients (herdr-core's `machine add` shells out to system ssh,
-        // which prefers keys and the agent) log in with a registered public key. ssh2
-        // parses the request; verifying the signature (RFC 4252 §7, `ctx.blob` is the
-        // exact signed bytes) is ours. A request WITHOUT a signature is the client
-        // asking "would you take this key?" — accepting answers PK_OK (ssh2 does that).
         const pk = ctx as unknown as { key?: { algo: string; data: Buffer }; signature?: Buffer; blob?: Buffer; hashAlgo?: string };
         const key = pk.key;
-        if (!rec || !key?.data) return reject();
+        if (process.env.HERDGATE_SSH_AUTH_DEBUG === "1") deps.log(`ssh-auth-debug: user=${ctx.username} sig=${Boolean(pk.signature)} algo=${key?.algo} blocked=${blocked(ip)}`);
+        if (!rec || !key?.data) { if (process.env.HERDGATE_SSH_AUTH_DEBUG === "1") deps.log(`ssh-auth-debug: reject rec=${Boolean(rec)} key=${Boolean(key?.data)}`); return reject(); }
         const entry = rec.sshKeys?.find((k) => k.algo === key.algo && Buffer.from(k.b64, "base64").equals(key.data));
-        if (!entry) return reject(); // agent key not for us: no strike, just no
+        if (!entry) { if (process.env.HERDGATE_SSH_AUTH_DEBUG === "1") deps.log(`ssh-auth-debug: reject entry (algos=${rec.sshKeys?.map((k) => k.algo).join(",")})`); return reject(); } // agent key not for us: no strike, just no
         if (!pk.signature) return ctx.accept();
         const keyObj = sshPubKeyToKeyObject(key.algo, key.data);
         if (!keyObj || !cryptoVerify(pk.hashAlgo ?? undefined, pk.blob ?? Buffer.alloc(0), keyObj, pk.signature)) {
+          if (process.env.HERDGATE_SSH_AUTH_DEBUG === "1") deps.log(`ssh-auth-debug: reject verify keyObj=${Boolean(keyObj)} hashAlgo=${pk.hashAlgo} sigLen=${pk.signature?.length} blobLen=${pk.blob?.length}`);
           strike(ip);
           deps.log(`ssh: bad key signature for ${rec.id} from ${ip}`);
           return reject();

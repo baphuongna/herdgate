@@ -5,15 +5,18 @@
 // --session-id), the parent↔child link is journaled beside the receipts, and a
 // closed pane reopens with one command using the same --session-id flag.
 //
-//   node experiments/pi-spawn/spawn.mjs spawn <name> [--cwd DIR] [--parent-session ID] [-- extra pi args]
+//   node experiments/pi-spawn/spawn.mjs spawn <name> [--cwd DIR] [--tab] [--parent-session ID] [-- extra pi args]
 //   node experiments/pi-spawn/spawn.mjs arm <name-or-id> [--body]   # /herdgate-arm with THE spawn id
 //   node experiments/pi-spawn/spawn.mjs list                        # + receipt status per child
 //   node experiments/pi-spawn/spawn.mjs restore <name-or-id>
 //
-// spawn: splits a sibling pane (from HERDR_PANE_ID when inside Herdr), starts a
-// fresh Pi agent with the pre-assigned session id, verifies the pane binding,
-// records { id, sessionId, paneId, parentSessionId, cwd } in spawns.jsonl.
-// restore: opens the SAME session in a new pane via -- --session-id (idempotent).
+// spawn: splits a sibling pane stacked below (full width; side-by-side splits
+// wrap JSON notifications mid-token), or --tab gives the child its own tab;
+// starts a fresh Pi agent with the pre-assigned session id, verifies the pane
+// binding, records { id, sessionId, paneId, parentSessionId, cwd } in spawns.jsonl.
+// restore: opens the SAME session (own tab again for --tab children) via
+// -- --session-id (idempotent). Tests default to the machine model; pass e.g.
+// -- --thinking low for fast turns.
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { findSpawn, recordSpawn, readSpawns, spawnBase, spawnsFile, updateSpawn } from './registry.mjs';
@@ -46,17 +49,20 @@ const fail = (message) => { console.error(message); process.exit(1); };
 
 if (command === 'spawn') {
   const name = arg;
-  if (!name) fail('usage: spawn <name> [--cwd DIR] [--parent-session ID] [-- extra pi args]');
+  if (!name) fail('usage: spawn <name> [--cwd DIR] [--tab] [--parent-session ID] [-- extra pi args]');
   const cwd = flag('cwd', process.cwd());
+  const wantTab = process.argv.includes('--tab');
   const extras = (() => { const i = process.argv.indexOf('--'); return i > 0 ? process.argv.slice(i + 1) : []; })();
   const { myPane, parentSessionId } = myBinding();
   const parent = flag('parent-session', parentSessionId);
   const id = randomUUID(); // one id: receipt request == Pi session
   // Stacked split keeps full terminal width (side-by-side wraps notifications mid-JSON).
-  const splitArgs = myPane
-    ? ['pane', 'split', '--pane', myPane, '--direction', 'down', '--no-focus', '--cwd', cwd]
-    : ['pane', 'split', '--current', '--direction', 'down', '--no-focus', '--cwd', cwd];
-  const pane = run(...splitArgs).result.pane.pane_id;
+  // --tab gives the child its own tab instead — zero impact on the caller's layout.
+  const pane = wantTab
+    ? run('tab', 'create', '--label', `hg-${name}`, '--no-focus', '--cwd', cwd).result.root_pane.pane_id
+    : run(...(myPane
+      ? ['pane', 'split', '--pane', myPane, '--direction', 'down', '--no-focus', '--cwd', cwd]
+      : ['pane', 'split', '--current', '--direction', 'down', '--no-focus', '--cwd', cwd])).result.pane.pane_id;
   try {
     run('agent', 'start', name, '--kind', 'pi', '--pane', pane, '--timeout', '45000',
       '--', '--session-id', id, ...extras);
@@ -64,6 +70,7 @@ if (command === 'spawn') {
     fail(`agent start failed: ${String(error.message).slice(0, 300)}`);
   }
   const entry = recordSpawn(spawnBase(), { id, sessionId: id, paneId: pane, name,
+    ...(wantTab ? { tab: true } : {}),
     ...(parent ? { parentSessionId: parent } : {}), cwd, ts: Date.now() });
   console.log(JSON.stringify({ ...entry, parent: parent ?? null,
     bound: bindingOf(run('pane', 'list').result.panes ?? [], pane) === id }));
@@ -114,10 +121,13 @@ if (command === 'spawn') {
   const entry = findSpawn(spawnBase(), arg);
   if (!entry) fail(`no spawn record for ${arg}`);
   const { myPane } = myBinding();
-  const splitArgs = myPane
-    ? ['pane', 'split', '--pane', myPane, '--direction', 'down', '--no-focus', '--cwd', entry.cwd ?? process.cwd()]
-    : ['pane', 'split', '--current', '--direction', 'down', '--no-focus', '--cwd', entry.cwd ?? process.cwd()];
-  const pane = run(...splitArgs).result.pane.pane_id;
+  const dir = entry.cwd ?? process.cwd();
+  // A tab-spawned child restores into its own tab again; a split child stacks below.
+  const pane = entry.tab
+    ? run('tab', 'create', '--label', `hg-${entry.name}`, '--no-focus', '--cwd', dir).result.root_pane.pane_id
+    : run(...(myPane
+      ? ['pane', 'split', '--pane', myPane, '--direction', 'down', '--no-focus', '--cwd', dir]
+      : ['pane', 'split', '--current', '--direction', 'down', '--no-focus', '--cwd', dir])).result.pane.pane_id;
   try {
     run('agent', 'start', entry.name, '--kind', 'pi', '--pane', pane, '--timeout', '45000',
       '--', '--session-id', entry.sessionId);
