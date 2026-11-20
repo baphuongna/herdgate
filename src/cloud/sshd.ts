@@ -17,10 +17,12 @@
  */
 
 import { createHash, createPublicKey, generateKeyPairSync as nodeKeyPair, verify as cryptoVerify, type KeyObject } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, chmodSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer as tcpServer, type Socket } from "node:net";
 import { dirname } from "node:path";
+import type { Duplex } from "node:stream";
 import ssh2Pkg from "ssh2";
-import { type DeviceRecord, type State } from "./stores.ts";
+import { type State } from "./stores.ts";
 import { randomToken } from "./util.ts";
 
 const { Server } = ssh2Pkg;
@@ -106,6 +108,8 @@ export interface SshConfig {
   bind?: string;
   /** Where the host key lives; `dirname(statePath)` by default. Ephemeral if absent. */
   keyPath?: string;
+  /** Deadline from transport accept through successful SSH user authentication. */
+  authTimeoutMs?: number;
 }
 
 export interface SshDeps {
@@ -130,16 +134,19 @@ export interface SshHandle {
    * (`/v1/bridge/ws`) delivers a phone's raw SSH bytes. Auth, strikes and the
    * read-only allowlist apply unchanged; `socket.remoteAddress` is the strike key.
    */
-  inject(socket: import("node:stream").Duplex & { remoteAddress?: string }): void;
+  inject(socket: Duplex & { remoteAddress?: string }): void;
+  /** Disconnect a revoked device, or just sessions authenticated with a removed key. */
+  revoke(deviceId: string, fingerprint?: string): void;
   close(): Promise<void>;
   /** Gateway calls this when a HOST sends an `ssh.*` frame to a device. */
-  onHostFrame(deviceId: string, payload: Record<string, unknown>): void;
+  onHostFrame(deviceId: string, payload: Record<string, unknown>): boolean;
 }
 
 interface ChannelStream {
   write(chunk: Buffer): boolean;
   end(chunk?: Buffer): void;
   exit(code: number): void;
+  stderr: { write(chunk: Buffer): boolean };
 }
 
 interface Channel {
@@ -176,6 +183,17 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
     strikes.set(ip, f);
   };
 
+  type Transport = Duplex & { remoteAddress?: string };
+  interface Peer {
+    socket: Transport;
+    ip: string;
+    deadline: NodeJS.Timeout | null;
+    deviceId?: string;
+    fingerprint?: string;
+  }
+  const peers = new Map<Transport, Peer>();
+  const authTimeoutMs = deps.config.authTimeoutMs ?? 12_000;
+
   const channelKey = (deviceId: string, ch: string): string => `${deviceId}:${ch}`;
   const deviceChannels = (deviceId: string): Channel[] => [...channels.values()].filter((c) => c.deviceId === deviceId);
 
@@ -183,16 +201,19 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
   const toHost = (deviceId: string, payload: Record<string, unknown>): boolean => deps.sendAsDevice(deviceId, payload);
 
   const server = new Server({ hostKeys: [hostKey.private] }, (client, info) => {
+    // ssh2's server-side Client stores the socket supplied to injectSocket as
+    // _sock (1.17). Do not authorize a connection if that transport is unknown.
+    const socket = (client as unknown as { _sock?: Transport })._sock;
+    const peer = socket && peers.get(socket);
+    client.on("error", () => socket?.destroy());
+    if (!peer) { client.end(); return; }
     const ip = info?.ip ?? "?";
-    let device: DeviceRecord | null = null;
-
-    client.on("error", () => {
-      /* the socket layer reports the close itself */
-    });
-
-    let dev: DeviceRecord | null = null; // narrowed alias for the closures below
     client.on("authentication", (ctx) => {
       if (blocked(ip)) return ctx.reject();
+      // The initial `none` request discovers supported methods. An empty list
+      // can make clients stop before offering a key. Keep the list independent
+      // of whether this username is registered.
+      const reject = () => ctx.reject(["publickey", "password"]);
       const id = ctx.username.trim();
       const rec = /^d_[A-Za-z0-9]+$/.test(id) ? deps.state.deviceById(id) : null;
       if (ctx.method === "publickey") {
@@ -203,39 +224,50 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
         // asking "would you take this key?" — accepting answers PK_OK (ssh2 does that).
         const pk = ctx as unknown as { key?: { algo: string; data: Buffer }; signature?: Buffer; blob?: Buffer; hashAlgo?: string };
         const key = pk.key;
-        if (!rec || !key?.data) return ctx.reject();
+        if (!rec || !key?.data) return reject();
         const entry = rec.sshKeys?.find((k) => k.algo === key.algo && Buffer.from(k.b64, "base64").equals(key.data));
-        if (!entry) return ctx.reject(); // agent key not for us: no strike, just no
+        if (!entry) return reject(); // agent key not for us: no strike, just no
         if (!pk.signature) return ctx.accept();
         const keyObj = sshPubKeyToKeyObject(key.algo, key.data);
         if (!keyObj || !cryptoVerify(pk.hashAlgo ?? undefined, pk.blob ?? Buffer.alloc(0), keyObj, pk.signature)) {
           strike(ip);
           deps.log(`ssh: bad key signature for ${rec.id} from ${ip}`);
-          return ctx.reject();
+          return reject();
         }
-        device = rec;
-        dev = rec;
-        deps.log(`ssh: device ${rec.id} (${rec.name}, ${rec.scope}) authenticated with key ${sshKeyFingerprint(entry.b64)} from ${ip}`);
+        peer.deviceId = rec.id;
+        peer.fingerprint = sshKeyFingerprint(entry.b64);
+        deps.log(`ssh: device ${rec.id} (${rec.name}, ${rec.scope}) authenticated with key ${peer.fingerprint} from ${ip}`);
         return ctx.accept();
       }
       if (ctx.method !== "password") {
         // Per-device passwords (and registered public keys) are the only ways in.
-        return ctx.reject();
+        return reject();
       }
       const ok = rec ? deps.state.deviceByCredentials(id, ctx.password ?? "") : null;
       if (!ok) {
         strike(ip);
         deps.log(`ssh: auth failed for "${id.slice(0, 12)}" from ${ip}`);
-        return ctx.reject();
+        return reject();
       }
-      device = ok;
-      dev = ok;
+      peer.deviceId = ok.id;
+      peer.fingerprint = undefined;
       deps.log(`ssh: device ${ok.id} (${ok.name}, ${ok.scope}) authenticated from ${ip}`);
       ctx.accept();
     });
 
+    const owned = new Map<string, Channel>();
+    const closeChannel = (channel: Channel) => {
+      const { deviceId, ch } = channel;
+      owned.delete(ch);
+      if (!channels.delete(channelKey(deviceId, ch))) return;
+      toHost(deviceId, { op: "ssh.close", ch });
+    };
+
     client.on("ready", () => {
+      if (peer.deadline) clearTimeout(peer.deadline);
+      peer.deadline = null;
       client.on("session", (accept, reject) => {
+        if (peer.socket.destroyed || !peer.deviceId || !deps.state.deviceById(peer.deviceId)) return reject();
         const session = accept();
         session.on("sftp", (acceptSftp, rejectSftp) => rejectSftp());
         session.on("shell", (acceptShell, rejectShell) => rejectShell());
@@ -244,8 +276,8 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
         // request (without allocating anything) is honest and keeps exec-only policy.
         session.on("pty", (accept) => accept());
         session.on("exec", (acceptExec, rejectExec, info) => {
-          const dvc = dev;
-          if (!dvc) return rejectExec();
+          const dvc = peer.deviceId ? deps.state.deviceById(peer.deviceId) : null;
+          if (peer.socket.destroyed || !dvc || (peer.fingerprint && !dvc.sshKeys?.some(k => sshKeyFingerprint(k.b64) === peer.fingerprint))) return rejectExec();
           if (blocked(ip)) return rejectExec();
 
           // No device-socket gate here: a phone on the SSH leg has no WebSocket open.
@@ -258,12 +290,13 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
           const stream = acceptExec();
           const channel: Channel = { deviceId: dvc.id, ch, stream, closing: false };
           channels.set(channelKey(dvc.id, ch), channel);
+          owned.set(ch, channel);
 
           // Ask the host to run it. The command travels inside the opaque payload; the
           // host's bridge decides whether to run it and answers ssh.granted / ssh.denied.
           const opened = toHost(dvc.id, { op: "ssh.open", ch, cmd: String(info.command ?? "") });
           if (!opened) {
-            channels.delete(channelKey(dvc.id, ch));
+            closeChannel(channel);
             stream.exit(111);
             stream.end(Buffer.from("herdgate: the host is not connected\r\n"));
             return;
@@ -273,10 +306,12 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
             if (channel.closing) return;
             toHost(dvc.id, { op: "ssh.data", ch, b64: buf.toString("base64") });
           });
-          stream.on("close", () => {
-            channels.delete(channelKey(dvc.id, ch));
-            toHost(dvc.id, { op: "ssh.close", ch });
+          stream.on("end", () => {
+            // The client closed its stdin (an exec script is complete): tell the
+            // host, so script channels can match and spawned processes see EOF.
+            if (!channel.closing) toHost(dvc.id, { op: "ssh.eof", ch });
           });
+          stream.on("close", () => closeChannel(channel));
           stream.stderr?.on?.("data", () => {
             /* stderr is merged by the phone side in exec mode; drop duplicates */
           });
@@ -285,23 +320,36 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
     });
 
     client.on("close", () => {
-      const dvc = dev;
-      if (dvc) {
-        for (const c of deviceChannels(dvc.id)) {
-          channels.delete(channelKey(c.deviceId, c.ch));
-          toHost(dvc.id, { op: "ssh.close", ch: c.ch });
-        }
-        if (deviceChannels(dvc.id).length === 0) deps.log(`ssh: device ${dvc.id} disconnected`);
-      }
+      for (const c of owned.values()) closeChannel(c);
+      if (peer.deviceId && deviceChannels(peer.deviceId).length === 0) deps.log(`ssh: device ${peer.deviceId} disconnected`);
     });
   });
 
+  const inject = (socket: Transport): void => {
+    const ip = socket.remoteAddress ?? "?";
+    const pending = [...peers.values()].filter(p => p.deadline !== null);
+    if (peers.size >= 128 || pending.length >= 32 || pending.filter(p => p.ip === ip).length >= 12) {
+      socket.destroy();
+      return;
+    }
+    const peer: Peer = { socket, ip, deadline: setTimeout(() => socket.destroy(), authTimeoutMs) };
+    peer.deadline?.unref();
+    peers.set(socket, peer);
+    socket.once("close", () => {
+      if (peer.deadline) clearTimeout(peer.deadline);
+      peers.delete(socket);
+    });
+    socket.on("error", () => socket.destroy());
+    try { server.injectSocket(socket as Socket); }
+    catch { socket.destroy(); }
+  };
+  const tcp = tcpServer(inject);
   await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, bind, () => resolve());
+    tcp.once("error", reject);
+    tcp.listen(port, bind, () => resolve());
   });
 
-  const addr = server.address();
+  const addr = tcp.address();
   const realPort = typeof addr === "object" && addr ? addr.port : null;
   deps.log(`ssh: listening on ${bind}:${realPort} (devices auth with their device id + key)`);
 
@@ -309,22 +357,22 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
     port: realPort,
     bind,
     hostKeyFingerprint: hostKey.fingerprint,
-    inject(socket) {
-      // ssh2's official injection point; the socket only needs the stream API plus
-      // remoteAddress/remoteFamily/remotePort for logging and the strike map.
-      server.injectSocket(socket as unknown as import("node:net").Socket);
+    inject,
+    revoke(deviceId, fingerprint) {
+      for (const peer of peers.values()) {
+        if (peer.deviceId === deviceId && (fingerprint === undefined || peer.fingerprint === fingerprint)) {
+          peer.socket.destroy();
+        }
+      }
     },
     /** The HOST's ssh.* frames come back through the agent leg; write them into the phone's stream. */
     onHostFrame(deviceId, payload) {
       const op = typeof payload.op === "string" ? payload.op : "";
       const ch = typeof payload.ch === "string" ? payload.ch : "";
       const channel = channels.get(channelKey(deviceId, ch));
-      if (!channel) return;
+      if (!channel) return false;
 
-      if (op === "ssh.granted") {
-        channel.closing = false;
-        return;
-      }
+      if (op === "ssh.granted") return true;
       if (op === "ssh.denied") {
         // The host refused (scope, command, no hc): close the channel honestly.
         const reason = typeof payload.reason === "string" ? payload.reason : "refused by the host";
@@ -333,18 +381,19 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
         channel.stream?.exit(111);
         channel.stream?.end();
         channels.delete(channelKey(deviceId, ch));
-        return;
+        return true;
       }
       if (op === "ssh.data") {
         const b64 = typeof payload.b64 === "string" ? payload.b64 : "";
-        if (b64.length > 400_000) return; // over the frame budget; the rate limiter catches floods
+        if (b64.length > 400_000) return true; // over the frame budget
         const buf = Buffer.from(b64, "base64");
         try {
-          channel.stream?.write(buf);
+          if (payload.stderr === true) channel.stream?.stderr.write(buf);
+          else channel.stream?.write(buf);
         } catch {
           /* the phone vanished mid-write; close carries it */
         }
-        return;
+        return true;
       }
       if (op === "ssh.closed") {
         channel.closing = true;
@@ -354,15 +403,12 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
         channel.stream?.exit(code);
         channel.stream?.end();
         channels.delete(channelKey(deviceId, ch));
-        return;
       }
+      return true;
     },
     async close() {
-      for (const c of channels.values()) {
-        c.stream?.end();
-      }
-      channels.clear();
-      await new Promise<void>((done) => server.close(() => done()));
+      for (const peer of peers.values()) peer.socket.destroy();
+      await new Promise<void>((done) => tcp.close(() => done()));
     },
   } satisfies SshHandle;
 }
@@ -370,12 +416,13 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
 /** Mint once, keep at mode 0600; ephemeral (per-boot) when no key path is configured. */
 function loadOrMintHostKey(deps: SshDeps): { private: string; public: string; fingerprint: string } {
   const path = deps.config.keyPath;
-  if (path && existsSync(path)) {
+  if (path) {
     try {
-      const f = JSON.parse(readFileSync(path, "utf8")) as { private: string; public: string; fingerprint: string };
-      if (f.private && f.public) return f;
-    } catch {
-      /* fall through and re-mint */
+      const f = JSON.parse(readFileSync(path, "utf8")) as { private: string; public: string };
+      if (typeof f.private !== "string" || !f.private || typeof f.public !== "string" || !f.public) throw new Error("invalid key");
+      return { private: f.private, public: f.public, fingerprint: fingerprintOf(f.public) };
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("cannot load existing SSH host key; restore it from backup");
     }
   }
   // ssh2.utils generates the OpenSSH format directly; the node-crypto path is the fallback.
@@ -394,9 +441,8 @@ function loadOrMintHostKey(deps: SshDeps): { private: string; public: string; fi
         })();
   const fingerprint = fingerprintOf(key.public);
   if (path) {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify({ ...key, fingerprint }), { mode: 0o600 });
-    chmodSync(path, 0o600);
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    writeFileSync(path, JSON.stringify({ ...key, fingerprint }), { mode: 0o600, flag: "wx" });
     deps.log(`ssh: host key minted at ${path} (${fingerprint})`);
   } else {
     deps.log(`ssh: ephemeral host key (${fingerprint}) — set HERDGATE_SSH_KEY to keep it`);

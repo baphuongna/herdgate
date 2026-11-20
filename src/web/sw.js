@@ -3,7 +3,7 @@
 //
 // Bump VERSION when a shell file changes; old caches are dropped on activate.
 
-const VERSION = "herdgate-v11";
+const VERSION = "herdgate-v17";
 const SHELL = ["/", "/app.css", "/e2e.js", "/app.js", "/app.webmanifest", "/icons/icon.svg"];
 
 self.addEventListener("install", (event) => {

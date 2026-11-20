@@ -301,6 +301,8 @@ dialog::backdrop {
 }
 
 /* SSH public-key management inside the device's SSH section */
+.ssh-user-select { display: block; width: 100%; margin-top: 4px; }
+#view details.ssh .keyrow[hidden] { display: none; }
 .sshkeys .pubkey-input {
   flex: 1;
   min-width: 0;

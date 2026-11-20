@@ -1,0 +1,3 @@
+# Deployment-only versioned bundles; the npm package ships the installer sources.
+herdgate-win-*.zip
+herdgate-*.tgz

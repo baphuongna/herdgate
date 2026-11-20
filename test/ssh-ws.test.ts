@@ -4,9 +4,13 @@ import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
+import { connect } from "node:net";
+import { once } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
 import WebSocket from "ws";
 
 import { startCloud } from "../src/cloud/gateway.ts";
+import { startTcpEdge } from "../src/cloud/ssh-tcp-edge.ts";
 import { encode } from "../src/protocol/envelope.ts";
 
 interface Recv {
@@ -60,6 +64,70 @@ class DeviceSock {
     this.ws.close();
   }
 }
+
+test("ssh over websocket expires silent tunnels while healthy tunnels stay open", async () => {
+  const cloud = await startCloud({ accounts: [], ssh: { port: 0 }, heartbeatMs: 200 });
+  const url = `ws://127.0.0.1:${cloud.port}/v1/ssh/ws`;
+  const silent = new WebSocket(url, { autoPong: false });
+  const healthy = new WebSocket(url);
+  try {
+    const closed = once(silent, "close", { signal: AbortSignal.timeout(2_500) });
+    await once(healthy, "open");
+    await closed;
+    await delay(250);
+    assert.equal(healthy.readyState, WebSocket.OPEN);
+  } finally {
+    silent.terminate();
+    healthy.terminate();
+    await cloud.close();
+  }
+});
+
+test("SSH auth deadline frees idle TCP and TCP-edge slots even while the WSS peer answers pings", async () => {
+  const cloud = await startCloud({ accounts: [], ssh: { port: 0, authTimeoutMs: 400 }, heartbeatMs: 80 });
+  const edge = await startTcpEdge({ gate: `http://127.0.0.1:${cloud.port}`, port: 0, total: 1 });
+  const direct = connect(cloud.ssh!.port!, "127.0.0.1");
+  const routed = connect(edge.port, "127.0.0.1");
+  try {
+    const signal = AbortSignal.timeout(3000);
+    const directClosed = once(direct, "close", { signal });
+    const routedClosed = once(routed, "close", { signal });
+    direct.resume();
+    assert.match(String((await once(routed, "data", { signal }))[0]), /^SSH-/);
+    routed.resume();
+    await Promise.all([directClosed, routedClosed]);
+    const next = connect(edge.port, "127.0.0.1");
+    try { assert.match(String((await once(next, "data", { signal }))[0]), /^SSH-/); }
+    finally { next.destroy(); }
+  } finally {
+    direct.destroy();
+    routed.destroy();
+    await edge.close();
+    await cloud.close();
+  }
+});
+
+test("TCP edge bounds connections per source and frees the slot when it closes", async () => {
+  const cloud = await startCloud({ accounts: [], ssh: { port: 0 } });
+  const edge = await startTcpEdge({ gate: `http://127.0.0.1:${cloud.port}`, host: "127.0.0.1", port: 0, perIp: 1 });
+  const dial = () => connect(edge.port, "127.0.0.1");
+  const first = dial();
+  try {
+    const signal = AbortSignal.timeout(4_000);
+    const [banner] = await once(first, "data", { signal });
+    assert.match(String(banner), /^SSH-/);
+    const extra = dial();
+    try { await once(extra, "close", { signal }); } finally { extra.destroy(); }
+    first.end();
+    await once(first, "close", { signal });
+    const next = dial();
+    try { assert.match(String((await once(next, "data", { signal }))[0]), /^SSH-/); } finally { next.destroy(); }
+  } finally {
+    first.destroy();
+    await edge.close();
+    await cloud.close();
+  }
+});
 
 async function roomIdOf(base: string, token: string): Promise<string> {
   const ws = new WebSocket(base.replace("http", "ws") + "/v1/device/ws");
@@ -123,9 +191,9 @@ test("ssh over websocket: system ssh through the herdgate-via wrapper authentica
     // ssh resolves ~ from the passwd entry (not $HOME), so pin known-hosts to the
     // test's temp dir — the machine's real file must never learn test host keys.
     const known = join(dir, "known_hosts");
-    const run = (args: string[]) =>
+    const run = (args: string[], bin = "node") =>
       new Promise<{ code: number | null; out: string }>((resolve) => {
-        const p = spawn("node", args, { env: { ...process.env, HOME: dir, USERPROFILE: dir } });
+        const p = spawn(bin, args, { env: { ...process.env, HOME: dir, USERPROFILE: dir } });
         let out = "";
         p.stdout.on("data", (d: Buffer) => (out += d));
         p.stderr.on("data", (d: Buffer) => (out += d));
@@ -154,7 +222,18 @@ test("ssh over websocket: system ssh through the herdgate-via wrapper authentica
     });
     const bad = await run([via, "--gate", base, "--user", granted.device.id, "--key", badKey, "--known-hosts", known, "--", "exit"]);
     assert.equal(bad.code, 255);
-    assert.ok(bad.out.includes("Permission denied"), bad.out.slice(0, 200));
+    // Some native clients choose their key from the server's advertised methods.
+    assert.match(bad.out, /Permission denied \(publickey,password\)/);
+
+    // Mobile uses plain TCP, with no ProxyCommand or owner token at the edge.
+    const edge = await startTcpEdge({ gate: base, host: "127.0.0.1", port: 0 });
+    try {
+      const mobile = await run(["-F", "/dev/null", "-o", `UserKnownHostsFile=${known}`, "-o", "HostKeyAlias=herdgate", "-o", "StrictHostKeyChecking=yes", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i", keyPath, "-p", String(edge.port), `${granted.device.id}@127.0.0.1`, "exit"], "ssh");
+      assert.equal(mobile.code, 111, mobile.out);
+      assert.match(mobile.out, /the host is not connected/);
+    } finally {
+      await edge.close();
+    }
   } finally {
     await cloud.close();
     rmSync(dir, { recursive: true, force: true });

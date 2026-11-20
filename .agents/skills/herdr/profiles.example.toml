@@ -1,0 +1,18 @@
+schema_version = 1
+
+# These examples use the destination machine's default Pi model.
+# To pin a model, add model = "provider/model-id" after verifying it locally.
+[profiles.advisor]
+notes = "Short independent review; checks assumptions and evidence."
+thinking = "high"
+
+[profiles.committee-rca]
+notes = "Root-cause analysis; compare competing explanations."
+thinking = "high"
+
+[profiles.committee-review]
+notes = "Challenge conclusions and identify missing evidence."
+thinking = "high"
+
+[profiles.handoff]
+notes = "Continue the brief within its stated scope and acceptance criteria."

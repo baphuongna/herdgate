@@ -33,12 +33,12 @@ export function randomId(prefix: string): string {
 export async function readJsonBody(req: import("node:http").IncomingMessage, maxBytes = 4096): Promise<Record<string, unknown> | null> {
   const chunks: Buffer[] = [];
   let size = 0;
-  for await (const c of req) {
-    size += (c as Buffer).length;
-    if (size > maxBytes) return null;
-    chunks.push(c as Buffer);
-  }
   try {
+    for await (const c of req) {
+      size += (c as Buffer).length;
+      if (size > maxBytes) return null;
+      chunks.push(c as Buffer);
+    }
     const v = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     return typeof v === "object" && v !== null && !Array.isArray(v) ? v as Record<string, unknown> : null;
   } catch {

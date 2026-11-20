@@ -1,7 +1,7 @@
 # herdgate — design
 
-v0 skeleton, 2026-11-18. This document is the contract the code aspires to; where they disagree today, the code
-wins and this file gets fixed.
+Architecture and trust boundaries. For installation and upgrade commands, see [README.md](README.md) and
+[DEPLOY.md](DEPLOY.md).
 
 ## 1. What herdgate is
 
@@ -26,7 +26,7 @@ Three deployment properties:
 |---|---|---|---|
 | account | a person | config token (v0) | operator (env) |
 | room | one host app | room token (random 32B, stored **hashed**) | device-flow approval |
-| device | one browser/PWA | device record id + the account token | `pair.begin` |
+| device | one room-scoped browser or SSH client | device ID + device secret, or registered SSH public key for SSH auth | `pair.begin` and key registration |
 
 - **Host provisioning (device flow).** The host mints a code (`POST /v1/agent/code`), a human approves it from a
   logged-in device (`POST /v1/agent/approve`), the host polls `GET /v1/agent/code/:code/status` and receives the
@@ -57,7 +57,9 @@ responses carry a `stream {gen, seq}` header; a reconnecting device adds
 in order. `gen` changes on every gateway process start, so stale bookkeeping from a
 previous life invalidates in one comparison — the device gets a fresh hello (`resumed:false`)
 and re-requests state. A resume from before what was kept answers `stream.gap:true`
-(replay what survived; the device re-requests its view). Frames with an `ssh.*` op are
+(replay what survived; the device re-requests its view). Device-targeted frames are
+visible only to their destination device, live and in replay; sequence gaps between
+its frames are normal because the cursor is room-wide. Frames with an `ssh.*` op are
 **ephemeral**: sent raw, unstamped, never buffered — they belong to an SSH channel that
 died with the drop, and replaying them into a new SSH session would corrupt its wire
 protocol. `pair.granted` (carries the one-time device secret) is likewise never replayed.
@@ -66,7 +68,7 @@ HTTP: `GET /healthz`, `POST /v1/agent/code`, `POST /v1/agent/approve` (bearer ac
 `GET /v1/agent/code/:code/status`.
 
 Limits: frames 256 KiB (`maxPayload`), 60 msg/s per socket (token bucket), hello within 10s, failed-hello
-strikes per IP (5/min → 60s block), protocol-level pings every 30s with terminate on silence.
+strikes per IP (5/min → 60s block), and WebSocket heartbeat pings (8s by default) with termination on silence.
 
 ## 4. State
 
@@ -83,10 +85,12 @@ header makes a restart a clean re-sync rather than a wrong replay.
 | A stolen `act` device | approve-on-host at pair time; host re-confirmation of dangerous ops is host policy |
 | Hostile room claiming | codes bound to the approving account; rooms never cross accounts |
 | DoS | per-IP blocks, per-socket rate, frame caps, supersede rule, unbounded fan-out is a bug |
-| Cloud reading content | **opaque payloads rule** — nothing to read; E2E (§6) removes even the possibility |
+| Cloud reading content | Gate routes application frames without interpreting them; only a negotiated Noise session protects that payload from the Gate. SSH terminates at the Gate. |
 | Host confusion via cloudflared | optional `expectedHost` pin; nothing else about the edge is trusted |
 
-What v0 does **not** promise: per-device secrets (account token = device identity today — roadmap), payload confidentiality on the wire beyond TLS (E2E roadmap), multi-account isolation.
+Per-device secrets and Noise_XX payload sessions now exist. Noise applies to its own application payload
+channel, not to SSH, which terminates at the Gate. Do not infer that all payloads use Noise or that the
+single-owner deployment model provides multi-tenant isolation.
 
 ## 6. Roadmap
 
@@ -98,22 +102,24 @@ What v0 does **not** promise: per-device secrets (account token = device identit
    plugin and the PWA run one identical module) over the payload channel; the device initiates after
    pairing, the host acks with `e2e.ready` (nothing encrypts before the ack — a frame racing the
    handshake's last step would desync the counters forever), and a decrypt failure drops the session for
-   renegotiation. Host static key is TOFU: the device pins its fingerprint and screams if it changes.
-   See DESIGN §3 and `plugin/server/e2e.mjs`.
+   renegotiation. Cipher operations are serialized per direction. Host identity is TOFU: the PWA uses
+   a full SHA-256 pin, upgrades a matching legacy pin and refuses changed keys or plaintext pane data
+   on a pinned room. See `plugin/server/e2e.mjs`.
 4. ~~**Official Herdr adapter**~~ — **done (v0.1.0)**, read-only. `src/host/herdr.ts` runs
    `herdr api snapshot` (verified on Herdr 0.9.5, protocol 22) and maps `workspaces[]`, `tabs[]`, `panes[]`,
    `agents[]` and the focused ids into a versioned view. Device ops are `view` and `ping`; every other op is
    refused on the host with `read-only`. Next in this line: an `act` op set once per-op policy and audit exist.
-5. **Device PWA** — pairing page + dashboard + frame UI (static files served by the cloud).
-5b. ~~**SSH leg through the gate**~~ — **done (v0.5.0)**; see §8. Follow-ups: publickey auth, framed/live
-   terminals for `read` devices via an observe-only proxy.
-5c. ~~**SSH bridge for machines with no open port**~~ — **done (v0.9.0)**: a one-file bridge on any reachable
-   host dials the cloud over wss and pipes raw SSH into the sshd (`ssh2.injectSocket`); the device hello
-   advertises the bridge while it is live. Auth/scopes/allowlist unchanged — in the cloud.
+5. **Device PWA** — shipped: pairing, multi-room dashboard, per-device SSH key management and read-only pane views.
+5b. **SSH through the Gate** — shipped: per-device public keys, TUI bridge, real Core and the scoped Mobile
+   TUI adapter (see §8).
+5c. **SSH without inbound publisher ports** — shipped: SSH over WSS for desktop clients and a tokenless
+   TCP edge for Mobile. The old owner-token SSH bridge is a separate legacy deployment.
 6. ~~**Push wake**~~ — **done (v0.8.0)**: VAPID keys beside the state file; a paired device stores its web-push
    subscription (`/v1/device/push`); the host sends `wake {device}` and the cloud delivers a silent,
    payload-less push — but only when the device is not connected (a connected one is already live). The
-   PWA's service worker raises a notification only when no window is open.
+   PWA's service worker raises a notification only when no window is open. Off by default since v0.9.33;
+   opt-in wake uses a fixed HTTPS provider list and connects only to an approved public IPv4 DNS result,
+   retaining TLS verification for the provider name and never following redirects.
 7. Multi-account signup, quotas, Postgres state, audit log.
 
 ## 7. Host payload contract (herdgate.herdr.v1)
@@ -132,8 +138,9 @@ workspaces[{id,label,number,tabs,panes,agentStatus,focused}], agents[{name,kind,
 A new Herdr version that adds keys keeps working (every field is read defensively); a missing key degrades to an
 empty/honest value rather than throwing.
 
-Pairing `act` is off unless the operator sets `HERDGATE_ALLOW_ACT=1`; the read-only op set means even an `act`
-device has nothing to cause an effect with yet.
+The table describes the standalone metadata adapter. The TUI publisher also exposes read-only
+`term.list` and `term.read` for the PWA. Browser payload operations do not grant terminal input;
+SSH access is a separate channel with its own authorization.
 
 ## 8. How herdgate attaches to Herdr (official surface only)
 
@@ -150,14 +157,14 @@ extensions (`docs/plugins.mdx`) and lists in the marketplace (`herdr-plugin` Git
 Two official surfaces are used, one per program: the **plugin** (§ above, `herdr-plugin.toml`) for the TUI, and
 the **app mod** (§ below, `mods/<name>/`) for the desktop app.
 
-The plugin's only Herdr API is the documented one: `HERDR_BIN_PATH ... api snapshot`. Env it relies on is the
-set Herdr injects (`HERDR_ENV`, `HERDR_BIN_PATH`, `HERDR_SOCKET_PATH`, `HERDR_PLUGIN_ID`, `HERDR_PLUGIN_ROOT`,
-`HERDR_PLUGIN_CONFIG_DIR`, `HERDR_PLUGIN_STATE_DIR`, `HERDR_PLUGIN_CONTEXT_JSON`, …). Nothing is read from a
-private Herdr path and nothing patches Herdr.
+The plugin uses Herdr's CLI for metadata and pane reads, and fixed Herdr bridge commands for remote TUI
+connections. The interactive Mobile adapter additionally uses Herdr's native terminal session control.
+These integrations use the running TUI server's configured executable and socket, not a second Herdr
+server. Nothing patches Herdr.
 
-Credentials go in `HERDR_PLUGIN_CONFIG_DIR` (user-editable, never in `HERDR_PLUGIN_ROOT`, which is a managed
-source checkout); runtime state goes in `HERDR_PLUGIN_STATE_DIR`. The plugin has no `node_modules` dependency:
-it uses Node's global `WebSocket`, so a GitHub `herdr plugin install` of just this directory works.
+Credentials go in `HERDR_PLUGIN_CONFIG_DIR`, not the managed plugin checkout; runtime state goes in
+`HERDR_PLUGIN_STATE_DIR`. The standalone plugin uses Node's native `WebSocket`; the opt-in Linux Gate
+loopback transport uses the bundled `ws` dependency.
 
 Note on Herdr's moving parts: the **TUI** (`herdr`) exposes workspaces/tabs/panes/agents; **herdr-core** (`hc`)
 is the separate runtime under the Herdr app and its iPhone/iPad/Android app, with a JSON-RPC API of its own.
@@ -175,33 +182,35 @@ The mod and the TUI plugin share one publisher: the mod owns the pairing convers
 write the token 0600) and shells out to `plugin/server/index.mjs serve` for the long-lived connection. One
 implementation, two surfaces.
 
-### Mobile: over SSH, through herdgate (v0.5.0)
+### SSH clients: TUI, real Core and the Mobile TUI adapter
 
-The Herdr phone app is closed source and has no extension surface. It talks to `herdr-core` **over SSH** —
-`ssh <machine> hc connect`, JSON-RPC one message per line — and that is the supported path. herdgate now
-**terminates that SSH leg itself** (`src/cloud/sshd.ts`, ssh2):
+The Gate (`src/cloud/sshd.ts`) terminates SSH and authenticates the device ID with its registered public
+key or device secret, never with the owner token. Each exec is an ephemeral channel bound to the
+authenticated device and room. The publisher dispatches supported commands to fixed argv, not a shell.
+A VPS TCP edge, when used, carries raw SSH over WSS and holds no Gate credentials; the client verifies
+and pins the Gate's SSH host key. SSH channels are not replayed or resumed after a disconnect.
 
-- the phone's "add a machine" points at the gate: username = the device id, password = the device secret
-  `pair.granted` issued once (per-device secrets, roadmap §6 item 1, landed with this leg — the PWA stores
-  its key locally and re-attaches with it; the account token is no longer a device credential and is NOT an
-  SSH credential);
-- each SSH exec session is one bridge channel: the cloud relays `ssh.*` payloads opaquely, and the host-side
-  bridge (`src/host/ssh.ts`, mirrored in `plugin/server/ssh.mjs`) spawns exactly the requested `hc …` command
-  (argv, `shell: false`) and pipes it byte by byte;
-- **scope is enforced at the host bridge** — the trusted decision point, since the cloud cannot see payloads:
-  a `read` device gets a filtered plain-mode channel (mutating JSON-RPC methods are refused with a real
-  error and never reach herdr-core; a `framed: true` hello is downgraded so live terminals — which are
-  write streams — cannot be typed into; garbage is cut off), while an `act` device, approved by a human on
-  the host, gets byte-transparent access;
-- the SSH host key is minted once (Ed25519, mode 0600) and its fingerprint is printed at boot.
+| Target | Host scope enforcement |
+|---|---|
+| Existing Herdr TUI via the desktop TUI bridge | `act` only; the native two-way bridge is not a read filter. |
+| Real `herdr-core` | A `read` device gets filtered plain JSON-RPC; framed hello is downgraded. Approved `act` gets byte-transparent Core RPC. |
+| Existing TUI panes via the Mobile adapter | Read/observe attaches show a text snapshot; no input or resize. An explicitly configured device with matching `act` scope can use Send, keys, Interrupt and native attach with ANSI, input and resize. |
 
-Verified against real herdr-core 0.1.21: a `read` device authenticated with its key, listed terminals, read a
-terminal, subscribed to events; `terminal.send` and `file.write` were refused at the gate and nothing was
-written. An `act` device passes `framed: true` through untouched.
+The Mobile adapter speaks the Core protocol subset needed for those operations and rejects unsupported
+RPCs. It does not implement Core task lifecycle, templates or file operations. See
+`plugin/server/mobile-tui-core.mjs` and `plugin/server/mobile-tui-stream.mjs`.
 
-Scope of this slice: `password` auth only (no publickey yet), plain mode for `read` (framed/live terminal is
-act-only), and no session resume. Reachability: on the LAN or via VPN/Tailscale to the machine running the
-gate; the SSH listener binds loopback by default and needs `HERDGATE_SSH_BIND=0.0.0.0` for LAN phones.
+### Publisher releases and migration
+
+The platform-specific publisher runtime is installed outside npm's cache. On Windows `herdgate install`
+installs a per-user, Node-pinned command from npm. First setup also provisions it. Its `command` junction
+is separate from the publisher's `current` junction, so publisher rollback does not remove the command.
+User PATH registration is optional and never changes the machine-wide PATH. Migration stages and validates
+first, then saves the existing device mode only after the new publisher connects; failure triggers a
+rollback attempt. On Linux the CLI installs a user systemd unit, recognizes only the known legacy home
+unit for adoption, and checks the new invocation's Gate hello. Both preserve the room config and the
+running Herdr server. The Gate, TCP edge, and standalone Linux Mobile publishers have independent
+lifecycles.
 
 ## 9. Herdr-relay comparison (why a new project)
 

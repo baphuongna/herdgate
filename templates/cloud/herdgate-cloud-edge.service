@@ -1,0 +1,18 @@
+[Unit]
+Description=Herdgate Cloud public SSH TCP edge (no credentials)
+After=network.target
+
+[Service]
+DynamicUser=yes
+WorkingDirectory=/opt/herdgate-cloud
+EnvironmentFile=/etc/herdgate/edge.env
+ExecStart=/usr/bin/node runtime/cloud/ssh-tcp-edge.js
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

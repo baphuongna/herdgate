@@ -34,14 +34,24 @@ const flag = (name) => {
   const i = argv.indexOf(name);
   return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
 };
-const GATE = (flag("--gate") ?? process.env.HERDGATE_URL ?? "https://gate.phuongnb.io.vn").replace(/\/$/, "");
-const wsUrl = GATE.replace(/^http/, "ws") + "/v1/ssh/ws";
 const MODE = argv.includes("--tunnel") ? "tunnel" : argv.includes("--probe") ? "probe" : "via";
 
 const die = (msg) => {
   console.error(`herdgate-via: ${msg}`);
   process.exit(2);
 };
+
+const configuredGate = flag("--gate") ?? process.env.HERDGATE_URL;
+if (!configuredGate) die("configure --gate <url> or HERDGATE_URL");
+let origin;
+try { origin = new URL(configuredGate); }
+catch { die("invalid Gate URL"); }
+if (origin.username || origin.password || origin.pathname !== "/" || origin.search || origin.hash ||
+    (origin.protocol !== "https:" && !(origin.protocol === "http:" && ["127.0.0.1", "::1", "[::1]", "localhost"].includes(origin.hostname)))) {
+  die("Gate URL must be an HTTPS origin (HTTP only for local development)");
+}
+const GATE = origin.origin;
+const wsUrl = GATE.replace(/^http/, "ws") + "/v1/ssh/ws";
 
 const toBuf = (data) => {
   if (Buffer.isBuffer(data)) return data;

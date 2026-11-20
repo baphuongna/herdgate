@@ -2,16 +2,21 @@
  * herdgate plugin for Herdr — commands behind the manifest.
  *
  * The plugin calls Herdr through `HERDR_BIN_PATH` (the official CLI) and publishes the
- * resulting metadata to a herdgate cloud over one outbound WebSocket. Read-only: the
- * plugin never sends a keystroke, reads a pane's content, or runs an agent.
+ * resulting metadata to a herdgate cloud over one outbound WebSocket. Device
+ * permissions are checked before dispatching any interactive bridge commands.
  */
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { hostname, homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead } from "./common.mjs";
 import { createSshBridge } from "./ssh.mjs";
+import { findReceipt, journalBase as receiptJournalBase, publicReceipt } from "./pi-receipts.mjs";
+import { JOB_ID, MAX_PENDING, MAX_PROMPT, appendJob, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, workerBase } from "./pi-worker.mjs";
+import { registerPublisher } from "./publisher-tui-lifecycle.mjs";
 import { HostChannel, b64d, b64e, fingerprint, generateKeyPair } from "./e2e.mjs";
 
 const D = dirs();
@@ -139,13 +144,28 @@ async function serve() {
 
 /**
  * The long-lived publisher: read Herdr metadata and push it to every paired device.
- * Reconnects with bounded backoff. Uses Node's global WebSocket so the plugin needs no
- * node_modules — `herdr plugin install` checks out the manifest directory alone.
+ * Reconnects with bounded backoff. The default transport uses Node's global
+ * WebSocket, so a standalone `herdr plugin install` needs no node_modules.
  */
 async function publisherLoop() {
   const cfg = readConfig(D.configPath);
   const url = cfg.HERDGATE_URL.replace(/\/$/, "");
   const wsUrl = url.replace(/^http/, "ws") + "/v1/agent/ws";
+  let openSocket = () => new WebSocket(wsUrl);
+  const loopbackPort = cfg.HERDGATE_AGENT_LOOPBACK_PORT;
+  if (loopbackPort) {
+    if (!/^[1-9]\d{0,4}$/.test(loopbackPort) || Number(loopbackPort) > 65_535) {
+      throw new Error("HERDGATE_AGENT_LOOPBACK_PORT must be a port from 1 to 65535");
+    }
+    // Only for co-located publisher/gate deployments. Node's native WebSocket
+    // won't set Host; use the gateway's existing ws dependency for this mode.
+    const { default: LocalWebSocket } = await import("ws");
+    const host = new URL(url).host;
+    const endpoint = `ws://127.0.0.1:${loopbackPort}/v1/agent/ws`;
+    openSocket = () => new LocalWebSocket(endpoint, {
+      headers: { Host: host }, agent: false, handshakeTimeout: 5_000, perMessageDeflate: false,
+    });
+  }
   const token = cfg.HERDGATE_ROOM_TOKEN;
   let backoff = 1_000;
   let lastSig = "";
@@ -179,45 +199,48 @@ async function publisherLoop() {
   // A device that has not completed the handshake keeps working in the clear —
   // the plaintext path stays the compat fallback.
   const e2eKeyPath = D.stateDir ? join(D.stateDir, "e2e-host.json") : "";
-  let e2eSelf = null;
-  const e2eSelfKey = async () => {
-    if (e2eSelf) return e2eSelf;
+  let e2eIdentity;
+  const e2eSelfKey = () => e2eIdentity ??= (async () => {
     try {
       const j = JSON.parse(readFileSync(e2eKeyPath, "utf8"));
-      e2eSelf = { jwk: j.jwk, pub: b64d(j.pub) };
-      return e2eSelf;
-    } catch {
-      /* mint a fresh identity below */
-    }
-    e2eSelf = await generateKeyPair();
-    try {
-      mkdirSync(dirname(e2eKeyPath), { recursive: true });
-      writeFileSync(e2eKeyPath, JSON.stringify({ jwk: e2eSelf.jwk, pub: b64e(e2eSelf.pub) }), { mode: 0o600 });
+      return { jwk: j.jwk, pub: b64d(j.pub) };
     } catch (e) {
-      log(`e2e: could not persist host key (${e instanceof Error ? e.message : String(e)})`);
+      if (e.code !== "ENOENT") throw new Error("cannot load existing E2E host identity");
     }
-    return e2eSelf;
-  };
+    const key = await generateKeyPair();
+    mkdirSync(dirname(e2eKeyPath), { recursive: true, mode: 0o700 });
+    writeFileSync(e2eKeyPath, JSON.stringify({ jwk: key.jwk, pub: b64e(key.pub) }), { mode: 0o600, flag: "wx" });
+    return key;
+  })();
   const e2eSessions = new Map();
+  const acceptingFinish = new WeakSet();
   /** Per-device last-call times for the subprocess-backed term.* ops (1/s each). */
   const termThrottle = new Map();
   /** null = not an e2e payload; {reply} = handshake answer to send; {inner} = decrypted device payload. */
-  const e2eOnDevice = async (device, payload) => {
+  const e2eOnDevice = async (ws, device, payload) => {
     if (payload && typeof payload === "object" && typeof payload.op === "string" && payload.op.startsWith("e2e")) log(`e2e: op ${payload.op} from ${device}`);
     if (!payload || typeof payload !== "object") return null;
     if (payload.op === "e2e.init") {
       const ch = new HostChannel(await e2eSelfKey());
+      if (wsRef !== ws || ws.readyState !== 1 || !devices.some(d => d.id === device)) return { reply: null };
       e2eSessions.set(device, ch);
-      return { reply: { op: "e2e.reply", ...(await ch.acceptInit(payload)) } };
+      const reply = await ch.acceptInit(payload);
+      return e2eSessions.get(device) === ch ? { reply: { op: "e2e.reply", ...reply } } : { reply: null };
     }
     if (payload.op === "e2e.finish") {
       const ch = e2eSessions.get(device);
-      if (!ch) return { reply: { op: "error", code: "e2e", message: "no handshake in progress" } };
-      await ch.acceptFinish(payload);
-      log(`e2e: session up with ${device} (host fp ${fingerprint((await e2eSelfKey()).pub)})`);
-      // The ack is the start signal: the device encrypts nothing before it, so no
-      // transport frame can race the handshake's last step and desync the counters.
-      return { reply: { op: "e2e.ready" } };
+      if (!ch || ch.ready() || acceptingFinish.has(ch)) return { reply: null };
+      acceptingFinish.add(ch);
+      try {
+        const fp = await fingerprint((await e2eSelfKey()).pub);
+        await ch.acceptFinish(payload);
+        if (e2eSessions.get(device) === ch && wsRef === ws && ws.readyState === 1) {
+          // Queue the ack before allowing the first ciphertext to be sent.
+          ws.send(JSON.stringify({ v: 1, t: "frame", device, payload: { op: "e2e.ready" } }));
+          log(`e2e: session up with ${device} (host fp ${fp})`);
+        }
+        return { reply: null };
+      } finally { acceptingFinish.delete(ch); }
     }
     if (payload.op === "e2e") {
       const ch = e2eSessions.get(device);
@@ -227,6 +250,7 @@ async function publisherLoop() {
       } catch {
         // A decrypt failure means the counters can never resync: drop the session and
         // make the device renegotiate.
+        if (e2eSessions.get(device) !== ch) return { reply: null };
         e2eSessions.delete(device);
         log(`e2e: dropped session with ${device} (decrypt failed — renegotiate)`);
         return { reply: { op: "error", code: "e2e", message: "session dropped — renegotiate" } };
@@ -234,19 +258,29 @@ async function publisherLoop() {
     }
     return null;
   };
-  /** Encrypt for this device when a session exists; passthrough otherwise. */
-  const e2eToDevice = async (device, payload) => {
+  /** Encrypt for this device when a session exists; passthrough for legacy clients. */
+  const sendPayload = async (ws, device, payload) => {
+    if (wsRef !== ws || ws.readyState !== 1 || !devices.some(d => d.id === device)) return;
     const ch = e2eSessions.get(device);
-    return ch?.ready() ? ch.send(payload) : payload;
+    if (acceptingFinish.has(ch)) return;
+    const wire = ch?.ready() ? await ch.send(payload) : payload;
+    if (wsRef === ws && ws.readyState === 1 && e2eSessions.get(device) === ch) {
+      ws.send(JSON.stringify({ v: 1, t: "frame", device, payload: wire }));
+    }
   };
 
   const ssh = createSshBridge({
+    session: cfg.HERDGATE_HERDR_SESSION || undefined,
+    tuiOnly: process.env.HERDGATE_TUI_ONLY === "1",
+    mobileHcBin: process.env.HERDGATE_MOBILE_HC_BIN || null,
+    mobileTuiAdapter: process.env.HERDGATE_MOBILE_TUI_DEVICE ? {
+      device: process.env.HERDGATE_MOBILE_TUI_DEVICE,
+      scope: process.env.HERDGATE_MOBILE_TUI_SCOPE === "act" ? "act" : "read",
+      script: fileURLToPath(new URL("./mobile-tui-core.mjs", import.meta.url)),
+    } : null,
     send: (device, payload) => {
-      void (async () => {
-        if (wsRef && wsRef.readyState === 1) {
-          wsRef.send(JSON.stringify({ v: 1, t: "frame", device, payload: await e2eToDevice(device, payload) }));
-        }
-      })();
+      // sshd is the SSH endpoint; a concurrent PWA session must not seal these frames.
+      if (wsRef?.readyState === 1) wsRef.send(JSON.stringify({ v: 1, t: "frame", device, payload }));
     },
     scopeOf: (device) => devices.find((d) => d.id === device)?.scope ?? null,
     log,
@@ -256,7 +290,7 @@ async function publisherLoop() {
     const payload = await snapshotPayload();
     if (!payload) return;
     for (const d of devices) {
-      ws.send(JSON.stringify({ v: 1, t: "frame", device: d.id, payload: await e2eToDevice(d.id, payload) }));
+      await sendPayload(ws, d.id, payload);
     }
   };
 
@@ -274,8 +308,18 @@ async function publisherLoop() {
     }
   };
 
+  const shutdown = () => {
+    ssh.closeAll();
+    if (wsRef?.readyState === 1) wsRef.close();
+    process.exit(0);
+  };
+  const tuiOnly = process.env.HERDGATE_TUI_ONLY === "1";
+  const lifecycle = tuiOnly && process.env.HERDGATE_TUI_RUN_ID
+    ? registerPublisher(D.stateDir, process.env.HERDGATE_TUI_RUN_ID, shutdown)
+    : null;
+
   const connect = () => {
-    const ws = new WebSocket(wsUrl);
+    const ws = openSocket();
     wsRef = ws;
     let helloed = false;
     ws.onopen = () => {
@@ -297,7 +341,8 @@ async function publisherLoop() {
         helloed = true;
         backoff = 1_000;
         devices = m.devices ?? [];
-        log(`connected to ${url} (room ${m.roomId}, ${devices.length} device(s))`);
+        lifecycle?.setConnected(true);
+        log(`connected to ${url}${loopbackPort ? ` via loopback 127.0.0.1:${loopbackPort}` : ""} (room ${m.roomId}, ${devices.length} device(s))`);
         void publish(ws);
         if (timer) clearInterval(timer);
         timer = setInterval(() => void publish(ws), 30_000);
@@ -305,7 +350,12 @@ async function publisherLoop() {
         return;
       }
       if (m.t === "room.update") {
-        devices = m.devices ?? [];
+        const next = m.devices ?? [];
+        for (const d of devices) if (!next.some((n) => n.id === d.id && n.scope === d.scope)) {
+          ssh.dropDevice(d.id);
+          e2eSessions.delete(d.id);
+        }
+        devices = next;
         void publish(ws);
         return;
       }
@@ -317,7 +367,7 @@ async function publisherLoop() {
           ssh.handle(m.device, m.payload);
           return;
         }
-        const unwrapped = await e2eOnDevice(m.device, m.payload);
+        const unwrapped = await e2eOnDevice(ws, m.device, m.payload);
         if (unwrapped) {
           if (unwrapped.reply !== null && unwrapped.reply !== undefined) {
             ws.send(JSON.stringify({ v: 1, t: "frame", device: m.device, payload: unwrapped.reply }));
@@ -326,10 +376,90 @@ async function publisherLoop() {
         }
         const payload = unwrapped?.inner ?? m.payload;
         const op = payload && typeof payload === "object" ? payload.op : undefined;
-        const replyTo = async (out) => {
-          ws.send(JSON.stringify({ v: 1, t: "frame", device: m.device, payload: await e2eToDevice(m.device, out) }));
-        };
+        const replyTo = (out) => sendPayload(ws, m.device, out).catch(e => log(`payload send failed: ${e.message}`));
         if (op === "ping") return void replyTo({ op: "pong", n: payload.n ?? null, at: new Date().toISOString() });
+        if (op === "receipt.get") {
+          // Experimental (opt-in HERDGATE_PI_RECEIPTS=1): answer from the local Pi
+          // receipt journal written by the experiments/pi-receipt observer.
+          // Metadata only — the observer itself never opens a socket.
+          const id = typeof payload.id === "string" ? payload.id : "";
+          const enabled = process.env.HERDGATE_PI_RECEIPTS === "1";
+          const entry = enabled ? findReceipt(receiptJournalBase(), id) : null;
+          log(`receipts: ${m.device} queried ${id || "?"} -> ${entry ? entry.status : "unknown"}`);
+          return void replyTo({ op: "receipt.result", id: id || null,
+            ...publicReceipt(entry), ...(enabled ? {} : { reason: "pi_receipts_disabled" }) });
+        }
+        if (op === "worker.health") {
+          // Experimental (opt-in HERDGATE_PI_WORKER=1): liveness for the owner — queue
+          // depth plus the last heartbeat written by the scheduler/worker experiment.
+          // Metadata only; read scope is enough; missing heartbeat is reported as null.
+          const enabled = process.env.HERDGATE_PI_WORKER === "1";
+          let queued = null;
+          let running = null;
+          let beat = null;
+          if (enabled) {
+            try { const depth = queueDepth(readJobs(jobsFile(workerBase()))); queued = depth.queued; running = depth.running; }
+            catch { /* unreadable queue -> null, fail closed */ }
+            beat = readHeartbeat(workerBase());
+          }
+          const age = beat ? Math.max(0, Math.round((Date.now() - beat.ts) / 1000)) : null;
+          log(`worker: ${m.device} health -> queued ${queued ?? "?"} running ${running ?? "?"} heartbeat ${beat ? `${age}s ago` : "none"}`);
+          return void replyTo({ op: "worker.health.result", enabled,
+            ...(enabled
+              ? { queued, running, heartbeat: beat ? { ts: beat.ts, source: beat.source, ageSeconds: age } : null }
+              : { reason: "pi_worker_disabled" }) });
+        }
+        if (op === "worker.submit" || op === "worker.status") {
+          // Experimental (opt-in HERDGATE_PI_WORKER=1): admission to the local Pi worker
+          // queue (plugin/server/pi-worker.mjs). The publisher never runs Pi itself — a
+          // separately started experiments/pi-worker drains the queue and journals receipts.
+          // worker.submit carries a prompt, so it is a control operation (act scope only).
+          const enabled = process.env.HERDGATE_PI_WORKER === "1";
+          const file = jobsFile(workerBase());
+          const id = typeof payload.id === "string" && JOB_ID.test(payload.id) ? payload.id : "";
+          if (op === "worker.status") {
+            let job = null;
+            if (enabled && id) {
+              try { job = readJobs(file).get(id) ?? null; } catch { job = null; }
+            }
+            log(`worker: ${m.device} status ${id || "?"} -> ${job ? job.state : "unknown"}`);
+            return void replyTo({ op: "worker.status.result", id: id || null, ...publicJob(job),
+              ...(enabled ? {} : { reason: "pi_worker_disabled" }) });
+          }
+          if (!enabled) {
+            return void replyTo({ op: "error", code: "pi_worker_disabled", message: "the Pi worker queue is not enabled on this host" });
+          }
+          if (devices.find(d => d.id === m.device)?.scope !== "act") {
+            return void replyTo({ op: "error", code: "requires-act", message: "worker.submit needs an act device" });
+          }
+          const prompt = typeof payload.prompt === "string" ? payload.prompt : "";
+          if (!prompt.trim() || prompt.length > MAX_PROMPT) {
+            return void replyTo({ op: "error", code: "bad-prompt", message: `worker.submit needs a prompt of 1..${MAX_PROMPT} chars` });
+          }
+          let jobs;
+          try { jobs = readJobs(file); }
+          catch (e) {
+            return void replyTo({ op: "error", code: "worker-queue", message: `queue unreadable: ${e instanceof Error ? e.message : String(e)}` });
+          }
+          const existing = id ? jobs.get(id) : undefined;
+          const settled = !existing && id ? findReceipt(receiptJournalBase(), id) : null;
+          if (existing || settled) {
+            const state = existing ? existing.state : String(settled?.status);
+            log(`worker: ${m.device} resubmitted ${id} -> ${state} (duplicate)`);
+            return void replyTo({ op: "worker.submitted", id, state, duplicate: true });
+          }
+          const pending = [...jobs.values()].filter(j => j.state === "queued" || j.state === "running").length;
+          if (pending >= MAX_PENDING) {
+            return void replyTo({ op: "error", code: "queue-full", message: `worker queue is full (${MAX_PENDING} pending)` });
+          }
+          const jobId = id || randomUUID();
+          try { appendJob(file, { v: 1, id: jobId, prompt, ts: Date.now(), state: "queued" }); }
+          catch (e) {
+            return void replyTo({ op: "error", code: "worker-queue", message: `queue append failed: ${e instanceof Error ? e.message : String(e)}` });
+          }
+          log(`worker: ${m.device} submitted ${jobId} (${prompt.length} chars)`);
+          return void replyTo({ op: "worker.submitted", id: jobId, state: "queued", duplicate: false });
+        }
         if (op === "view") {
           // Answer this device now, even if the view has not changed since the last push.
           lastSig = "";
@@ -392,9 +522,11 @@ async function publisherLoop() {
     const retry = (why) => {
       if (retried) return;
       retried = true;
+      lifecycle?.setConnected(false);
       if (timer) clearInterval(timer);
       timer = null;
       ssh.closeAll();
+      e2eSessions.clear();
       devices = [];
       const wait = Math.min(30_000, backoff) + Math.random() * 500;
       backoff *= 2;
@@ -404,6 +536,7 @@ async function publisherLoop() {
     ws.onclose = () => retry("disconnected");
     ws.onerror = () => retry("ws error");
   };
+  if (tuiOnly) for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, shutdown);
   connect();
   // Keep the child alive while the socket reconnects.
   setInterval(() => {}, 1 << 30);

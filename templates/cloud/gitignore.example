@@ -1,0 +1,4 @@
+/.env
+/data/
+/owner-token
+/node_modules/

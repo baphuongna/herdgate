@@ -1,0 +1,41 @@
+name: herdgate-cloud
+services:
+  gate:
+    build: .
+    user: "${HERDGATE_UID:-1000}:${HERDGATE_GID:-1000}"
+    environment:
+      HERDGATE_ACCOUNT_TOKEN_FILE: /run/secrets/herdgate-owner-token
+      HERDGATE_PUBLIC_HOST: "${HERDGATE_PUBLIC_HOST:?set the public hostname in .env}"
+      HERDGATE_PUBLIC_URL: "https://${HERDGATE_PUBLIC_HOST:?set the public hostname in .env}"
+      HERDGATE_SSH_HOST: "${HERDGATE_SSH_HOST:-}"
+      HERDGATE_SSH_PUBLIC_PORT: "${HERDGATE_SSH_PUBLIC_PORT:-2299}"
+      HERDGATE_ENABLE_PUSH: "${HERDGATE_ENABLE_PUSH:-0}"
+      HERDGATE_NO_PUSH: "${HERDGATE_NO_PUSH:-0}"
+      HERDGATE_PUSH_SUB: "${HERDGATE_PUSH_SUB:-mailto:owner@herdgate.invalid}"
+      HERDGATE_TRUSTED_PROXY: "${HERDGATE_TRUSTED_PROXY:-0}"
+      HERDGATE_REAL_IP_HEADER: "${HERDGATE_REAL_IP_HEADER:-CF-Connecting-IP}"
+      HERDGATE_SSH_TUNNELS_PER_IP: "${HERDGATE_SSH_TUNNELS_PER_IP:-6}"
+      HERDGATE_SSH_TUNNELS_TOTAL: "${HERDGATE_SSH_TUNNELS_TOTAL:-64}"
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./owner-token
+        target: /run/secrets/herdgate-owner-token
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:${HERDGATE_HTTP_PORT:-8787}:8787"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('node:http').get('http://127.0.0.1:8787/healthz', {headers: {Host: process.env.HERDGATE_PUBLIC_HOST}}, r => {r.resume(); if (r.statusCode !== 200) process.exitCode = 1}).on('error', () => { process.exitCode = 1 })"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped

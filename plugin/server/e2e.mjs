@@ -47,9 +47,13 @@ export function concat(...parts) {
   return out;
 }
 
-/** Short human-checkable fingerprint of a static public key (8 bytes, url-safe). */
-export function fingerprint(pub) {
+/** Legacy pin matching is used only to upgrade existing browser pins. */
+function legacyFingerprint(pub) {
   return b64e(pub.slice(0, 8)).replace(/[^A-Za-z0-9]/g, "").toLowerCase().slice(0, 12);
+}
+
+export async function fingerprint(pub) {
+  return "SHA256:" + b64e(await sha256(pub)).replace(/=+$/, "");
 }
 
 // ---- WebCrypto plumbing ----------------------------------------------------
@@ -90,31 +94,38 @@ export async function generateKeyPair() {
 class CipherState {
   k = null;
   n = 0;
+  #tail = Promise.resolve();
   setKey(k) {
     this.k = k;
   }
-  nonce() {
-    // 96-bit: 4 zero bytes ‖ BE64(n) — n stays below 2^32 for our lifetimes.
+  nonce(n) {
+    // 96-bit: 4 zero bytes ‖ BE64(n); sessions are bounded below 2^32.
     const iv = new Uint8Array(12);
-    new DataView(iv.buffer).setUint32(8, this.n);
+    new DataView(iv.buffer).setUint32(8, n);
     return iv;
   }
-  async encrypt(ad, plaintext) {
-    if (this.n >= 0xffffffff) throw new Error("e2e: nonce exhausted");
-    const key = await subtle.importKey("raw", this.k, "AES-GCM", false, ["encrypt"]);
-    const ct = new Uint8Array(
-      await subtle.encrypt({ name: "AES-GCM", iv: this.nonce(), additionalData: ad, tagLength: 128 }, key, plaintext),
-    );
-    this.n += 1;
-    return ct;
+  #enqueue(operation) {
+    const result = this.#tail.then(operation);
+    this.#tail = result.catch(() => {});
+    return result;
   }
-  async decrypt(ad, ciphertext) {
-    const key = await subtle.importKey("raw", this.k, "AES-GCM", false, ["decrypt"]);
-    const pt = new Uint8Array(
-      await subtle.decrypt({ name: "AES-GCM", iv: this.nonce(), additionalData: ad, tagLength: 128 }, key, ciphertext),
-    );
-    this.n += 1;
-    return pt;
+  encrypt(ad, plaintext) {
+    return this.#enqueue(async () => {
+      if (this.n >= 0xffffffff) throw new Error("e2e: nonce exhausted");
+      const n = this.n++;
+      const key = await subtle.importKey("raw", this.k, "AES-GCM", false, ["encrypt"]);
+      const ct = new Uint8Array(await subtle.encrypt({ name: "AES-GCM", iv: this.nonce(n), additionalData: ad, tagLength: 128 }, key, plaintext));
+      return { ct, n };
+    });
+  }
+  decrypt(ad, ciphertext, n) {
+    return this.#enqueue(async () => {
+      if (this.n >= 0xffffffff || (n !== undefined && n !== this.n)) throw new Error("e2e: invalid nonce counter");
+      const key = await subtle.importKey("raw", this.k, "AES-GCM", false, ["decrypt"]);
+      const pt = new Uint8Array(await subtle.decrypt({ name: "AES-GCM", iv: this.nonce(this.n), additionalData: ad, tagLength: 128 }, key, ciphertext));
+      this.n += 1;
+      return pt;
+    });
   }
 }
 
@@ -151,7 +162,7 @@ class Handshake {
   }
   /** The `s` token: transport under the current key, else in the clear (ENC0). */
   async writeTokenStatic(pubRaw) {
-    const out = this.cs.k ? await this.cs.encrypt(this.h, pubRaw) : pubRaw;
+    const out = this.cs.k ? (await this.cs.encrypt(this.h, pubRaw)).ct : pubRaw;
     await this.mixHash(out);
     return out;
   }
@@ -189,14 +200,18 @@ export class DeviceChannel {
     return { e: b64e(this.#e.pub) };
   }
   /** Feed the host's `{op:"e2e.reply", e, c}`; returns the msg3 payload. */
-  async acceptReply(msg) {
+  async acceptReply(msg, expectedHost = null) {
     const eHost = b64d(msg.e);
     if (eHost.length !== PUB_LEN) throw new Error("e2e: bad host ephemeral");
     await this.#hs.mixHash(eHost);
     await this.#hs.mixKey(await dh(this.#e.jwk, eHost)); // ee
     const sHost = await this.#hs.readTokenStatic(b64d(msg.c)); // s
     if (sHost.length !== PUB_LEN) throw new Error("e2e: bad host static");
-    this.hostFingerprint = fingerprint(sHost);
+    const fp = await fingerprint(sHost);
+    if (expectedHost && expectedHost !== fp && (expectedHost.startsWith("SHA256:") || expectedHost !== legacyFingerprint(sHost))) {
+      throw Object.assign(new Error("e2e: host key changed"), { code: "host-key-changed" });
+    }
+    this.hostFingerprint = fp;
     await this.#hs.mixKey(await dh(this.#e.jwk, sHost)); // es (e_dev × s_host)
     const c = await this.#hs.writeTokenStatic(this.#self.pub); // s_dev
     await this.#hs.mixKey(await dh(this.#self.jwk, eHost)); // se (e_host × s_dev)
@@ -210,12 +225,11 @@ export class DeviceChannel {
     return Boolean(this.sendCs && this.recvCs);
   }
   async send(obj) {
-    const ct = await this.sendCs.encrypt(this.#hs.h, utf8e(JSON.stringify(obj)));
-    return { op: "e2e", n: this.sendCs.n - 1, c: b64e(ct) };
+    const { ct, n } = await this.sendCs.encrypt(this.#hs.h, utf8e(JSON.stringify(obj)));
+    return { op: "e2e", n, c: b64e(ct) };
   }
   async recv(msg) {
-    const pt = await this.recvCs.decrypt(this.#hs.h, b64d(msg.c));
-    return JSON.parse(utf8d(pt));
+    return receive(this.recvCs, this.#hs.h, msg);
   }
 }
 
@@ -247,7 +261,7 @@ export class HostChannel {
   async acceptFinish(msg) {
     const sDev = await this.#hs.readTokenStatic(b64d(msg.c)); // s_dev
     if (sDev.length !== PUB_LEN) throw new Error("e2e: bad device static");
-    this.deviceFingerprint = fingerprint(sDev);
+    this.deviceFingerprint = await fingerprint(sDev);
     await this.#hs.mixKey(await dh(this.#e.jwk, sDev)); // se (e_host × s_dev)
     const [c1, c2] = await this.#hs.split();
     this.recvCs = c1; // device → host (c1 encrypts initiator→responder)
@@ -258,11 +272,16 @@ export class HostChannel {
     return Boolean(this.sendCs && this.recvCs);
   }
   async send(obj) {
-    const ct = await this.sendCs.encrypt(this.#hs.h, utf8e(JSON.stringify(obj)));
-    return { op: "e2e", n: this.sendCs.n - 1, c: b64e(ct) };
+    const { ct, n } = await this.sendCs.encrypt(this.#hs.h, utf8e(JSON.stringify(obj)));
+    return { op: "e2e", n, c: b64e(ct) };
   }
   async recv(msg) {
-    const pt = await this.recvCs.decrypt(this.#hs.h, b64d(msg.c));
-    return JSON.parse(utf8d(pt));
+    return receive(this.recvCs, this.#hs.h, msg);
   }
+}
+
+async function receive(cipher, handshakeHash, msg) {
+  if (!Number.isInteger(msg.n) || msg.n < 0 || msg.n >= 0xffffffff) throw new Error("e2e: invalid nonce counter");
+  const plaintext = await cipher.decrypt(handshakeHash, b64d(msg.c), msg.n);
+  return JSON.parse(utf8d(plaintext));
 }

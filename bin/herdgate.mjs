@@ -5,25 +5,54 @@
 //
 // Installs the herdr-app mod and the publisher into the app's home, and
 // prefills the panel's settings so the only thing left is Pair → Publish.
-import { cpSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { cpSync, mkdirSync, writeFileSync, existsSync, readFileSync, realpathSync, rmdirSync } from "node:fs";
+import { join, dirname, basename } from "node:path";
 import { homedir, hostname } from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { manageCloud, resolveCloud } from "./cloud-config.mjs";
+import { trySyncPiSkills } from "./pi-skills.mjs";
+import { readConfig } from "../plugin/server/common.mjs";
+import { withLatest } from "../windows/npm-update.mjs";
+import { windowsNode } from "../windows/node-runtime.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url)); // <pkg>/bin
 const ROOT = dirname(HERE); // <pkg>
 
 const help = `herdgate — every machine, one herd
 
+  herdgate install [--no-path]        Install the persistent Windows command (no publisher restart).
+  herdgate pi-skills                   Sync the bundled skills into your Pi profile.
+  herdgate cloud add <name> <https-url>
+  herdgate cloud list
+  herdgate cloud serve                Run a self-hosted Gate from the full npm package (uses HERDGATE_* env).
+  herdgate pair --cloud <name>       Pair this machine with owner approval.
+  herdgate setup [--cloud <name>] [--mobile-act <device-id>]
+                                    Install/configure the publisher for this OS.
+  herdgate migrate [--mobile-act <device-id> | --plain]
+      Adopt an existing publisher without changing its cloud or pairing.
+  herdgate start | stop | status | update
+      Manage the publisher. Update fetches the latest npm release.
+
+  Compatibility commands:
   herdgate setup-host [--cloud <url>] [--name <machine-name>] [--app-home <dir>]
       Install the herdr-app mod + publisher and prefill the panel settings.
-      --cloud     your gate, e.g. https://gate.phuongnb.io.vn   (required)
+      --cloud     your gate, e.g. https://gate.example.com      (required)
       --name      how this machine shows up on the phone        (default: hostname)
       --app-home  herdr-app home (default: the platform's usual one)
       --no-integrate  skip the tab-bar panel integration (pane.split still works)
 
-Everything else lives in the app's herdgate panel: Pair, then Publish.`;
+  herdgate install-tui
+      Install or update the per-user Windows TUI publisher. Does not start it.
+  herdgate tui setup [path-to-herdr.exe] [--mobile-tui d_read | --mobile-tui-act d_act | --hc <exe>]
+      Install, start and save the selected publisher mode (existing pairing required).
+  herdgate tui update
+      Install this npm version and restart only the publisher, preserving its mode.
+  herdgate tui start [path-to-herdr.exe]
+  herdgate tui status | stop | version | versions | use <release-id>
+      Manage the installed publisher without adding it to PATH.
+  herdgate home-tui setup [--adopt] | status | restart | stop
+      Manage the Linux TUI publisher as a systemd user service.`;
 
 function arg(name, fallback = undefined) {
   const i = process.argv.indexOf(`--${name}`);
@@ -40,11 +69,8 @@ function appHome() {
 }
 
 function setupHost() {
-  const cloud = arg("cloud");
-  if (!cloud) {
-    console.error(help);
-    process.exit(1);
-  }
+  const cloud = resolveCloud(arg("cloud"));
+  checkCloud(cloud);
   const home = appHome();
   const name = arg("name") ?? hostname();
 
@@ -238,9 +264,127 @@ function integrate(home) {
   console.log("           the shipped layout `main` stays untouched (layout.switch main goes back).");
 }
 
-const cmd = process.argv[2];
-if (cmd === "setup-host") setupHost();
-else {
-  console.log(help);
-  process.exit(cmd === "help" || cmd === "--help" ? 0 : 1);
+function runNode(file, args, env = process.env) {
+  const child = spawnSync(process.execPath, [file, ...args], { env, stdio: "inherit", shell: false, windowsHide: true });
+  if (child.error) throw child.error;
+  process.exitCode = child.status ?? 1;
+}
+
+function runInstalledTui(args, useSavedProfile = false) {
+  if (!process.env.LOCALAPPDATA) throw new Error("the TUI publisher CLI is for Windows (%LOCALAPPDATA% is unset)");
+  const root = join(process.env.LOCALAPPDATA, "Herdgate", "cli");
+  const current = join(root, "current");
+  if (!existsSync(current)) throw new Error("run herdgate install-tui first");
+  const release = realpathSync(current);
+  const releases = realpathSync(join(root, "releases"));
+  const key = (p) => process.platform === "win32" ? p.toLowerCase() : p;
+  if (!/^tui-[a-f0-9]{16}$/.test(basename(release)) || key(dirname(release)) !== key(releases)) {
+    throw new Error("current does not point to an installed release; rerun install-tui");
+  }
+  runNode(join(release, "windows", useSavedProfile ? "setup-tui.mjs" : "cli.mjs"), args);
+}
+
+function pairedConfig() {
+  const base = join(appHome(), "herdgate");
+  const config = join(base, "config");
+  return { base, config, current: readConfig(join(config, "herdgate.env")) };
+}
+function checkCloud(origin) {
+  const { current } = pairedConfig();
+  if (current.HERDGATE_ROOM_TOKEN && origin && resolveCloud(current.HERDGATE_URL) !== origin) {
+    throw new Error("this machine is already paired to another cloud; adding a cloud does not move a pairing");
+  }
+  return Boolean(current.HERDGATE_ROOM_TOKEN);
+}
+function cloudOption(args) {
+  const out = [...args];
+  const i = out.indexOf("--cloud");
+  if (i < 0) return { options: out };
+  const value = out[i + 1];
+  if (!value || value.startsWith("--")) throw new Error("--cloud requires a configured name or HTTPS URL");
+  out.splice(i, 2);
+  if (out.includes("--cloud")) throw new Error("only one --cloud value is allowed");
+  return { options: out, origin: resolveCloud(value) };
+}
+function pairHost(args) {
+  const { options, origin } = cloudOption(args);
+  if (!origin || options.length) throw new Error("usage: herdgate pair --cloud <name>");
+  const { base, config } = pairedConfig();
+  mkdirSync(config, { recursive: true, mode: 0o700 });
+  const lock = join(config, ".pairing");
+  mkdirSync(lock);
+  try {
+    if (checkCloud(origin)) { console.log("herdgate: already paired to this cloud"); return; }
+    // Pairing is explicit and still needs approval; the room token stays in host config.
+    runNode(join(ROOT, "plugin", "server", "index.mjs"), ["pair"], {
+      ...process.env, HERDGATE_URL: origin,
+      HERDR_PLUGIN_CONFIG_DIR: config, HERDR_PLUGIN_STATE_DIR: join(base, "state"),
+    });
+  } finally { rmdirSync(lock); }
+}
+function managePublisher(cmd, args) {
+  const { origin, options } = cloudOption(args);
+  if (!["setup", "migrate"].includes(cmd) && origin) throw new Error("--cloud is only used with setup, migrate or pair");
+  if (["setup", "migrate"].includes(cmd) && !checkCloud(origin)) {
+    throw new Error("this machine is not paired; run herdgate pair --cloud <name> first");
+  }
+  const win = process.platform === "win32";
+  if (!win && process.platform !== "linux") throw new Error("publisher management requires Windows or Linux with systemd");
+  if (cmd === "update") {
+    if (options.length) throw new Error("usage: herdgate update");
+    return withLatest((pkg) => runNode(join(pkg, "bin", "herdgate.mjs"), win ? ["tui", "update"] : ["home-tui", "setup"]));
+  }
+  if (win) {
+    const flags = options.map(flag => flag === "--mobile-act" ? "--mobile-tui-act" : flag === "--mobile-read" ? "--mobile-tui" : flag);
+    if (cmd === "setup" || cmd === "migrate") return runNode(join(ROOT, "windows", "setup-tui.mjs"), [cmd, ...flags]);
+    // Starting must not reinstall an older globally installed npm package.
+    if (cmd === "start") return runInstalledTui(["setup", ...flags], true);
+    return runInstalledTui([cmd, ...flags]);
+  }
+  if (cmd === "migrate") {
+    if (options.length) throw new Error("usage: herdgate migrate [--cloud <name>]");
+    return runNode(join(HERE, "home-tui.mjs"), ["setup", "--adopt"]);
+  }
+  return runNode(join(HERE, "home-tui.mjs"), [cmd, ...options]);
+}
+
+const [cmd, ...args] = process.argv.slice(2);
+try {
+  if (cmd === "setup-host") {
+    setupHost();
+    trySyncPiSkills();
+  } else if (cmd === "pi-skills" && !args.length) trySyncPiSkills();
+  else if (cmd === "cloud" && args.length === 1 && args[0] === "serve") {
+    const entry = join(ROOT, "src", "cloud", "main.ts");
+    if (!existsSync(entry)) throw new Error("cloud serve requires the full npm package; use the Cloud archive for Docker or systemd");
+    runNode(entry, []);
+  } else if (cmd === "cloud") manageCloud(args);
+  else if (cmd === "pair") pairHost(args);
+  else if (process.platform === "win32" && (
+    ["install", "setup", "migrate", "start", "update", "install-tui"].includes(cmd) ||
+    (cmd === "tui" && ["setup", "migrate", "start", "update"].includes(args[0]))
+  ) && (Number(process.versions.node.split(".")[0]) < 22 || typeof globalThis.WebSocket !== "function")) {
+    const node = windowsNode();
+    const r = spawnSync(node, [fileURLToPath(import.meta.url), cmd, ...args], { stdio: "inherit", shell: false, windowsHide: true });
+    if (r.error) throw r.error;
+    process.exitCode = r.status ?? 1;
+  } else if (["setup", "migrate", "start", "stop", "status", "update"].includes(cmd)) managePublisher(cmd, args);
+  else if (cmd === "home-tui") runNode(join(HERE, "home-tui.mjs"), args);
+  else if (cmd === "install") {
+    if (args.length && !(args.length === 1 && args[0] === "--no-path") && !(args.length === 2 && args[0] === "--root" && args[1])) {
+      throw new Error("usage: herdgate install [--no-path | --root <dir>]");
+    }
+    runNode(join(ROOT, "windows", "install-cli.mjs"), ["--command", ...args]);
+  }
+  else if (cmd === "install-tui") runNode(join(ROOT, "windows", "install-cli.mjs"), args);
+  else if (cmd === "tui") {
+    if (["setup", "migrate", "update"].includes(args[0])) runNode(join(ROOT, "windows", "setup-tui.mjs"), args);
+    else runInstalledTui(args);
+  } else {
+    console.log(help);
+    process.exitCode = !cmd || cmd === "help" || cmd === "--help" ? 0 : 1;
+  }
+} catch (e) {
+  console.error(`herdgate: ${e instanceof Error ? e.message : String(e)}`);
+  process.exitCode = 1;
 }

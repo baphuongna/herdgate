@@ -1,6 +1,6 @@
 {
   "name": "@bom0792/herdgate",
-  "version": "0.9.20",
+  "version": "0.9.34",
   "description": "Cloud relay hub for herdr-core: every machine dials out, phones and browsers follow (PWA + SSH leg, E2E payloads).",
   "type": "module",
   "engines": {
@@ -12,8 +12,12 @@
     "edge": "node src/dev/main.ts",
     "test": "node --test test/*.test.ts",
     "check": "tsc -p tsconfig.json",
+    "build:cloud": "tsc -p tsconfig.cloud.json",
+    "build:release": "bash scripts/build-release.sh",
     "ssh-bridge": "node src/cloud/ssh-bridge.ts",
-    "postinstall": "node scripts/patch-ssh2.mjs"
+    "ssh-tcp-edge": "node src/cloud/ssh-tcp-edge.ts",
+    "mobile-tui": "node src/host/mobile-tui.ts",
+    "postinstall": "node scripts/patch-ssh2.mjs && node scripts/install-pi-skills.mjs"
   },
   "dependencies": {
     "ssh2": "^1.17.0",
@@ -29,12 +33,42 @@
     "herdgate": "bin/herdgate.mjs"
   },
   "files": [
-    "bin",
-    "src",
-    "app-mod",
-    "plugin",
-    "scripts",
+    "bin/*.mjs",
+    ".agents/skills/herdr*/SKILL.md",
+    ".agents/skills/herdr/herdr_pi.py",
+    ".agents/skills/herdr/profiles.example.toml",
+    "src/**/*.ts",
+    "src/host/*.mjs",
+    "src/web/index.html",
+    "src/web/*.css",
+    "src/web/*.js",
+    "src/web/app.webmanifest",
+    "src/web/icons/icon.svg",
+    "src/web/icons/icon-192.png",
+    "src/web/icons/icon-512.png",
+    "app-mod/herdgate/main.js",
+    "app-mod/herdgate/mod.json",
+    "app-mod/herdgate/herdgate.svg",
+    "plugin/herdr-plugin.toml",
+    "plugin/server/*.mjs",
+    "plugin/server/*.d.mts",
+    "scripts/*.mjs",
+    "scripts/*.sh",
+    "DEPLOY.md",
+    "DESIGN.md",
     "dist-readme.md",
-    "templates"
+    "templates/herdgate-via.mjs",
+    "templates/herdgate-tcp-edge.service",
+    "templates/cloud/Caddyfile.example",
+    "templates/cloud/Dockerfile",
+    "templates/cloud/.dockerignore",
+    "templates/cloud/gitignore.example",
+    "templates/cloud/README.md",
+    "templates/cloud/compose.env.example",
+    "templates/cloud/compose.yml",
+    "templates/cloud/*.service",
+    "tsconfig.json",
+    "tsconfig.cloud.json",
+    "windows/*.mjs"
   ]
 }

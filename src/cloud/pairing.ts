@@ -33,14 +33,19 @@ export class AgentCodes {
   readonly #entries: Entry[] = [];
   readonly #now: () => number;
   readonly #publicUrl: string | null;
+  readonly #maxPending: number;
 
-  constructor(now: () => number = Date.now, publicUrl: string | null = null) {
+  constructor(now: () => number = Date.now, publicUrl: string | null = null, maxPending = 256) {
     this.#now = now;
     this.#publicUrl = publicUrl;
+    this.#maxPending = Math.max(1, maxPending);
   }
 
-  mint(hostName: string): MintedCode {
+  mint(hostName: string): MintedCode | null {
     this.#prune();
+    // A bounded inventory: an unauthenticated mint loop must not grow memory
+    // without limit (audit pairing:unbounded-code-mint).
+    if (this.#entries.length >= this.#maxPending) return null;
     const e: Entry = { code: randomCode(8), hostName, expires: this.#now() + AGENT_CODE_TTL_MS, approved: false, roomToken: null, roomId: null };
     this.#entries.push(e);
     return { code: e.code, url: this.#publicUrl ? `${this.#publicUrl.replace(/\/$/, "")}/pair?code=${e.code}` : e.code, expiresIn: AGENT_CODE_TTL_MS / 1000 };

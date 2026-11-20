@@ -17,10 +17,9 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
-import { Duplex, type Stream } from "node:stream";
-import { WebSocketServer, type WebSocket } from "ws";
+import { isIP } from "node:net";
+import { Duplex } from "node:stream";
+import { WebSocket, WebSocketServer } from "ws";
 import {
   decode,
   encode,
@@ -39,7 +38,8 @@ import { type Account, type DeviceRecord, type RoomRecord, State } from "./store
 import { readJsonBody, randomId, sameSecret, sha256Hex } from "./util.ts";
 import { serveStatic } from "./static.ts";
 import { startSshd, type SshHandle, type SshConfig } from "./sshd.ts";
-import { endpointTag, vapidHeader, type VapidKeys } from "./vapid.ts";
+import { pushEndpoint, sendWake } from "./push.ts";
+import { type VapidKeys } from "./vapid.ts";
 
 export interface CloudConfig {
   accounts: { id: string; name: string; token: string }[];
@@ -53,25 +53,39 @@ export interface CloudConfig {
   publicUrl?: string | null;
   /** Directory of the PWA (src/web). Served on `/`; omit to serve no UI. */
   webRoot?: string;
-  /** The SSH leg phones dial. `port: 0` disables. */
+  /** The SSH leg; omit to disable, or set `port: 0` for an ephemeral listener. */
   ssh?: SshConfig;
-  /** The hostname phones should dial for the SSH leg (e.g. an AAAA/DNS-only name). */
+  /** Public address advertised to clients, when an edge maps a different port. */
   sshHost?: string;
+  sshPublicPort?: number;
   /** VAPID keys for silent wake pushes; omit to disable the push endpoints. */
   push?: { keys: VapidKeys; /** mailto contact required by the VAPID spec. */ sub: string } | null;
+  /**
+   * Trust a reverse-proxy header (e.g. CF-Connecting-IP) as the client address for
+   * abuse limits. Without it, loopback connections (a same-host proxy such as
+   * cloudflared) get a per-connection budget so one abusive client can never lock
+   * out everyone behind the proxy.
+   */
+  trustedProxy?: boolean;
+  /** Header name read in trusted-proxy mode; default CF-Connecting-IP. */
+  realIpHeader?: string;
+  /** SSH-over-WSS budget. Defaults: 6 per client, 64 total. Raw-TCP edges cannot
+   * convey real client addresses, so size these for the shared edge address. */
+  sshTunnelLimits?: { perKey?: number; total?: number };
+  /** Cap on concurrently pending pairing codes; default 256. */
+  maxPendingCodes?: number;
+  heartbeatMs?: number;
   log?: (line: string) => void;
 }
 
 interface AgentConn {
   ws: WebSocket;
   room: RoomRecord;
-  alive: boolean;
 }
 interface DeviceConn {
   ws: WebSocket;
   account: Account;
   device: DeviceRecord | null;
-  alive: boolean;
   /** True when this socket authenticated with a device secret, not the account token. */
   viaDeviceSecret: boolean;
 }
@@ -87,12 +101,15 @@ export interface Cloud {
 export function startCloud(cfg: CloudConfig): Promise<Cloud> {
   const log = cfg.log ?? (() => {});
   const state = new State(cfg.accounts, cfg.statePath);
-  const codes = new AgentCodes(Date.now, cfg.publicUrl ?? null);
+  const codes = new AgentCodes(Date.now, cfg.publicUrl ?? null, cfg.maxPendingCodes ?? 256);
   let sshd: SshHandle | null = null;
 
   const agentByRoom = new Map<string, AgentConn>(); // roomId → conn
   const deviceConns = new Set<DeviceConn>();
-  const pendingPairs = new Map<string, (ok: boolean) => void>(); // requestId → resolve
+  const pendingPairs = new Map<string, { host: WebSocket; owner: WebSocket; finish: (ok: boolean, reason?: string) => void }>();
+  const cancelPairs = (ws: WebSocket, side: "host" | "owner", reason?: string): void => {
+    for (const pair of pendingPairs.values()) if (pair[side] === ws) pair.finish(false, reason);
+  };
 
   // ---- SSH bridges: a reachable front door for the SSH leg --------------------
   // A bridge runs on any host with an open port (e.g. a tiny VPS), dials the cloud
@@ -141,6 +158,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     msg: Record<string, unknown>;
     bytes: number;
     at: number;
+    device?: string;
   }
   interface RoomStream {
     gen: string;
@@ -159,42 +177,17 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     }
     return s;
   };
-  /** Silent wake push to a device's stored endpoint (VAPID, no payload). */
+  const pendingWakes = new Set<string>();
   const wakeDevice = (deviceId: string): void => {
     const push = cfg.push;
-    const endpoint = state.deviceById(deviceId)?.push?.endpoint;
-    if (!push || !endpoint) return;
-    try {
-      const u = new URL(endpoint);
-      const send = u.protocol === "https:" ? httpsRequest : httpRequest;
-      const req = send(
-        {
-          protocol: u.protocol,
-          hostname: u.hostname,
-          port: u.port || (u.protocol === "https:" ? 443 : 80),
-          path: `${u.pathname}${u.search}`,
-          method: "POST",
-          headers: {
-            TTL: "60",
-            Urgency: "normal",
-            "content-length": "0",
-            Authorization: vapidHeader(endpoint, push.keys, push.sub),
-          },
-        },
-        (res) => {
-          res.resume();
-          if (res.statusCode && res.statusCode >= 400) log(`push: wake ${endpointTag(endpoint)} answered ${res.statusCode}`);
-        },
-      );
-      req.on("error", (e) => log(`push: wake ${endpointTag(endpoint)} failed (${e instanceof Error ? e.message : String(e)})`));
-      req.end();
-    } catch (e) {
-      // A bad endpoint must never take the gateway down.
-      log(`push: wake ${endpointTag(endpoint)} failed (${e instanceof Error ? e.message : String(e)})`);
-    }
+    const endpoint = pushEndpoint(state.deviceById(deviceId)?.push?.endpoint ?? "");
+    if (!push || !endpoint || pendingWakes.has(deviceId) || pendingWakes.size >= 8) return;
+    pendingWakes.add(deviceId);
+    void sendWake(endpoint, push.keys, push.sub).catch(() => log("push: wake failed"))
+      .finally(() => pendingWakes.delete(deviceId));
   };
 
-  const streamEmit = (roomId: string, msg: Record<string, unknown>): void => {
+  const streamEmit = (roomId: string, msg: Record<string, unknown>, device?: string): void => {
     const s = streamOf(roomId);
     s.seq += 1;
     const stamped = { ...msg, seq: s.seq };
@@ -213,45 +206,69 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       if (s.seq > s.evictedUpTo) s.evictedUpTo = s.seq;
     } else {
       while (s.bytes + bytes > STREAM_MAX_BYTES) evict();
-      s.buf.push({ seq: s.seq, msg: stamped, bytes, at });
+      s.buf.push({ seq: s.seq, msg: stamped, bytes, at, device });
       s.bytes += bytes;
     }
     for (const c of deviceConns) {
-      if (c.device?.roomId !== roomId) continue;
-      try {
-        c.ws.send(text);
-      } catch {
-        /* closing */
-      }
+      if (c.device?.roomId !== roomId || (device !== undefined && c.device.id !== device)) continue;
+      sendText(c.ws, text);
     }
   };
 
-  // ---- rate limiting: failed hellos per IP ----
-  const fails = new Map<string, { n: number; until: number }>();
-  const ipOf = (req: IncomingMessage): string => req.socket.remoteAddress ?? "?";
-  const strike = (ip: string): void => {
-    const f = fails.get(ip) ?? { n: 0, until: 0 };
+  // ---- rate limiting: failed hellos per client ----
+  // The key is the client address, with two guards against a shared-address
+  // collapse (audit gateway:shared-address-ip-controls): loopback connections
+  // (a same-host proxy like cloudflared) always get a per-connection key, and a
+  // trusted-proxy header restores real per-client keys behind an edge.
+  const fails = new Map<string, { n: number; until: number; at: number }>();
+  const FAILS_MAX = 4_096;
+  const loopbackOf = (addr: string): boolean => addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
+  const clientKeyOf = (req: IncomingMessage): string => {
+    const addr = req.socket.remoteAddress ?? "?";
+    if (cfg.trustedProxy) {
+      const raw = cfg.realIpHeader ? req.headers[cfg.realIpHeader.toLowerCase()] : undefined;
+      const value = (Array.isArray(raw) ? raw[0] : raw) ?? "";
+      const ip = String(value).trim();
+      if (ip && !ip.includes(",") && isIP(ip) !== 0) return ip;
+      return `${addr}#${randomId("k")}`; // no usable header: never share a budget
+    }
+    if (loopbackOf(addr)) return `${addr}#${randomId("k")}`;
+    return addr;
+  };
+  const pruneFails = (): void => {
+    if (fails.size <= FAILS_MAX) return;
+    const now = Date.now();
+    for (const [k, f] of fails) if (now - f.at > 60_000) fails.delete(k);
+    if (fails.size > FAILS_MAX) fails.clear();
+  };
+  const strike = (key: string): void => {
+    pruneFails();
+    const f = fails.get(key) ?? { n: 0, until: 0, at: Date.now() };
     f.n += 1;
+    f.at = Date.now();
     if (f.n >= 5) {
       f.until = Date.now() + 60_000;
       f.n = 0;
     }
-    fails.set(ip, f);
+    fails.set(key, f);
   };
-  const blocked = (ip: string): boolean => {
-    const f = fails.get(ip);
+  const blocked = (key: string): boolean => {
+    const f = fails.get(key);
     return !!f && f.until > Date.now();
   };
 
-  const send = (ws: WebSocket, msg: Record<string, unknown>): void => {
-    if (ws.readyState === ws.OPEN) {
-      try {
-        ws.send(encode(msg));
-      } catch {
-        /* closing */
-      }
-    }
+  // Per-client pairing-code mint rate (audit pairing:unbounded-code-mint).
+  const MINT_PER_KEY = 10;
+  const MINT_WINDOW_MS = 10 * 60_000;
+  const mints = new Map<string, { n: number; until: number; at: number }>();
+
+  const sendText = (ws: WebSocket, text: string | Buffer): void => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const size = typeof text === "string" ? Buffer.byteLength(text) : text.length;
+    if (ws.bufferedAmount + size > 1024 * 1024) return ws.terminate();
+    try { ws.send(text); } catch { ws.terminate(); }
   };
+  const send = (ws: WebSocket, msg: Record<string, unknown>): void => sendText(ws, encode(msg));
   const fail = (ws: WebSocket, code: string, message: string): void => send(ws, { t: "error", code, message });
 
   // ---- registry helpers ----
@@ -282,16 +299,16 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
   // ---- WebSocket plumbing ----
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
 
-  const keepAlive = (getAlive: () => boolean, ws: WebSocket): NodeJS.Timeout => {
+  const keepAlive = (ws: WebSocket): void => {
+    let alive = true;
+    ws.on("pong", () => { alive = true; });
     const iv = setInterval(() => {
-      if (!getAlive()) {
-        ws.terminate();
-        return;
-      }
-      ws.ping();
-    }, 30_000);
+      if (!alive) return ws.terminate();
+      alive = false;
+      if (ws.readyState === WebSocket.OPEN) ws.ping();
+    }, cfg.heartbeatMs ?? 8_000);
     iv.unref?.();
-    return iv;
+    ws.once("close", () => clearInterval(iv));
   };
 
   /** Token bucket: returns false when over the rate (the caller closes 1008). */
@@ -309,17 +326,19 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
   };
 
   const upgrade = (req: IncomingMessage, socket: import("node:stream").Duplex, head: Buffer, leg: "agent" | "device" | "bridge" | "ssh-ws"): void => {
-    const ip = ipOf(req);
-    if (blocked(ip)) {
+    const key = clientKeyOf(req);
+    if (blocked(key)) {
       socket.write("HTTP/1.1 429 Too Many Requests\r\n\r\n");
       socket.destroy();
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      if (leg === "agent") attachAgent(ws, ip);
-      else if (leg === "bridge") attachBridge(ws, ip);
-      else if (leg === "ssh-ws") attachSshTunnel(ws, ip);
-      else attachDevice(ws, ip);
+      // ws emits receiver errors on the connection, including before its app hello.
+      ws.on("error", () => ws.terminate());
+      if (leg === "agent") attachAgent(ws, key);
+      else if (leg === "bridge") attachBridge(ws, key);
+      else if (leg === "ssh-ws") attachSshTunnel(ws, key);
+      else attachDevice(ws, key);
     });
   };
 
@@ -330,11 +349,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     const helloTimer = setTimeout(() => {
       if (!done) ws.close(4001, "hello timeout");
     }, HELLO_TIMEOUT_MS);
-    const iv = keepAlive(() => conn?.alive ?? true, ws);
-
-    ws.on("pong", () => {
-      if (conn) conn.alive = true;
-    });
+    keepAlive(ws);
     ws.on("message", (data, isBinary) => {
       if (isBinary) return ws.close(1003, "text only");
       // Size is enforced by `maxPayload` on the server; decode still guards shape.
@@ -356,10 +371,11 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         clearTimeout(helloTimer);
         const old = agentByRoom.get(room.id);
         if (old) {
+          cancelPairs(old.ws, "host", "host reconnected; try Pair again");
           send(old.ws, { t: "error", code: "superseded", message: "another connection took this room" });
           old.ws.close(4000, "superseded");
         }
-        conn = { ws, room, alive: true };
+        conn = { ws, room };
         agentByRoom.set(room.id, conn);
         log(`agent ${room.id} (${room.name}) connected`);
         send(ws, { t: "hello", roomId: room.id, roomName: room.name, devices: deviceViews(room.id), resumed: false });
@@ -368,6 +384,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       }
 
       const room = conn.room;
+      if (agentByRoom.get(room.id)?.ws !== ws) return;
       switch (m.t) {
         case "frame": {
           const device = typeof m.device === "string" ? m.device : null;
@@ -377,20 +394,17 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
           // Host→device ssh.* frames also feed the sshd, which writes them into the
           // phone's SSH channel; the payload stays opaque to this layer either way.
           if (isSsh) {
-            sshd?.onHostFrame(device, payload as Record<string, unknown>);
+            if (state.deviceById(device)?.roomId !== room.id) return;
+            if (sshd?.onHostFrame(device, payload as Record<string, unknown>)) return;
             // Ephemeral: raw, unstamped, never buffered (see room streams above).
             const text = encode({ t: "frame", payload });
             for (const c of deviceConns) {
-              if (c.device?.id !== device) continue;
-              try {
-                c.ws.send(text);
-              } catch {
-                /* closing */
-              }
+              if (c.device?.id === device) sendText(c.ws, text);
             }
             return;
           }
-          streamEmit(room.id, { t: "frame", payload });
+          if (state.deviceById(device)?.roomId !== room.id) return;
+          streamEmit(room.id, { t: "frame", payload }, device);
           return;
         }
         case "presence": {
@@ -399,10 +413,9 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         }
         case "pair.response": {
           const requestId = typeof m.requestId === "string" ? m.requestId : null;
-          const resolve = requestId ? pendingPairs.get(requestId) : null;
-          if (!requestId || !resolve) return fail(ws, "bad-message", "unknown requestId");
-          pendingPairs.delete(requestId);
-          resolve(m.ok === true);
+          const pair = requestId ? pendingPairs.get(requestId) : null;
+          if (!pair || pair.host !== ws) return fail(ws, "bad-message", "unknown requestId");
+          pair.finish(m.ok === true);
           return;
         }
         case "wake": {
@@ -425,7 +438,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     });
     ws.on("close", () => {
       clearTimeout(helloTimer);
-      clearInterval(iv);
+      cancelPairs(ws, "host", "host disconnected; try Pair again once it is online");
       if (conn && agentByRoom.get(conn.room.id)?.ws === ws) {
         agentByRoom.delete(conn.room.id);
         log(`agent ${conn.room.id} disconnected`);
@@ -448,10 +461,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     const helloTimer = setTimeout(() => {
       if (!done) ws.close(4001, "hello timeout");
     }, HELLO_TIMEOUT_MS);
-    const iv = keepAlive(() => conn !== null, ws);
-    ws.on("pong", () => {
-      /* conn presence is the liveness marker for bridges */
-    });
+    keepAlive(ws);
 
     ws.on("message", (data, isBinary) => {
       if (isBinary) return ws.close(1003, "text only");
@@ -527,7 +537,6 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
 
     ws.on("close", () => {
       clearTimeout(helloTimer);
-      clearInterval(iv);
       for (const sock of sessions.values()) sock.destroy();
       sessions.clear();
       if (conn && bridges.has(conn)) {
@@ -542,49 +551,48 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
    * into the sshd via `inject`. For clients whose network cannot reach the TCP
    * leg (IPv4-only vs an AAAA-only host) — the tunnel rides port 443 like the
    * web app. No pre-auth: the SSH protocol itself authenticates (device id +
-   * publickey/password) and the sshd's strike map keys on the socket's address —
-   * which, behind a CDN, is the edge IP; documented, and bounded here.
+   * publickey/password) and the sshd's strike map keys on the tunnel's client key —
+   * a real address, a trusted-proxy header value, or a per-connection key for
+   * same-host proxies (audit gateway:shared-address-ip-controls).
    */
   const sshTunnels = new Map<string, number>();
-  const SSH_TUNNELS_PER_IP = 6;
-  const SSH_TUNNELS_TOTAL = 64;
-  const attachSshTunnel = (ws: WebSocket, ip: string): void => {
-    const n = sshTunnels.get(ip) ?? 0;
+  const SSH_TUNNELS_PER_KEY = Math.max(1, Math.min(1_024, cfg.sshTunnelLimits?.perKey ?? 6));
+  const SSH_TUNNELS_TOTAL = Math.max(1, Math.min(1_024, cfg.sshTunnelLimits?.total ?? 64));
+  const attachSshTunnel = (ws: WebSocket, key: string): void => {
+    const n = sshTunnels.get(key) ?? 0;
     const total = [...sshTunnels.values()].reduce((a, b) => a + b, 0);
-    if (!sshd || n >= SSH_TUNNELS_PER_IP || total >= SSH_TUNNELS_TOTAL) {
+    if (!sshd || n >= SSH_TUNNELS_PER_KEY || total >= SSH_TUNNELS_TOTAL) {
       ws.close(1013, !sshd ? "ssh leg disabled" : "busy");
       return;
     }
-    sshTunnels.set(ip, n + 1);
-    const sock = new VirtualSshSocket(ip);
+    sshTunnels.set(key, n + 1);
+    keepAlive(ws);
+    const sock = new VirtualSshSocket(key);
     let closed = false;
     const bye = (): void => {
       if (closed) return;
       closed = true;
-      const left = (sshTunnels.get(ip) ?? 1) - 1;
-      if (left > 0) sshTunnels.set(ip, left);
-      else sshTunnels.delete(ip);
+      const left = (sshTunnels.get(key) ?? 1) - 1;
+      if (left > 0) sshTunnels.set(key, left);
+      else sshTunnels.delete(key);
     };
     ws.on("message", (data, isBinary) => {
       if (!isBinary) return ws.close(1003, "binary only");
-      if (!sock.push(Buffer.from(data as Buffer))) return; // sshd not reading: leave the buffering to ws
+      if (!sock.push(Buffer.from(data as Buffer))) ws.terminate();
     });
     ws.on("close", () => {
       bye();
       sock.push(null); // EOF: the sshd hangs up cleanly
       sock.destroy();
     });
-    ws.on("error", () => { /* onclose follows */ });
-    sock.on("tobytes", (chunk: Buffer) => {
-      if (ws.readyState === 1) ws.send(chunk); // 1 = OPEN, instance-safe
-    });
+    sock.on("tobytes", (chunk: Buffer) => sendText(ws, chunk));
     sock.on("close", () => {
       bye();
-      if (ws.readyState === 1) {
-        try { ws.close(1000); } catch { /* undici: some codes throw */ }
-      }
+      // Do not let a peer hold the transport open after the SSH deadline or
+      // revocation by declining to complete a WebSocket close handshake.
+      ws.terminate();
     });
-    sshd.inject(sock as unknown as import("node:net").Socket);
+    sshd.inject(sock);
   };
 
   const attachDevice = (ws: WebSocket, ip: string): void => {
@@ -594,11 +602,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     const helloTimer = setTimeout(() => {
       if (!done) ws.close(4001, "hello timeout");
     }, HELLO_TIMEOUT_MS);
-    const iv = keepAlive(() => conn?.alive ?? true, ws);
-
-    ws.on("pong", () => {
-      if (conn) conn.alive = true;
-    });
+    keepAlive(ws);
     ws.on("message", (data, isBinary) => {
       if (isBinary) return ws.close(1003, "text only");
       // Size is enforced by `maxPayload` on the server; decode still guards shape.
@@ -642,7 +646,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         }
         done = true;
         clearTimeout(helloTimer);
-        conn = { ws, account: account!, device, alive: true, viaDeviceSecret };
+        conn = { ws, account: account!, device, viaDeviceSecret };
         deviceConns.add(conn);
         log(`device ${device ? device.id : "?"} (${account!.name}${viaDeviceSecret ? ", device key" : ""}) connected`);
         const agents = state.roomsOfAccount(account!.id).map((r) => {
@@ -659,7 +663,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         // Resume: a returning device replays what it missed (bounded, best effort).
         // No match (no resume, wrong room, stale gen, seq from another life) falls
         // through to a fresh hello — the device re-requests state on its own.
-        const wantResume = ((): { room: string; gen: string; seq: number } | null => {
+        const wantResume = ((): { room: string; device: string; gen: string; seq: number } | null => {
           if (!device) return null;
           const r = m.resume;
           if (typeof r !== "object" || r === null) return null;
@@ -668,15 +672,16 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
           const seq = (r as { seq?: unknown }).seq;
           if (room !== device.roomId || typeof gen !== "string") return null;
           if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) return null;
-          return { room, gen, seq };
+          return { room, device: device.id, gen, seq };
         })();
         const resuming = ((): { replay: StreamMsg[]; gap: boolean } | null => {
           if (!wantResume) return null;
           const s = streams.get(wantResume.room);
           if (!s || s.gen !== wantResume.gen || wantResume.seq > s.seq) return null;
-          const replay = s.buf.filter((b) => b.seq > wantResume.seq);
+          const tail = s.buf.filter((b) => b.seq > wantResume.seq);
+          const replay = tail.filter((b) => b.device === undefined || b.device === wantResume.device);
           // Missed more than we kept: say so, the device re-syncs its state.
-          const gap = replay.length < s.seq - wantResume.seq;
+          const gap = tail.length < s.seq - wantResume.seq;
           return { replay, gap };
         })();
 
@@ -688,11 +693,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
             stream: { gen: s.gen, seq: s.seq, gap: resuming.gap },
           });
           for (const b of resuming.replay) {
-            try {
-              ws.send(encode(b.msg));
-            } catch {
-              /* closing */
-            }
+            send(ws, b.msg);
           }
           if (resuming.gap) log(`device ${device.id} resumed with a gap (re-requests state)`);
         } else {
@@ -707,7 +708,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
               if (!cfg.ssh) return {};
               for (const b of bridges) if (b.advertise) return { ssh: { ...b.advertise } };
               // The real port (the listener may be ephemeral), falling back to config.
-              return { ssh: { port: sshd?.port ?? cfg.ssh.port, ...(cfg.sshHost ? { host: cfg.sshHost } : {}) } };
+              return { ssh: { port: cfg.sshPublicPort ?? sshd?.port ?? cfg.ssh.port, ...(cfg.sshHost ? { host: cfg.sshHost } : {}) } };
             })(),
           });
         }
@@ -718,7 +719,9 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       switch (m.t) {
         case "frame": {
           const device = conn.device;
-          if (!device) return fail(ws, "not-paired", "pair.begin first");
+          if (!device || state.deviceById(device.id) !== device) return fail(ws, "not-paired", "pair.begin first");
+          const op = (m.payload as { op?: unknown } | null)?.op;
+          if (typeof op === "string" && op.startsWith("ssh.")) return fail(ws, "bad-message", "SSH frames require an authenticated SSH channel");
           const agent = agentByRoom.get(device.roomId);
           if (!agent) return fail(ws, "host-offline", "the host is not connected");
           send(agent.ws, { t: "frame", device: device.id, payload: m.payload });
@@ -744,7 +747,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     });
     ws.on("close", () => {
       clearTimeout(helloTimer);
-      clearInterval(iv);
+      cancelPairs(ws, "owner");
       if (conn) {
         deviceConns.delete(conn);
         if (conn.device) pushRoomUpdate(conn.device.roomId);
@@ -769,17 +772,17 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     };
     if (scope === "read") return finish();
     const agent = agentByRoom.get(room.id);
-    if (!agent) return send(conn.ws, { t: "pair.denied", reason: "host offline" });
+    if (agent?.ws.readyState !== WebSocket.OPEN) return send(conn.ws, { t: "pair.denied", reason: "host offline" });
     const requestId = randomId("pr");
-    const timer = setTimeout(() => {
-      pendingPairs.delete(requestId);
-      send(conn.ws, { t: "pair.denied", reason: "host did not answer" });
-    }, PAIR_ANSWER_MS);
-    pendingPairs.set(requestId, (ok) => {
+    const complete = (ok: boolean, reason = "denied on the host"): void => {
       clearTimeout(timer);
+      pendingPairs.delete(requestId);
+      if (conn.ws.readyState !== WebSocket.OPEN) return;
       if (ok) finish();
-      else send(conn.ws, { t: "pair.denied", reason: "denied on the host" });
-    });
+      else send(conn.ws, { t: "pair.denied", reason });
+    };
+    const timer = setTimeout(() => complete(false, "host did not answer"), PAIR_ANSWER_MS);
+    pendingPairs.set(requestId, { host: agent.ws, owner: conn.ws, finish: complete });
     send(agent.ws, { t: "pair.request", requestId, device: { name }, scope });
   };
 
@@ -807,7 +810,9 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       res.writeHead(421);
       return res.end("wrong host");
     }
-    const url = new URL(req.url ?? "/", "http://x");
+    let url: URL;
+    try { url = new URL(req.url ?? "/", "http://x"); }
+    catch { return json(res, 400, { error: "bad request target" }); }
     const path = url.pathname;
 
     if (req.method === "GET" && path === "/healthz") {
@@ -816,10 +821,31 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     }
 
     if (req.method === "POST" && path === "/v1/agent/code") {
-      if (blocked(ipOf(req))) return json(res, 429, { error: "rate limited" });
+      const key = clientKeyOf(req);
+      if (blocked(key)) return json(res, 429, { error: "rate limited" });
+      // Two budgets so minting cannot be driven without limit (audit
+      // pairing:unbounded-code-mint): a small per-client rate and a global
+      // pending cap inside AgentCodes.
+      const m = mints.get(key) ?? { n: 0, until: 0, at: Date.now() };
+      const now = Date.now();
+      if (m.until > now) {
+        mints.set(key, m);
+        return json(res, 429, { error: "too many pairing codes; retry shortly" });
+      }
+      if (now - m.at > MINT_WINDOW_MS) m.n = 0;
+      if (m.n >= MINT_PER_KEY) {
+        m.until = now + MINT_WINDOW_MS;
+        mints.set(key, m);
+        return json(res, 429, { error: "too many pairing codes; retry shortly" });
+      }
+      m.n += 1;
+      m.at = now;
+      mints.set(key, m);
       return void readJsonBody(req).then((body) => {
         const name = typeof body?.name === "string" && body.name.trim() ? body.name.trim().slice(0, 64) : "host";
-        json(res, 200, codes.mint(name));
+        const minted = codes.mint(name);
+        if (!minted) return json(res, 429, { error: "too many pending pairing codes" });
+        json(res, 200, minted);
       });
     }
 
@@ -840,7 +866,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
 
     const statusMatch = path.match(/^\/v1\/agent\/code\/([A-Za-z0-9]+)\/status$/);
     if (req.method === "GET" && statusMatch) {
-      if (blocked(ipOf(req))) return json(res, 429, { error: "rate limited" });
+      if (blocked(clientKeyOf(req))) return json(res, 429, { error: "rate limited" });
       const st = codes.status(statusMatch[1]);
       if (st.status === "unknown") return json(res, 404, { status: st.status });
       return json(res, 200, st);
@@ -850,7 +876,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       return json(res, 200, { publicKey: cfg.push.keys.publicBase64Url });
     }
     if (cfg.push && path === "/v1/device/push") {
-      if (blocked(ipOf(req))) return json(res, 429, { error: "rate limited" });
+      if (blocked(clientKeyOf(req))) return json(res, 429, { error: "rate limited" });
       // Two identities, same as the WS leg: the paired device (id + its own secret in
       // the body) or the owner (account token in Authorization, device id in the body).
       return void readJsonBody(req).then((body) => {
@@ -867,15 +893,11 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
           state.setDevicePush(device.id, null);
           return json(res, 200, { ok: true });
         }
-        const endpoint = typeof body?.endpoint === "string" ? body.endpoint.trim().slice(0, 2048) : "";
-        let u: URL;
-        try {
-          u = new URL(endpoint);
-        } catch {
-          return json(res, 400, { error: "bad endpoint" });
-        }
-        if (u.protocol !== "https:" && u.protocol !== "http:") return json(res, 400, { error: "bad endpoint" });
-        state.setDevicePush(device.id, endpoint);
+        const endpoint = typeof body?.endpoint === "string" && body.endpoint.length <= 2048 ? body.endpoint.trim() : "";
+        if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
+        const validated = pushEndpoint(endpoint);
+        if (!validated) return json(res, 400, { error: "unsupported push endpoint" });
+        state.setDevicePush(device.id, validated.href);
         return json(res, 200, { ok: true });
       });
     }
@@ -883,7 +905,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     // The owner's device roster (per room) and un-pairing. Account-token auth —
     // the same identity that approved the machine.
     if (path === "/v1/devices") {
-      if (blocked(ipOf(req))) return json(res, 429, { error: "rate limited" });
+      if (blocked(clientKeyOf(req))) return json(res, 429, { error: "rate limited" });
       if (req.method !== "GET") return json(res, 405, { error: "method not allowed" });
       const account = accountByAuth(req);
       if (!account) return json(res, 401, { error: "account token required" });
@@ -899,7 +921,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       });
     }
     if (path === "/v1/device/revoke") {
-      if (blocked(ipOf(req))) return json(res, 429, { error: "rate limited" });
+      if (blocked(clientKeyOf(req))) return json(res, 429, { error: "rate limited" });
       if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
       const account = accountByAuth(req);
       if (!account) return json(res, 401, { error: "account token required" });
@@ -915,6 +937,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
             try { c.ws.close(4001, "revoked"); } catch { /* already gone */ }
           }
         }
+        sshd?.revoke(device.id);
         pushRoomUpdate(device.roomId);
         log(`device ${device.id} (${device.name}) revoked by ${account.name}`);
         return json(res, 200, { ok: true });
@@ -925,7 +948,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     // add` this device, so system ssh logs in without a password prompt. Same two
     // identities as /v1/device/push (the device's own secret, or the owner's token).
     if (path === "/v1/device/sshkey") {
-      if (blocked(ipOf(req))) return json(res, 429, { error: "rate limited" });
+      if (blocked(clientKeyOf(req))) return json(res, 429, { error: "rate limited" });
       return void readJsonBody(req).then((body) => {
         // GET carries no body: the device id rides the query, its secret a header
         // (never a query string — those end up in proxy logs).
@@ -949,6 +972,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
           const b64 = typeof body?.b64 === "string" ? body.b64 : "";
           if (!b64) return json(res, 400, { error: "b64 required" });
           const removed = state.removeDeviceSshKey(device.id, b64);
+          if (removed) sshd?.revoke(device.id, sshKeyFingerprint(b64));
           return json(res, removed ? 200 : 404, { ok: removed });
         }
         if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
@@ -977,7 +1001,9 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       socket.write("HTTP/1.1 421 Misdirected Request\r\n\r\n");
       return socket.destroy();
     }
-    const path = new URL(req.url ?? "/", "http://x").pathname;
+    let path: string;
+    try { path = new URL(req.url ?? "/", "http://x").pathname; }
+    catch { socket.end("HTTP/1.1 400 Bad Request\r\n\r\n"); return; }
     if (path === "/v1/agent/ws") return upgrade(req, socket, head, "agent");
     if (path === "/v1/device/ws") return upgrade(req, socket, head, "device");
     if (path === "/v1/bridge/ws") return upgrade(req, socket, head, "bridge");
@@ -991,9 +1017,8 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       const addr = server.address();
       const port = typeof addr === "object" && addr ? addr.port : 0;
 
-      // The SSH leg shares this process (state + device sockets). Disabled when ssh is
-      // false or its port is 0.
-      // `ssh` unset = disabled (tests and API-only runs); main.ts turns it on by default.
+      // The SSH leg shares this process (state + device sockets). `ssh` unset
+      // disables it; port 0 gives an ephemeral listener.
       // The cloud resolves only once the leg is up or has failed, so callers see the truth.
       const sshPromise: Promise<SshHandle | null> = cfg.ssh
         ? startSshd({
@@ -1023,13 +1048,10 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
           get ssh() {
             return sshd;
           },
-          close: () =>
-            new Promise<void>((done) => {
-              for (const a of agentByRoom.values()) a.ws.close(1001, "server shutdown");
-              for (const d of deviceConns) d.ws.close(1001, "server shutdown");
-              void sshd?.close();
-              server.close(() => done());
-            }),
+          close: async () => {
+            for (const ws of wss.clients) ws.terminate();
+            await Promise.all([sshd?.close(), new Promise<void>((done) => server.close(() => done()))]);
+          },
         });
       });
     });

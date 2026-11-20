@@ -1,7 +1,7 @@
 // herdgate PWA — the device side of the gate.
 //
 // What it does: signs in with an account token, lists the machines (rooms) that account
-// has, pairs this device into one (scope read, or act with the host's approval), and shows
+// has, manages a separate pairing per machine, and shows
 // the read-only view the host publishes.
 //
 // House rules it respects:
@@ -11,15 +11,33 @@
 //   - the token lives in localStorage on this device and is never sent anywhere but the
 //     cloud's own WS endpoint.
 
-const BUILD = "v0.9.20";
+const BUILD = "v0.9.33-web.1";
 
 const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = "herdgate.token";
 const CLOUD_KEY = "herdgate.cloud";
 const DEVICE_KEY = "herdgate.device";
 const DEVICE_SECRET_KEY = "herdgate.deviceSecret";
+const PAIRS_KEY = "herdgate.roomPairs";
 
-import { DeviceChannel, generateKeyPair, fingerprint } from "/e2e.js";
+function roomPairs() {
+  try { return new Map(JSON.parse(localStorage.getItem(PAIRS_KEY) ?? "[]")); }
+  catch { return new Map(); }
+}
+
+function savePair(roomId, pair) {
+  const pairs = roomPairs();
+  if (pair) pairs.set(roomId, pair);
+  else pairs.delete(roomId);
+  localStorage.setItem(PAIRS_KEY, JSON.stringify([...pairs]));
+}
+
+function clearLegacyPair() {
+  localStorage.removeItem(DEVICE_KEY);
+  localStorage.removeItem(DEVICE_SECRET_KEY);
+}
+
+import { DeviceChannel, generateKeyPair } from "/e2e.js";
 
 // E2E payloads: this device's Noise_XX identity (kept locally, never sent to the cloud
 // in the clear) and the host fingerprints it has pinned (TOFU per room).
@@ -52,27 +70,37 @@ function e2eB64d(s) {
 // Per-room channel state; reset when the socket drops. The channel only carries
 // traffic after the host's `e2e.ready` ack — nothing may race the handshake's
 // last step, or the transport counters desync for good.
-const e2e = { ch: null, initing: false, ready: false };
+const e2e = { ch: null, initing: false, ready: false, verified: false, epoch: 0, keyChanged: false, beganAt: 0 };
+const pinnedHost = () => state.deviceRoom && localStorage.getItem(e2eFpKey(state.deviceRoom));
 function e2eReset() {
+  e2e.epoch++;
   e2e.ch = null;
   e2e.initing = false;
   e2e.ready = false;
+  e2e.verified = false;
+  e2e.keyChanged = false;
+  e2e.beganAt = 0;
 }
 
 /** Begin (or restart) the Noise_XX handshake with this room's host. */
 async function e2eBegin() {
-  if (e2e.ch?.ready() || e2e.initing) return;
+  if (e2e.ready || e2e.initing || e2e.keyChanged || Date.now() - e2e.beganAt < 5000) return;
   if (!(state.deviceSecret && state.deviceId && state.roomId)) return;
   if (state.ws?.readyState !== WebSocket.OPEN) return;
+  const epoch = e2e.epoch;
   e2e.initing = true;
+  e2e.beganAt = Date.now();
   try {
     const self = await e2eSelfKey();
     const ch = new DeviceChannel(self);
     const init = await ch.begin();
+    if (epoch !== e2e.epoch) return;
     e2e.ch = ch;
     send({ t: "frame", payload: { op: "e2e.init", e: init.e } });
+  } catch {
+    // A pinned room stays closed to plaintext even if WebCrypto is unavailable.
   } finally {
-    e2e.initing = false;
+    if (epoch === e2e.epoch) e2e.initing = false;
   }
 }
 
@@ -102,11 +130,15 @@ const state = {
   cloud: localStorage.getItem(CLOUD_KEY) ?? "",
   deviceId: localStorage.getItem(DEVICE_KEY) ?? "",
   deviceSecret: localStorage.getItem(DEVICE_SECRET_KEY) ?? "",
+  deviceRoom: null,
+  pairRoom: null,
+  pairSocket: null,
   ws: null,
   hello: null,
   roomId: null,
   view: null,
   viewError: null,
+  roomUi: null,
   terms: null,
   termTarget: null,
   termAnsi: null,
@@ -114,7 +146,6 @@ const state = {
   termBody: null,
   termPre: null,
   retry: 0,
-  closedByUs: false,
 };
 
 /** The cloud base: an explicit setting, else this page's origin (same-origin deployment). */
@@ -157,8 +188,8 @@ function showError(id, message) {
 function render() {
   const signedIn = Boolean(state.token);
   show("signin", !signedIn);
-  show("rooms", signedIn && !state.roomId);
-  show("room", signedIn && Boolean(state.roomId));
+  show("rooms", signedIn && !state.roomId && !state.pairRoom);
+  show("room", signedIn && Boolean(state.roomId) && !state.pairRoom);
 
   if (signedIn && !state.roomId) renderRooms();
   if (state.roomId) renderRoom();
@@ -168,6 +199,7 @@ function renderRooms() {
   const list = $("room-list");
   list.replaceChildren();
   const agents = state.hello?.agents ?? [];
+  const pairs = roomPairs();
   show("rooms-empty", agents.length === 0);
 
   for (const room of agents) {
@@ -175,26 +207,21 @@ function renderRooms() {
     node.querySelector(".name").textContent = room.name || room.roomId;
     const meta = [];
     meta.push(room.online ? "online" : "offline");
-    if (room.scope) meta.push(`paired · ${room.scope}`);
+    const scope = pairs.get(room.roomId)?.scope;
+    if (scope) meta.push(`paired · ${scope}`);
     node.querySelector(".meta").textContent = meta.join(" · ");
     node.querySelector(".row").dataset.roomId = room.roomId;
     node.querySelector(".rowbtn").addEventListener("click", () => {
-      const mine = (state.hello?.agents ?? []).find((r) => r.roomId === room.roomId);
-      if (mine?.scope) {
-        state.roomId = room.roomId;
-        state.view = null;
-        state.viewError = null;
-        render();
-        askView();
-      } else {
-        openPair(room.roomId);
-      }
+      const pairing = roomPairs().get(room.roomId);
+      if (pairing) selectRoom(room.roomId, pairing);
+      else openPair(room.roomId);
     });
     list.append(node);
   }
 }
 
 function renderRoom() {
+  if (!state.roomId) return;
   const room = (state.hello?.agents ?? []).find((r) => r.roomId === state.roomId);
   text("room-name", room?.name || state.roomId);
   text("room-state", room ? (room.online ? "host online" : "host offline") : "unknown room");
@@ -202,23 +229,42 @@ function renderRoom() {
   // E2E status: the pinned host fingerprint, or a loud note when it changed.
   const e2eNote = $("e2e-note");
   const pinned = state.roomId ? localStorage.getItem(e2eFpKey(state.roomId)) : null;
-  const current = e2e.ch?.ready() && e2e.ready ? e2e.ch.hostFingerprint : null;
-  const shown = current ?? pinned;
-  if (pinned && current && current !== pinned) {
+  const current = e2e.verified ? e2e.ch.hostFingerprint : null;
+  if (e2e.keyChanged) {
     e2eNote.hidden = false;
     e2eNote.className = "error small";
-    e2eNote.textContent = `The host key changed (was ${pinned}, now ${current}). Re-pair if you did not do this.`;
-  } else if (shown) {
+    e2eNote.textContent = "Host key changed. Pane data is blocked. Verify the key with the host administrator.";
+  } else if (current || pinned) {
     e2eNote.hidden = false;
     e2eNote.className = "muted small";
-    e2eNote.textContent = `end-to-end encrypted · host key ${shown}`;
+    e2eNote.textContent = current ? `end-to-end encrypted · host key ${current}` : "Waiting for an encrypted connection to the pinned host…";
   } else {
     e2eNote.hidden = true;
   }
 
-  const box = $("view");
-  box.replaceChildren();
+  if (!state.roomUi) {
+    const summary = document.createElement("div");
+    const live = document.createElement("div");
+    const controls = document.createElement("div");
+    $("view").replaceChildren(summary, live, controls);
+    const updateSshHint = renderRoomControls(controls);
+    state.roomUi = { summary, live, updateSshHint };
+  }
+  const ui = state.roomUi;
+  const online = Boolean(room?.online);
+  if (ui.online !== online || ui.view !== state.view || ui.error !== state.viewError) {
+    ui.online = online;
+    ui.view = state.view;
+    ui.error = state.viewError;
+    ui.summary.replaceChildren();
+    renderHostView(ui.summary, room);
+  }
+  const { live, updateSshHint } = ui;
+  renderLiveTerminals(live, online);
+  updateSshHint?.();
+}
 
+function renderHostView(box, room) {
   if (!room?.online) {
     box.append(note("The host is not connected. Start its publisher — in Herdr, press Publish."));
     return;
@@ -272,10 +318,11 @@ function renderRoom() {
     p.textContent = `as of ${new Date(v.takenAt).toLocaleTimeString()}`;
     box.append(p);
   }
+}
 
-  // Live terminals (read-only): the host's own panes — pick one and watch its
-  // ANSI screen. Everything rides the same frames (E2E when paired), no new trust.
-  if (room?.online) {
+function renderLiveTerminals(box, online) {
+  box.hidden = !online;
+  if (online && !state.termBody) {
     const tblock = document.createElement("details");
     tblock.className = "terms";
     const ts = document.createElement("summary");
@@ -285,30 +332,23 @@ function renderRoom() {
     tbody.className = "termbody";
     tblock.append(tbody);
     tblock.addEventListener("toggle", () => {
-      if (tblock.open && !state.terms) send({ t: "frame", payload: { op: "term.list" } });
+      if (tblock.open && !state.terms) sendPayload({ op: "term.list" });
     });
     box.append(tblock);
     state.termBody = tbody;
     renderTerms();
-    if (state.termTarget) {
-      // The view rebuilds this node; keep the live pane ticking without a new poll.
-      paintTerm();
-      if (!state.termTimer) startTerm(state.termTarget);
-    }
   }
+}
 
+function renderRoomControls(box) {
+  let updateSshHint;
   // The SSH leg: this device's own key dials the gate. In the Herdr phone app, add a
   // machine with this host/port and the key shown once at pair time.
   if (state.deviceSecret && state.deviceId) {
     const details = document.createElement("details");
     details.className = "ssh";
-    // Fresh from pairing: the section opens itself and STAYS open across the
-    // re-renders that follow (the view frame rebuilds this node) until the person
-    // closes it — the key is the one thing they must not miss.
-    if (state.showSecretOnce) details.open = true;
-    details.addEventListener("toggle", () => {
-      if (!details.open) state.showSecretOnce = false;
-    });
+    // Open after pairing; live frames never replace the user's controls.
+    details.open = state.showSecretOnce === true;
     const summary = document.createElement("summary");
     summary.textContent = "SSH for the Herdr app";
     const pre = document.createElement("pre");
@@ -317,33 +357,41 @@ function renderRoom() {
     // person typed to reach this page. The cloud advertises the SSH hostname it
     // wants phones to use (bridge / AAAA name); only without one do we fall back
     // to this page's host.
-    const port = state.sshPort ?? 2222;
-    const sshHost = state.sshHost || host;
-    pre.textContent = `ssh -p ${port} ${state.deviceId}@${sshHost}`;
-    details.append(summary, pre);
+    const { deviceId, deviceSecret, roomId, token } = state;
+    const base = cloudBase();
+    let selected = deviceId;
+    const allowed = new Set([deviceId]);
+    const chooser = document.createElement("label");
+    chooser.textContent = "SSH username ";
+    const picker = document.createElement("select");
+    picker.className = "ssh-user-select";
+    const option = (id, label) => {
+      const item = document.createElement("option");
+      item.value = id;
+      item.textContent = label;
+      return item;
+    };
+    picker.append(option(deviceId, `${deviceId} (this browser)`));
+    picker.value = deviceId;
+    picker.disabled = true;
+    chooser.append(picker);
+    details.append(summary, chooser, pre);
 
-    // The device key lives in this browser's localStorage (the cloud returns it
-    // once and keeps only a hash). It IS the SSH password — show it, on demand.
-    // `keyShown` lives in state so the reveal survives the room re-renders that
-    // rebuild this whole node whenever a frame arrives.
+    // The device secret is the SSH password. Reveal only on request and only
+    // for the device that owns this panel.
     const keyRow = document.createElement("div");
     keyRow.className = "keyrow";
-    if (state.keyShown && state.deviceSecret) {
+    const reveal = document.createElement("button");
+    reveal.type = "button";
+    reveal.className = "link";
+    reveal.textContent = "Show this device's key";
+    reveal.addEventListener("click", () => {
       const keyEl = document.createElement("pre");
-      keyEl.textContent = state.deviceSecret;
+      keyEl.textContent = deviceSecret;
       keyEl.setAttribute("aria-label", "device key");
-      keyRow.append(keyEl);
-    } else {
-      const reveal = document.createElement("button");
-      reveal.type = "button";
-      reveal.className = "link";
-      reveal.textContent = "Show this device's key";
-      reveal.addEventListener("click", () => {
-        state.keyShown = true;
-        renderRoom();
-      });
-      keyRow.append(reveal);
-    }
+      keyRow.replaceChildren(keyEl);
+    });
+    keyRow.append(reveal);
     details.append(keyRow);
 
     // Registered SSH PUBLIC keys: the machine that runs `hc machine add` can then log
@@ -373,11 +421,25 @@ function renderRoom() {
     keysBlock.append(addRow);
     const cfgHint = document.createElement("p");
     cfgHint.className = "muted small";
-    cfgHint.textContent = `then on that machine: hc machine add ${state.deviceId}@${sshHost}:${port} (add “StrictHostKeyChecking accept-new” for ${sshHost} in ~/.ssh/config to skip the host-key question)`;
+    updateSshHint = () => {
+      const port = state.sshPort ?? 2222;
+      const sshHost = state.sshHost || host;
+      const command = `ssh -p ${port} ${selected}@${sshHost}`;
+      if (pre.textContent === command) return;
+      pre.textContent = command;
+      cfgHint.textContent = `Herdr Mobile: SSH username ${selected}, port ${port}. Register the public key shown by the phone for this username.`;
+    };
     keysBlock.append(cfgHint);
     details.append(keysBlock);
 
-    const renderKeys = (keys) => {
+    const status = document.createElement("p");
+    status.className = "muted small";
+    status.setAttribute("role", "status");
+    keysBlock.append(status);
+    const keyAuth = (id) => id === deviceId ? { "x-herdgate-secret": deviceSecret } : { authorization: `Bearer ${token}` };
+    let keyRequest = 0;
+
+    const renderKeys = (keys, owner) => {
       keyList.replaceChildren();
       for (const k of keys) {
         const row = document.createElement("div");
@@ -390,12 +452,20 @@ function renderRoom() {
         rm.className = "link";
         rm.textContent = "remove";
         rm.addEventListener("click", async () => {
-          await fetch(`${cloudBase()}/v1/device/sshkey`, {
-            method: "DELETE",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ device: state.deviceId, deviceSecret: state.deviceSecret, b64: k.b64 }),
-          });
-          loadKeys();
+          if (selected !== owner) return;
+          try {
+            const response = await fetch(`${base}/v1/device/sshkey`, {
+              method: "DELETE",
+              headers: { "content-type": "application/json", ...keyAuth(owner) },
+              body: JSON.stringify({ device: owner, b64: k.b64 }),
+            });
+            if (selected === owner) {
+              if (response.ok) void loadKeys();
+              else status.textContent = `Could not remove key (HTTP ${response.status}).`;
+            }
+          } catch {
+            if (selected === owner) status.textContent = "Could not reach the gate.";
+          }
         });
         row.append(rm);
         keyList.append(row);
@@ -403,39 +473,86 @@ function renderRoom() {
       if (!keys.length) {
         const none = document.createElement("p");
         none.className = "muted small";
-        none.textContent = "none yet — password login still works";
+        none.textContent = "No public key registered for this username.";
         keyList.append(none);
       }
     };
     const loadKeys = async () => {
+      const target = selected;
+      const request = ++keyRequest;
       try {
-        const r = await fetch(`${cloudBase()}/v1/device/sshkey?device=${encodeURIComponent(state.deviceId)}`, {
-          method: "GET",
-          headers: { "content-type": "application/json", "x-herdgate-secret": state.deviceSecret },
-        });
-        if (r.ok) renderKeys((await r.json()).keys ?? []);
+        const r = await fetch(`${base}/v1/device/sshkey?device=${encodeURIComponent(target)}`, { headers: keyAuth(target) });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const { keys = [] } = await r.json();
+        if (request === keyRequest) renderKeys(keys, target);
       } catch {
-        /* offline: the section just stays as-is */
+        if (request === keyRequest) status.textContent = "Could not load public keys.";
       }
     };
+    const selectUsername = (id) => {
+      if (!allowed.has(id) || id === selected) return;
+      selected = id;
+      keyRow.hidden = id !== deviceId;
+      // Require a fresh paste when switching recipients to avoid granting access to the wrong device.
+      addInput.value = "";
+      status.textContent = "";
+      keyList.replaceChildren();
+      updateSshHint();
+      void loadKeys();
+    };
+    picker.addEventListener("change", () => selectUsername(picker.value));
+    let pickerRequest = 0;
+    const loadUsernames = async () => {
+      if (!token || !roomId) return;
+      const request = ++pickerRequest;
+      try {
+        const r = await fetch(`${base}/v1/devices?room=${encodeURIComponent(roomId)}`, { headers: { authorization: `Bearer ${token}` } });
+        if (!r.ok) return;
+        const { devices = [] } = await r.json();
+        if (request !== pickerRequest) return;
+        allowed.clear();
+        allowed.add(deviceId);
+        const options = [option(deviceId, `${deviceId} (this browser)`)];
+        for (const d of devices) {
+          if (allowed.has(d.id)) continue;
+          allowed.add(d.id);
+          options.push(option(d.id, `${d.name} · ${d.scope} · ${d.id}`));
+        }
+        if (!allowed.has(selected)) selectUsername(deviceId);
+        picker.replaceChildren(...options);
+        picker.value = selected;
+        picker.disabled = options.length === 1;
+      } catch { /* existing pairing still works */ }
+    };
+    details.addEventListener("toggle", () => { if (details.open) void loadUsernames(); });
     addBtn.addEventListener("click", async () => {
       const pubkey = addInput.value.trim();
-      if (!pubkey) return;
-      const r = await fetch(`${cloudBase()}/v1/device/sshkey`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ device: state.deviceId, deviceSecret: state.deviceSecret, pubkey }),
-      });
-      if (!r.ok) {
-        addInput.value = "";
-        addInput.placeholder = await r.json().then((b) => b.error ?? "rejected").catch(() => "rejected");
-        return;
+      const target = selected;
+      if (!pubkey || !allowed.has(target)) return;
+      status.textContent = "";
+      try {
+        const r = await fetch(`${base}/v1/device/sshkey`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...keyAuth(target) },
+          body: JSON.stringify({ device: target, pubkey }),
+        });
+        const result = await r.json().catch(() => ({}));
+        if (selected !== target) return;
+        if (!r.ok) {
+          status.textContent = result.error ?? `Could not add key (HTTP ${r.status}).`;
+          return;
+        }
+        if (addInput.value.trim() === pubkey) addInput.value = "";
+        status.textContent = `Key saved for ${target}.`;
+        void loadKeys();
+      } catch {
+        if (selected === target) status.textContent = "Could not reach the gate.";
       }
-      addInput.value = "";
-      loadKeys();
     });
-    loadKeys();
+    void loadKeys();
+    void loadUsernames();
     details.append(keysBlock);
+    box.append(details);
   }
 
   // The owner's roster for this machine: every paired device, its scope, live dot,
@@ -478,19 +595,14 @@ function renderRoom() {
           rm.textContent = "revoke";
           rm.addEventListener("click", async () => {
             if (!confirm(`Revoke ${d.name}? Its key and access die immediately.`)) return;
-            await fetch(`${cloudBase()}/v1/device/revoke`, {
+            const result = await fetch(`${cloudBase()}/v1/device/revoke`, {
               method: "POST",
               headers: { "content-type": "application/json", authorization: `Bearer ${state.token}` },
               body: JSON.stringify({ device: d.id }),
             });
-            if (d.id === state.deviceId) {
-              // This browser just un-paired itself: back to the machine list.
-              state.deviceId = null;
-              state.deviceSecret = null;
-              localStorage.removeItem(DEVICE_KEY);
-              localStorage.removeItem(DEVICE_SECRET_KEY);
-            }
-            loadDevices();
+            if (!result.ok) return;
+            if (d.id === state.deviceId) dropDevice();
+            else loadDevices();
           });
           row.append(rm);
           roster.append(row);
@@ -500,8 +612,9 @@ function renderRoom() {
         /* offline: the section stays as-is */
       }
     };
-    loadDevices();
+    block.addEventListener("toggle", () => { if (block.open) void loadDevices(); });
   }
+  return updateSshHint;
 }
 
 // ---- live terminals (read-only) ---------------------------------------------
@@ -510,10 +623,10 @@ function startTerm(target) {
   stopTerm(false);
   state.termTarget = target;
   state.termAnsi = null;
-  send({ t: "frame", payload: { op: "term.read", target, lines: 40 } });
+  sendPayload({ op: "term.read", target, lines: 40 });
   state.termTimer = setInterval(() => {
     if (!state.termTarget || !state.roomId) return stopTerm();
-    send({ t: "frame", payload: { op: "term.read", target: state.termTarget, lines: 40 } });
+    sendPayload({ op: "term.read", target: state.termTarget, lines: 40 });
   }, 2_000);
   renderTerms();
 }
@@ -558,7 +671,7 @@ function renderTerms() {
   btn.type = "button";
   btn.className = "link";
   btn.textContent = "refresh the pane list";
-  btn.addEventListener("click", () => send({ t: "frame", payload: { op: "term.list" } }));
+  btn.addEventListener("click", () => sendPayload({ op: "term.list" }));
   list.append(btn);
   const panes = state.terms ?? null;
   if (panes === null) {
@@ -667,11 +780,45 @@ function note(message, kind) {
   return p;
 }
 
-// ---- the socket ------------------------------------------------------------
+// ---- the room socket -------------------------------------------------------
+
+function disconnect() {
+  const ws = state.ws;
+  state.ws = null;
+  ws?.close();
+  e2eReset();
+}
+
+function selectRoom(roomId, pair, fresh = false) {
+  resetRoomView();
+  state.roomId = roomId;
+  state.showSecretOnce = fresh;
+  if (state.deviceRoom !== roomId || state.deviceId !== pair.id) {
+    disconnect();
+    state.deviceRoom = roomId;
+    state.deviceId = pair.id;
+    state.deviceSecret = pair.secret;
+    state.retry = 0;
+    connect();
+  }
+  render();
+  if (state.hello && state.ws?.readyState === WebSocket.OPEN) askView();
+}
+
+function dropDevice() {
+  const roomId = state.deviceRoom;
+  if (roomId && roomPairs().get(roomId)?.id === state.deviceId) savePair(roomId, null);
+  clearLegacyPair();
+  disconnect();
+  state.deviceRoom = null;
+  state.deviceId = "";
+  state.deviceSecret = "";
+  goMachines();
+  connect();
+}
 
 function connect() {
-  if (!state.token) return;
-  state.closedByUs = false;
+  if (!state.token || state.ws) return;
   let ws;
   try {
     ws = new WebSocket(wsUrl());
@@ -685,20 +832,22 @@ function connect() {
     // A paired device re-attaches with its own key; the account token is the owner path
     // (first sign-in, pairing, management). A device that knows where it stopped reading
     // also asks to resume its room's stream.
+    if (state.ws !== ws) return;
     const hello = state.deviceSecret && state.deviceId
       ? { device: state.deviceId, deviceSecret: state.deviceSecret }
-      : { accountToken: state.token, ...(state.deviceId ? { device: state.deviceId } : {}) };
-    const resume = state.deviceSecret && state.deviceId ? loadStream(state.roomId) : null;
+      : { accountToken: state.token };
+    const resume = loadStream(state.deviceRoom);
     ws.send(JSON.stringify({
       v: 1,
       t: "hello",
       ...hello,
       name: deviceName(),
-      ...(resume ? { resume: { room: state.roomId, gen: resume.gen, seq: resume.seq } } : {}),
+      ...(resume ? { resume: { room: state.deviceRoom, gen: resume.gen, seq: resume.seq } } : {}),
     }));
   });
 
   ws.addEventListener("message", (event) => {
+    if (state.ws !== ws) return;
     let m;
     try {
       m = JSON.parse(event.data);
@@ -709,12 +858,15 @@ function connect() {
   });
 
   ws.addEventListener("close", (event) => {
+    if (state.ws !== ws) return;
     state.ws = null;
-    state.hello = null;
     e2eReset();
-    if (state.closedByUs) return;
-    if (event.code === 4001) {
-      // The cloud refused the token: do not hammer it, send the person back to sign-in.
+    if (state.roomId && pinnedHost()) clearRoomPayload();
+    if (event.code === 4001 && ["unknown device credentials", "revoked"].includes(event.reason)) {
+      dropDevice();
+      return;
+    }
+    if (event.code === 4001 && event.reason === "unknown account token") {
       setStatus("signed out", "bad");
       forgetToken();
       return;
@@ -731,7 +883,7 @@ function connect() {
 async function onMessage(m, ws) {
   // Track the room stream so the next reconnect resumes from here.
   if (typeof m.seq === "number" && (m.t === "frame" || m.t === "presence")) {
-    const rid = m.t === "presence" ? m.roomId : state.roomId;
+    const rid = m.t === "presence" ? m.roomId : state.deviceRoom;
     const cur = loadStream(rid);
     if (cur && m.seq > cur.seq) saveStream(rid, cur.gen, m.seq);
   }
@@ -740,12 +892,15 @@ async function onMessage(m, ws) {
       state.retry = 0;
       state.hello = { agents: Array.isArray(m.agents) ? m.agents : [] };
       if (m.device?.id) {
-        state.deviceId = m.device.id;
-        localStorage.setItem(DEVICE_KEY, m.device.id);
-        if (!state.roomId) state.roomId = m.device.roomId;
+        const { roomId, id, scope } = m.device;
+        if (!state.deviceRoom) {
+          // Migrate the legacy single pairing only after the gate identifies its room.
+          savePair(roomId, { id, secret: state.deviceSecret, scope });
+          clearLegacyPair();
+          state.roomId = roomId;
+        }
+        state.deviceRoom = roomId;
       }
-      // Keep the chosen room only while it is still visible to this account/device.
-      if (state.roomId && !state.hello.agents.some((r) => r.roomId === state.roomId)) state.roomId = null;
       // Resume outcome: the stream header carries the cloud's position; when the
       // replay had a hole (too long away), askView() below re-fetches the state.
       const rid = m.device?.roomId ?? null;
@@ -773,62 +928,40 @@ async function onMessage(m, ws) {
         await onE2eReply(payload);
         return;
       }
-      if (payload && typeof payload === "object" && payload.op === "e2e.ready") {
+      if (payload?.op === "e2e.ready") {
+        if (!e2e.ch?.ready() || e2e.ready || e2e.initing || e2e.keyChanged) return;
         e2e.ready = true;
         renderRoom();
-        askView(); // now over the encrypted channel
+        void askView();
         return;
       }
-      if (payload && typeof payload === "object" && payload.op === "e2e") {
-        if (!e2e.ch?.ready()) return; // ciphertext for a session we do not have
-        let inner;
+      if (payload?.op === "e2e") {
+        const ch = e2e.ch;
+        if (!e2e.ready || !ch?.ready()) return;
         try {
-          inner = await e2e.ch.recv(payload);
+          const inner = await ch.recv(payload);
+          if (state.ws !== ws || e2e.ch !== ch) return;
+          if (!e2e.verified) {
+            // The plaintext ready ack only starts transport. A valid encrypted
+            // response proves the peer has the static key before we store the pin.
+            localStorage.setItem(e2eFpKey(state.deviceRoom), ch.hostFingerprint);
+            e2e.verified = true;
+            renderRoom();
+          }
+          applyPayload(inner);
         } catch {
-          // Wrong key or tampered frame: start over rather than show nonsense.
-          e2eReset();
-          void e2eBegin();
-          return;
+          if (state.ws === ws && e2e.ch === ch) restartEncryptedRoom();
         }
-        applyPayload(inner);
         return;
       }
-      if (payload && typeof payload === "object" && payload.code === "e2e" && e2e.ch) {
-        // The host dropped our session (decrypt failed there): renegotiate.
-        e2eReset();
-        void e2eBegin();
-        return;
-      }
-      if (payload && typeof payload === "object" && payload.op === "view" && e2e.ch?.ready() && e2e.ready) {
-        // Plaintext view while an encrypted session is up: the host lost its side —
-        // renegotiate (its publisher restarted).
-        e2eReset();
-        void e2eBegin();
-        applyPayload(payload);
+      if (e2e.keyChanged) return;
+      if (pinnedHost() || e2e.ch?.ready()) {
+        // Plaintext after a publisher restart may trigger renegotiation, but is never displayed.
+        if (e2e.ready && (payload?.code === "e2e" || payload?.op === "view")) restartEncryptedRoom();
+        else if (!e2e.ready) void e2eBegin();
         return;
       }
       applyPayload(payload);
-      return;
-    }
-    case "pair.granted": {
-      state.deviceId = m.device?.id ?? state.deviceId;
-      if (state.deviceId) localStorage.setItem(DEVICE_KEY, state.deviceId);
-      // Shown once and kept only on this device: it is this phone's SSH key on the gate.
-      if (typeof m.deviceSecret === "string" && m.deviceSecret) {
-        state.deviceSecret = m.deviceSecret;
-        localStorage.setItem(DEVICE_SECRET_KEY, m.deviceSecret);
-        state.showSecretOnce = true;
-      }
-      state.roomId = m.device?.roomId ?? state.roomId;
-      closePair();
-      render();
-      void e2eBegin();
-      askView();
-      void subscribePush();
-      return;
-    }
-    case "pair.denied": {
-      showError("pair-error", m.reason ? `Denied: ${m.reason}` : "Denied");
       return;
     }
     case "presence": {
@@ -860,14 +993,40 @@ function retryLater() {
 }
 
 /** Ask the host for its view: the only op this app ever sends (encrypted when up). */
-async function askView() {
-  if (state.ws?.readyState !== WebSocket.OPEN || !state.roomId) return;
-  if (e2e.ch?.ready() && e2e.ready) {
-    send({ t: "frame", payload: await e2e.ch.send({ op: "view" }) });
+function clearRoomPayload() {
+  state.view = null;
+  state.viewError = null;
+  state.terms = null;
+  state.termAnsi = null;
+  renderRoom();
+  renderTerms();
+}
+
+function restartEncryptedRoom() {
+  e2eReset();
+  clearRoomPayload();
+  void e2eBegin();
+}
+
+async function sendPayload(message) {
+  const ws = state.ws;
+  if (ws?.readyState !== WebSocket.OPEN || !state.roomId || e2e.keyChanged) return;
+  const ch = e2e.ch;
+  if (ch?.ready() && e2e.ready) {
+    try {
+      const payload = await ch.send(message);
+      if (state.ws === ws && e2e.ch === ch) send({ t: "frame", payload });
+    } catch {
+      if (state.ws === ws && e2e.ch === ch) restartEncryptedRoom();
+    }
     return;
   }
-  void e2eBegin(); // establish in the background; the ack path asks again over it
-  send({ t: "frame", payload: { op: "view" } });
+  void e2eBegin();
+  if (!pinnedHost() && !ch?.ready()) send({ t: "frame", payload: message });
+}
+
+function askView() {
+  return sendPayload({ op: "view" });
 }
 function applyPayload(payload) {
   // The plaintext (or decrypted) payload from the host lands here.
@@ -890,33 +1049,36 @@ function applyPayload(payload) {
     // The host refused or could not answer: an op we may not use, or its Herdr is down.
     state.viewError = payload.message ?? payload.code ?? "the host refused";
     state.view = null;
+  } else {
+    return;
   }
-  if (state.roomId) renderRoom();
+  renderRoom();
 }
 
 // ---- push wake ---------------------------------------------------------------
 
 /** Subscribe this device to silent wake pushes; ask for permission only once paired. */
 async function subscribePush() {
-  if (!(state.deviceSecret && state.deviceId)) return; // paired devices only
+  const { deviceId, deviceSecret } = state;
+  const base = cloudBase();
+  if (!(deviceSecret && deviceId)) return; // paired devices only
   if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
   try {
     const reg = await navigator.serviceWorker.ready;
     let sub = await reg.pushManager.getSubscription();
     if (!sub) {
-      const keyRes = await fetch(`${cloudBase()}/v1/push/key`);
+      const keyRes = await fetch(`${base}/v1/push/key`);
       if (!keyRes.ok) return; // push disabled on this cloud
       const { publicKey } = await keyRes.json();
       const raw = Uint8Array.from(atob(publicKey.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
       sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: raw });
     }
     const endpoint = sub.endpoint;
-    if (state.pushEndpoint === endpoint) return;
-    state.pushEndpoint = endpoint;
-    await fetch(`${cloudBase()}/v1/device/push`, {
+    if (cloudBase() !== base || state.deviceId !== deviceId) return;
+    await fetch(`${base}/v1/device/push`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ device: state.deviceId, deviceSecret: state.deviceSecret, endpoint }),
+      body: JSON.stringify({ device: deviceId, deviceSecret, endpoint }),
     });
   } catch {
     /* permission denied or push unavailable: the gate still works without it */
@@ -926,22 +1088,24 @@ async function subscribePush() {
 /** The host answered our handshake: finish it, pin its fingerprint (TOFU). */
 async function onE2eReply(payload) {
   const ch = e2e.ch;
-  if (!ch) return;
+  const roomId = state.deviceRoom;
+  if (!ch || !roomId || ch.ready() || e2e.initing || e2e.keyChanged) return;
+  e2e.initing = true;
   try {
-    const finish = await ch.acceptReply(payload);
+    const finish = await ch.acceptReply(payload, pinnedHost());
+    if (e2e.ch !== ch) return;
+    clearRoomPayload();
     send({ t: "frame", payload: { op: "e2e.finish", c: finish.c } });
-  } catch {
+  } catch (err) {
+    if (e2e.ch !== ch) return;
     e2eReset();
-    return;
+    if (err?.code === "host-key-changed") {
+      e2e.keyChanged = true;
+      clearRoomPayload();
+    }
+  } finally {
+    if (e2e.ch === ch) e2e.initing = false;
   }
-  const fp = ch.hostFingerprint;
-  if (fp && state.roomId) {
-    const stored = localStorage.getItem(e2eFpKey(state.roomId));
-    if (!stored) localStorage.setItem(e2eFpKey(state.roomId), fp);
-    renderRoom();
-  }
-  // The channel is up: ask for the view over it.
-  askView();
 }
 
 function send(message) {
@@ -965,30 +1129,79 @@ function openPair(roomId) {
   state.pairRoom = roomId;
   show("pair", true);
   show("rooms", false);
+  show("room", false);
   showError("pair-error", null);
   const name = $("pair-name");
   if (!name.value) name.value = deviceName();
   name.focus();
 }
 
+function pairStatus(message = "") {
+  text("pair-status", message);
+  show("pair-status", Boolean(message));
+}
+
 function closePair() {
+  state.pairSocket?.cancel();
+  pairStatus();
+  state.pairRoom = null;
   show("pair", false);
   showError("pair-error", null);
 }
 
 $("pair-form").addEventListener("submit", (event) => {
   event.preventDefault();
+  if (state.pairSocket || !state.pairRoom || !state.token) return;
   showError("pair-error", null);
+  const { pairRoom: roomId, token: accountToken } = state;
   const name = $("pair-name").value.trim() || deviceName();
   const scope = $("pair-scope").value === "act" ? "act" : "read";
-  const ok = send({ t: "pair.begin", roomId: state.pairRoom, name, scope });
-  if (!ok) return showError("pair-error", "not connected to the cloud");
-  // `act` waits for a human on the host; read is immediate.
-  $("pair-form").querySelector("button").disabled = true;
-  setTimeout(() => {
-    const b = $("pair-form").querySelector("button");
-    if (b) b.disabled = false;
-  }, 3_000);
+  // Pairing is an owner operation. Do not promote or replace the room socket.
+  let ws;
+  try { ws = new WebSocket(wsUrl()); }
+  catch { return showError("pair-error", "Could not connect to the gate"); }
+  const button = $("pair-form").querySelector("button");
+  button.disabled = true;
+  pairStatus("Connecting to the gate…");
+  let requested = false;
+  const operation = { cancel: () => finish() };
+  state.pairSocket = operation;
+  const timeout = setTimeout(() => finish("Pairing timed out"), 70_000);
+  function finish(error) {
+    if (state.pairSocket !== operation) return;
+    state.pairSocket = null;
+    button.disabled = false;
+    pairStatus();
+    clearTimeout(timeout);
+    ws.close();
+    if (error) showError("pair-error", error);
+  }
+  const sendPair = (message) => ws.send(JSON.stringify({ v: 1, ...message }));
+  ws.addEventListener("open", () => {
+    if (state.pairSocket === operation) sendPair({ t: "hello", accountToken, name: deviceName() });
+  });
+  ws.addEventListener("close", (event) => finish(event.reason || "Pairing connection closed"));
+  ws.addEventListener("message", (event) => {
+    if (state.pairSocket !== operation) return;
+    let m;
+    try { m = JSON.parse(event.data); } catch { return; }
+    if (m?.t === "hello" && !requested) {
+      requested = true;
+      pairStatus(scope === "act" ? "Waiting for the host to approve control…" : "Pairing…");
+      sendPair({ t: "pair.begin", roomId, name, scope });
+    } else if (m?.t === "pair.denied" || m?.t === "error") {
+      finish(m.reason || m.message || "Pairing refused");
+    } else if (m?.t === "pair.granted" && requested) {
+      if (m.device?.roomId !== roomId || m.device.scope !== scope || typeof m.device.id !== "string" || typeof m.deviceSecret !== "string") {
+        return finish("Invalid pairing reply");
+      }
+      const pairing = { id: m.device.id, secret: m.deviceSecret, scope };
+      savePair(roomId, pairing);
+      closePair();
+      selectRoom(roomId, pairing, true);
+      void subscribePush();
+    }
+  });
 });
 
 // ---- sign-in, settings -----------------------------------------------------
@@ -1023,8 +1236,7 @@ $("addmachine").addEventListener("submit", async (event) => {
     $("addmachine-code").value = "";
     noteEl.textContent = "approved — the machine appears when its publisher connects";
     // A fresh hello lists the new room (rooms come from hello).
-    state.closedByUs = true;
-    state.ws?.close();
+    disconnect();
     connect();
   } catch (e) {
     noteEl.className = "error small";
@@ -1040,17 +1252,11 @@ $("menu").addEventListener("click", () => {
 $("settings-form").addEventListener("submit", () => {
   const value = $("cloud").value.trim().replace(/\/$/, "");
   if (value !== state.cloud) {
+    // Never forward credentials from one cloud to another.
+    forgetToken();
     state.cloud = value;
     if (value) localStorage.setItem(CLOUD_KEY, value);
     else localStorage.removeItem(CLOUD_KEY);
-    // A different cloud is a different account: reconnect from scratch.
-    state.hello = null;
-    state.roomId = null;
-    if (state.ws) {
-      state.closedByUs = true;
-      state.ws.close();
-    }
-    connect();
   }
 });
 
@@ -1059,16 +1265,22 @@ $("signout").addEventListener("click", () => forgetToken());
 /** Back to the machine list — from the pair screen or the room screen.
  * Delegated at the document level so it works no matter what rebuilt the DOM
  * (and with a generous tap target; see .backbtn in the CSS). */
-const goMachines = () => {
-  state.roomId = null;
+function resetRoomView() {
+  stopTerm(false);
+  state.terms = null;
+  state.termBody = null;
+  state.termPre = null;
   state.view = null;
   state.viewError = null;
-  state.keyShown = false;
+  state.roomUi = null;
+  $("view").replaceChildren();
+}
+
+const goMachines = () => {
+  resetRoomView();
+  state.roomId = null;
   closePair();
-  show("pair", false);
-  show("room", false);
   render();
-  if (state.hello) renderRooms();
 };
 document.addEventListener("click", (event) => {
   const target = event.target instanceof Element ? event.target.closest("#back, #pair-back") : null;
@@ -1079,17 +1291,14 @@ function forgetToken() {
   state.token = "";
   state.deviceId = "";
   state.deviceSecret = "";
-  localStorage.removeItem(DEVICE_SECRET_KEY);
-  state.roomId = null;
+  state.deviceRoom = null;
   state.hello = null;
   localStorage.removeItem(TOKEN_KEY);
-  localStorage.removeItem(DEVICE_KEY);
-  if (state.ws) {
-    state.closedByUs = true;
-    state.ws.close();
-  }
+  localStorage.removeItem(PAIRS_KEY);
+  clearLegacyPair();
+  disconnect();
+  goMachines();
   $("settings").close();
-  render();
 }
 
 // ---- boot ------------------------------------------------------------------

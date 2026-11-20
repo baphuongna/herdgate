@@ -1,0 +1,26 @@
+[Unit]
+Description=Herdgate Cloud (Gateway and PWA)
+After=network.target
+
+[Service]
+DynamicUser=yes
+StateDirectory=herdgate-cloud
+StateDirectoryMode=0700
+UMask=0077
+WorkingDirectory=/opt/herdgate-cloud
+Environment=NODE_ENV=production
+Environment=HERDGATE_BIND=127.0.0.1 HERDGATE_PORT=8787
+Environment=HERDGATE_STATE=/var/lib/herdgate-cloud/state.json
+EnvironmentFile=/etc/herdgate/cloud.env
+LoadCredential=owner-token:/etc/herdgate/owner-token
+Environment=HERDGATE_ACCOUNT_TOKEN_FILE=%d/owner-token
+ExecStart=/usr/bin/node runtime/cloud/main.js
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

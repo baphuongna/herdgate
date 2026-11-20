@@ -12,7 +12,7 @@ export declare function b64d(s: string): Uint8Array;
 export declare function utf8e(s: string): Uint8Array;
 export declare function utf8d(u8: Uint8Array): string;
 export declare function concat(...parts: Uint8Array[]): Uint8Array;
-export declare function fingerprint(pub: Uint8Array): string;
+export declare function fingerprint(pub: Uint8Array): Promise<string>;
 export declare function generateKeyPair(): Promise<{ jwk: JsonWebKey; pub: Uint8Array }>;
 
 export interface NoiseWire {
@@ -25,7 +25,7 @@ export interface NoiseWire {
 export declare class DeviceChannel {
   constructor(self: { jwk: JsonWebKey; pub: Uint8Array });
   begin(): Promise<{ e: string }>;
-  acceptReply(msg: { e: string; c: string }): Promise<{ c: string }>;
+  acceptReply(msg: { e: string; c: string }, expectedHost?: string | null): Promise<{ c: string }>;
   ready(): boolean;
   hostFingerprint: string | null;
   send(obj: unknown): Promise<{ op: string; n: number; c: string }>;

@@ -40,7 +40,9 @@ test("e2e: handshake and transport, both roles, plus tamper and counter rejectio
   const host = await generateKeyPair();
   const device = await generateKeyPair();
   assert.equal(NOISE_NAME, "Noise_XX_P256_AESGCM_SHA256");
-  assert.equal(fingerprint(host.pub), fingerprint(host.pub.slice(0, 32)), "fingerprint is deterministic");
+  const hostPin = await fingerprint(host.pub);
+  assert.match(hostPin, /^SHA256:/);
+  assert.notEqual(hostPin, await fingerprint(host.pub.slice(0, 32)), "the pin covers the whole public key");
 
   const dev = new DeviceChannel(device);
   const hos = new HostChannel(host);
@@ -51,8 +53,8 @@ test("e2e: handshake and transport, both roles, plus tamper and counter rejectio
   const m3 = await dev.acceptReply({ e: (m2 as { e: string }).e, c: (m2 as { c: string }).c }); // {c}
   await hos.acceptFinish({ c: (m3 as { c: string }).c });
   assert.ok(dev.ready() && hos.ready());
-  assert.equal(dev.hostFingerprint, fingerprint(host.pub), "the device learns the host fp from the handshake");
-  assert.equal(hos.deviceFingerprint, fingerprint(device.pub));
+  assert.equal(dev.hostFingerprint, hostPin, "the device learns the host fp from the handshake");
+  assert.equal(hos.deviceFingerprint, await fingerprint(device.pub));
 
   // Transport both directions, interleaved.
   const w1 = await dev.send({ op: "view" });
@@ -63,22 +65,34 @@ test("e2e: handshake and transport, both roles, plus tamper and counter rejectio
   assert.deepEqual(got2, { op: "view", view: { n: 1 } });
 
   // Counter: replaying an old frame must fail (nonce reuse detection).
-  await assert.rejects(() => dev.recv(w2), /decrypt|operation failed|The operation/i);
+  await assert.rejects(() => dev.recv(w2), /invalid nonce counter/);
+  const batch = await Promise.all(Array.from({ length: 12 }, (_, i) => hos.send({ i })));
+  assert.deepEqual(batch.map(wire => wire.n), Array.from({ length: 12 }, (_, i) => i + 1));
+  assert.deepEqual(await Promise.all(batch.map(wire => dev.recv(wire))), Array.from({ length: 12 }, (_, i) => ({ i })));
 
-  // Tamper: flipping a byte in the ciphertext breaks the GCM tag.
-  const bytes = b64d((w2 as { c: string }).c);
+  // Tamper with a fresh frame at the expected counter: verify its GCM tag fails.
+  const fresh = await hos.send({ op: "view" });
+  await assert.rejects(() => dev.recv({ op: fresh.op, c: fresh.c }), /invalid nonce counter/);
+  const bytes = b64d(fresh.c);
   bytes[5] ^= 0xff;
-  await assert.rejects(() => dev.recv({ op: "e2e", n: 99, c: b64e(bytes) }), /decrypt|operation failed|The operation/i);
+  await assert.rejects(() => dev.recv({ ...fresh, c: b64e(bytes) }), /decrypt|operation failed|The operation/i);
+  assert.deepEqual(await dev.recv(fresh), { op: "view" });
 
   // A different static key cannot complete the handshake to the same session.
   const stranger = new DeviceChannel(await generateKeyPair());
   const s1 = await stranger.begin();
   const strangerHost = new HostChannel(host);
   const s2 = await strangerHost.acceptInit(s1);
-  const s3 = await stranger.acceptReply(s2);
+  const wrong = new DeviceChannel(device);
+  const wrongHost = new HostChannel(await generateKeyPair());
+  await assert.rejects(() => wrong.begin().then(init => wrongHost.acceptInit(init)).then(reply => wrong.acceptReply(reply, hostPin)), { code: "host-key-changed" });
+  assert.equal(wrong.ready(), false);
+  const oldPin = b64e(host.pub.slice(0, 8)).replace(/[^A-Za-z0-9]/g, "").toLowerCase().slice(0, 12);
+  const s3 = await stranger.acceptReply(s2, oldPin);
+  assert.equal(stranger.hostFingerprint, hostPin, "existing legacy pin upgrades in place");
   await strangerHost.acceptFinish(s3);
   const rogue = await stranger.send({ op: "view" });
-  await assert.rejects(() => hos.recv(rogue), /decrypt|operation failed|The operation/i);
+  await assert.rejects(() => hos.recv(rogue), /invalid nonce counter|decrypt|operation failed|The operation/i);
 });
 
 interface WireRecv {
@@ -208,7 +222,7 @@ test("e2e: a paired device handshakes through the gate and the view arrives encr
   assert.equal(reply.payload.op, "e2e.reply");
   const m3 = await ch.acceptReply({ e: reply.payload.e, c: reply.payload.c });
   sock.send({ t: "frame", payload: { op: "e2e.finish", ...m3 } });
-  assert.equal(ch.hostFingerprint, fingerprint(host.pub));
+  assert.equal(ch.hostFingerprint, await fingerprint(host.pub));
 
   // The device sends nothing encrypted until the host acks.
   const ready = (await sock.expect("frame")) as unknown as { payload: { op: string } };

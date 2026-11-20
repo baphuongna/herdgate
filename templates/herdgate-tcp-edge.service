@@ -1,0 +1,20 @@
+[Unit]
+Description=Herdgate public SSH TCP edge
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/herdgate-tcp-edge
+EnvironmentFile=/etc/herdgate-tcp-edge.env
+ExecStart=/usr/bin/node /opt/herdgate-tcp-edge/ssh-tcp-edge.mjs
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

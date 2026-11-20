@@ -16,6 +16,7 @@ import { mkdtempSync, rmSync, appendFileSync, readFileSync, existsSync, unlinkSy
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { Client } from "ssh2";
 import WebSocket from "ws";
 import { startCloud } from "../src/cloud/gateway.ts";
@@ -236,7 +237,7 @@ test("ssh leg: per-device auth, act passthrough, read filtering, hc-only", async
       maxMs: 5_000,
     });
     assert.equal(r3.code, 111, "a non-hc command is refused with exit 111");
-    assert.match(r3.out, /bridges "hc …" only/);
+    assert.match(r3.out, /not a supported Herdr or herdr-core command/);
 
     // -- 4. a wrong device key is an auth failure. --
     await assert.rejects(
@@ -397,11 +398,30 @@ test("ssh leg: publickey auth — register a key, log in without a password", as
       );
     await expectKeyReject(bad.private, "authenticated with a wrong key");
 
-    // Removing the key locks the passwordless door again.
+    // Removing one key must also close its already-authenticated connections,
+    // without affecting connections authenticated with the device password.
+    const open = async (credentials: { privateKey: string } | { password: string }) => {
+      const conn = new Client();
+      const ready = once(conn, "ready", { signal: AbortSignal.timeout(4000) });
+      conn.connect({ host: "127.0.0.1", port, username: dev.id, readyTimeout: 3000, ...credentials });
+      await ready;
+      return conn;
+    };
+    const active = await open({ privateKey: good.private });
+    const withPassword = await open({ password: dev.secret });
+    const keyClosed = once(active, "close", { signal: AbortSignal.timeout(4000) });
     const afterAdd = (await (await fetch(`${base}/v1/device/sshkey?device=${dev.id}`, { headers: { "x-herdgate-secret": dev.secret } })).json()) as { keys: { b64: string }[] };
     const del = await fetch(`${base}/v1/device/sshkey`, { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ device: dev.id, deviceSecret: dev.secret, b64: afterAdd.keys[0].b64 }) });
     assert.equal(del.status, 200);
+    await keyClosed;
     await expectKeyReject(good.private, "authenticated after key removal");
+    const passwordClosed = once(withPassword, "close", { signal: AbortSignal.timeout(4000) });
+    const revoked = await fetch(`${base}/v1/device/revoke`, {
+      method: "POST", headers: { authorization: `Bearer ${ACCOUNT}`, "content-type": "application/json" },
+      body: JSON.stringify({ device: dev.id }),
+    });
+    assert.equal(revoked.status, 200);
+    await passwordClosed;
   } finally {
     agent?.stop();
     await cloud.close();
