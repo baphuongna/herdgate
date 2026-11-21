@@ -25,6 +25,10 @@ export function scopeFor(cwd) {
   // journal scope. Reads already scan every scope, so this only converges writes.
   let real = cwd;
   try { real = realpathSync(cwd); } catch { /* deleted cwd: keep the raw path */ }
+  // Windows realpath preserves the caller's letter casing (D:\Bom vs d:\bom are
+  // the same dir on NTFS), so converge scopes case-insensitively there — verified
+  // live against the installed release on Windows (docs/herdr-skills validation).
+  if (process.platform === 'win32') real = real.toLowerCase();
   return createHash('sha256').update(real).digest('hex').slice(0, 16);
 }
 

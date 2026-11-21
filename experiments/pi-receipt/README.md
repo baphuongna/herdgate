@@ -158,3 +158,15 @@ Escape ra `unknown`/`canceled`; `/reload` và cả khởi động lại tiến t
 giữ receipt từ journal mà không gửi thêm.
 Test không chạm Gate public, profile thật, Windows hay 4G/5G. Xem thêm
 [nghiên cứu và thiết kế](../../docs/herdr-skills/HERDR_PI_EXTENSION_RESEARCH.md).
+
+
+## Nghiệm thu Windows (2026-11-21)
+
+Probe `windows-probe.mjs` chạy trên máy Windows thật (NTFS, node 22.14, qua SSH
+bridge) với release 0.9.36: **6/6 PASS** — journalBase, journal roundtrip, body
+UTF-8 (`O_NOFOLLOW`/`O_NONBLOCK` no-op), watch store (register/supersede/ack +
+persistence), watchReceipts phát settle mới, và `scopeFor` hội tụ.
+
+Phát hiện và đã sửa: `realpathSync` trên NTFS **giữ nguyên chữ hoa/thường của
+người gọi** (`D:\Bom` ≡ `d:\bom`) → scope từng bị tách thành hai. Fix: lowercase
+trước khi băm trên win32 (`plugin/server/pi-receipts.mjs`).
