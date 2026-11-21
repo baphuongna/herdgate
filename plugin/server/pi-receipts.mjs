@@ -79,7 +79,9 @@ function validEntryShape(entry) {
       && Object.keys(entry.usage).every(key => ['totalTokens', 'costUsd', 'durationMs'].includes(key))
       && Object.values(entry.usage).every(value => Number.isFinite(value)))
     && (entry.principal === undefined || PRINCIPAL.test(entry.principal)))
-    && (entry.title === undefined || validTitle(entry.title)));
+    && (entry.title === undefined || validTitle(entry.title))
+    && (entry.turns === undefined || (typeof entry.turns === 'number' && Number.isInteger(entry.turns) && entry.turns >= 0))
+    && (entry.lastActivityAt === undefined || (typeof entry.lastActivityAt === 'number' && Number.isFinite(entry.lastActivityAt))));
 }
 
 /** Parse a journal file; tolerate a torn tail and skip corrupt lines. */
@@ -122,11 +124,22 @@ export function findReceipt(base, id) {
 
 /** The public answer for a device: journal internals stay on the host.
  *  Title is prompt-derived text, so it is withheld by default (fail-safe) and
- *  only included when the caller explicitly passes withTitle: true. */
+ *  only included when the caller explicitly passes withTitle: true. Measured
+ *  activity counters (`turns`, `lastActivityAt`) are a count and a timestamp —
+ *  no conversation content — so they pass through whenever the entry has them. */
 export function publicReceipt(entry, { withTitle = false } = {}) {
   if (!entry) return { status: 'unknown', reason: 'not_retained_in_runtime' };
   const { v, ts, sessionId, paneId, title, ...rest } = entry;
   return withTitle && title !== undefined ? { ...rest, title } : rest;
+}
+
+/** True when the receipt has not seen activity for longer than staleAfterMs.
+ *  Only an observed `lastActivityAt` can say so: an entry without the field
+ *  predates the counter (or was written without transcript access), and the
+ *  difference is UNKNOWN, not stale — no guessing, fail closed to false. */
+export function isStale(entry, now = Date.now(), staleAfterMs = 30 * 60e3) {
+  if (!entry || typeof entry.lastActivityAt !== 'number' || !Number.isFinite(entry.lastActivityAt)) return false;
+  return now - entry.lastActivityAt > staleAfterMs;
 }
 
 /**

@@ -4,6 +4,8 @@
 // Journal format/readers are shared with the publisher (plugin/server/pi-receipts.mjs);
 // the journal writer is shared with the worker experiment (experiments/pi-receipt/journal.mjs).
 import { randomUUID } from 'node:crypto';
+import { closeSync, constants, openSync, readSync } from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 import { join } from 'node:path';
 import { deriveTitle, journalBase, PRINCIPAL } from '../../plugin/server/pi-receipts.mjs';
 import { MAX_JOURNAL, appendReceipt, compact as compactJournal, loadJournal, openScope, writeBody } from './journal.mjs';
@@ -44,6 +46,59 @@ function promptAfterMarker(content, marker) {
   const text = typeof content === 'string' ? content : content?.[0]?.type === 'text' ? content[0].text : undefined;
   if (typeof text !== 'string' || !text.startsWith(marker)) return undefined;
   return text.slice(marker.length).replace(/^\r?\n/, '');
+}
+
+const SESSION_CHUNK = 64 * 1024; // transcript scan buffer; files grow unbounded
+
+/**
+ * Measure a Pi session JSONL transcript: `turns` counts assistant messages,
+ * `lastActivityAt` is the newest message timestamp (message ms first, the
+ * entry's ISO timestamp as fallback, null when no message carries one). The
+ * scan reads bounded chunks and splits lines so large or still-appending
+ * transcripts never load whole into memory; corrupt or torn lines are skipped.
+ * Returns null when the transcript cannot be read — the caller then omits the
+ * count rather than guessing one.
+ */
+export function countTurnsFromSession(filePath) {
+  let fd;
+  try {
+    fd = openSync(filePath, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+  } catch {
+    return null;
+  }
+  const decoder = new StringDecoder('utf8');
+  const chunk = Buffer.alloc(SESSION_CHUNK);
+  let tail = '';
+  let turns = 0;
+  let lastActivityAt = null;
+  const absorb = line => {
+    if (!line.trim()) return;
+    let entry;
+    try { entry = JSON.parse(line); } catch { return; }
+    if (!entry || entry.type !== 'message' || !entry.message) return;
+    if (entry.message.role === 'assistant') turns++;
+    const ms = Number(entry.message.timestamp);
+    if (Number.isFinite(ms)) lastActivityAt = ms;
+    else {
+      const iso = Date.parse(entry.timestamp);
+      if (Number.isFinite(iso)) lastActivityAt = iso;
+    }
+  };
+  try {
+    for (;;) {
+      const n = readSync(fd, chunk, 0, chunk.length, null);
+      if (!n) break;
+      const lines = (tail + decoder.write(chunk.subarray(0, n))).split('\n');
+      tail = lines.pop(); // a partial line continues in the next chunk
+      for (const line of lines) absorb(line);
+    }
+    absorb(tail + decoder.end()); // final line without a trailing newline
+  } catch {
+    return null;
+  } finally {
+    try { closeSync(fd); } catch { /* already closed */ }
+  }
+  return { turns, lastActivityAt };
 }
 
 function readSuffix(manager, baseline) {
@@ -93,7 +148,7 @@ export default function observer(pi) {
     catch (error) { receipts.set(entry.id, entry); warn(error.message); }
   }
   function finish(status, fields = {}) {
-    const { id, requestEntryId, sessionId: session, cwd, retainBody, bodyText, principal, promptText } = active;
+    const { id, requestEntryId, sessionId: session, cwd, retainBody, bodyText, principal, promptText, sessionFile } = active;
     if (status === 'replied' && retainBody && bodyText) {
       try { writeBody(base, cwd, id, bodyText); }
       catch (error) { console.error(`herdgate-receipt: body archive failed (${error.code ?? 'unknown'})`); }
@@ -101,7 +156,13 @@ export default function observer(pi) {
     // Title is prompt-derived: stored on the journal entry (host-local) only —
     // the in-memory receipt and every notification stay metadata-only.
     const title = deriveTitle(promptText);
-    const entry = { v: 1, id, status, ...(requestEntryId ? { requestEntryId } : {}), sessionId: session, ts: Date.now(), ...(paneId ? { paneId } : {}), ...(principal ? { principal } : {}), ...(title ? { title } : {}), ...fields };
+    // Self-reported activity, measured at settle time from the transcript being
+    // observed: assistant turns are counted, never estimated. An unreadable
+    // transcript omits the count; the timestamp falls back to the settle
+    // itself (which is real activity), never to a guess.
+    const activity = sessionFile ? countTurnsFromSession(sessionFile) : null;
+    const entry = { v: 1, id, status, ...(requestEntryId ? { requestEntryId } : {}), sessionId: session, ts: Date.now(), ...(paneId ? { paneId } : {}), ...(principal ? { principal } : {}), ...(title ? { title } : {}), ...fields,
+      ...(activity ? { turns: activity.turns } : {}), lastActivityAt: activity?.lastActivityAt ?? Date.now() };
     const receipt = { id, status, ...(requestEntryId ? { requestEntryId } : {}), ...fields };
     active = undefined;
     record(entry);
@@ -160,7 +221,8 @@ export default function observer(pi) {
       if (active) return notify(ctx, { id: active.id, status: 'not_armed', reason: 'already_armed' });
       const id = explicitId ?? randomUUID();
       const marker = `[herdr-request:${id}]`;
-      active = { id, marker, sessionId, baseline: ctx.sessionManager.getLeafId(), deadline: performance.now() + TTL_MS, cwd: ctx.cwd, retainBody, ...(principal ? { principal } : {}) };
+      const sessionFile = ctx.sessionManager.getSessionFile?.() ?? null; // captured with the armed session
+      active = { id, marker, sessionId, baseline: ctx.sessionManager.getLeafId(), deadline: performance.now() + TTL_MS, cwd: ctx.cwd, retainBody, sessionFile, ...(principal ? { principal } : {}) };
       notify(ctx, { id, status: 'armed', marker, expiresInSeconds: TTL_MS / 1000, ...(retainBody ? { retainBody } : {}), ...(principal ? { principal } : {}) });
     },
   });
@@ -180,7 +242,8 @@ export default function observer(pi) {
       if (!stored) return notify(ctx, { id, status: 'unknown', reason: 'not_retained_in_runtime' });
       // Title stays out of the slash command's answer: notifications keep the
       // old metadata-only shape; the journal and host-local search own the title.
-      const { v, ts, sessionId: _session, paneId: _pane, title: _title, ...receipt } = stored;
+      // The activity counters follow the same rule — journal fields, not UI noise.
+      const { v, ts, sessionId: _session, paneId: _pane, title: _title, turns: _turns, lastActivityAt: _lastActivityAt, ...receipt } = stored;
       notify(ctx, { id, ...receipt });
     },
   });

@@ -96,7 +96,11 @@ function finish(payload) {
   finished = true;
   clearTimeout(timer);
   process.exitCode = out && typeof payload.text !== 'string' ? 1 : 0;
-  console.log(JSON.stringify(payload));
+  // The receipt row gains one column — measured assistant turns, '-' when the
+  // host journal predates the field (0 is a real count and shows as 0). Every
+  // other column is passed through untouched; body results keep their shape.
+  const row = payload.op === 'receipt.body.result' ? payload : { ...payload, turns: payload.turns ?? '-' };
+  console.log(JSON.stringify(row));
   ws.close();
 }
 function fail(message) {
