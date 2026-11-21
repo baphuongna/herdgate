@@ -201,6 +201,7 @@ test("web: separate room pairings survive reload, and pinned rooms reject plaint
         WebSocket: class extends WebSocket { constructor(url: string) { super(url); sockets.push(this); } },
         generateKeyPair: realCrypto ? generateKeyPair : async () => ({ jwk: {}, pub: new Uint8Array() }),
         DeviceChannel: realCrypto ? DeviceChannel : class { ready() { return false; } async begin() { return { e: "mock" }; } },
+        needsRekey: () => false,
         fetch, btoa, atob, setTimeout, clearTimeout,
       });
       const row = (id: string) => $("room-list").children.find((node) => node.querySelector(".row").dataset.roomId === id);

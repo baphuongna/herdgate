@@ -222,6 +222,8 @@ async function publisherLoop() {
     if (payload && typeof payload === "object" && typeof payload.op === "string" && payload.op.startsWith("e2e")) log(`e2e: op ${payload.op} from ${device}`);
     if (!payload || typeof payload !== "object") return null;
     if (payload.op === "e2e.init") {
+      const prior = e2eSessions.get(device);
+      if (prior?.ready()) log(`e2e: rotating session with ${device} (lifetime bound reached on the device)`);
       const ch = new HostChannel(await e2eSelfKey());
       if (wsRef !== ws || ws.readyState !== 1 || !devices.some(d => d.id === device)) return { reply: null };
       e2eSessions.set(device, ch);

@@ -1,8 +1,8 @@
 /**
  * herdgate E2E payloads — Noise_XX over the opaque payload channel.
  *
- * The PWA copy of `plugin/server/e2e.mjs` (verbatim; a test asserts the two never
- * drift). Everything
+ * One canonical implementation, two runtimes: this file is copied verbatim to
+ * `src/web/e2e.js` for the PWA (a test asserts the two never drift). Everything
  * runs on WebCrypto (`globalThis.crypto.subtle` — Node ≥ 20 exposes the same
  * object globally), so the plugin and the browser execute identical logic.
  *
@@ -21,6 +21,21 @@
 export const NOISE_NAME = "Noise_XX_P256_AESGCM_SHA256";
 export const KEY_LEN = 32;
 export const PUB_LEN = 65; // uncompressed P-256 point: 0x04 ‖ X ‖ Y
+
+/** Session lifetime (Paseo lesson: handshake lifetime). A transport key that lives
+ *  forever erodes forward secrecy — compromising it exposes the WHOLE session since
+ *  the handshake. Rotation fences exposure to the slice since the last handshake.
+ *  Bounds: messages per direction (far under nonce exhaustion at 2^32) or wall time,
+ *  whichever comes first. The device initiates; the host's `e2e.init` handler swaps
+ *  the session in place, so rotation is just a fresh handshake. */
+export const REKEY_AFTER_MESSAGES = 2 ** 24;
+export const REKEY_AFTER_MS = 24 * 60 * 60 * 1000;
+
+/** True when a READY channel has reached either lifetime bound. */
+export function needsRekey(ch, now = Date.now()) {
+  if (!ch?.ready()) return false;
+  return ch.usage() >= REKEY_AFTER_MESSAGES || now - ch.handshakeAt >= REKEY_AFTER_MS;
+}
 
 // ---- byte helpers (kept dependency-free; typed arrays only) ----------------
 
@@ -189,6 +204,7 @@ export class DeviceChannel {
   sendCs = null;
   recvCs = null;
   hostFingerprint = null;
+  handshakeAt = 0; // set when Split() runs — the rotation clock starts at ready
   constructor(self) {
     this.#self = self;
   }
@@ -218,11 +234,16 @@ export class DeviceChannel {
     const [c1, c2] = await this.#hs.split();
     this.sendCs = c1; // device → host
     this.recvCs = c2; // host → device
+    this.handshakeAt = Date.now();
     this.#e = null;
     return { c: b64e(c) };
   }
   ready() {
     return Boolean(this.sendCs && this.recvCs);
+  }
+  /** Messages carried under the current keys (max of both directions). */
+  usage() {
+    return Math.max(this.sendCs?.n ?? 0, this.recvCs?.n ?? 0);
   }
   async send(obj) {
     const { ct, n } = await this.sendCs.encrypt(this.#hs.h, utf8e(JSON.stringify(obj)));
@@ -241,6 +262,7 @@ export class HostChannel {
   sendCs = null;
   recvCs = null;
   deviceFingerprint = null;
+  handshakeAt = 0; // set when Split() runs — the rotation clock starts at ready
   constructor(self) {
     this.#self = self;
   }
@@ -266,10 +288,15 @@ export class HostChannel {
     const [c1, c2] = await this.#hs.split();
     this.recvCs = c1; // device → host (c1 encrypts initiator→responder)
     this.sendCs = c2; // host → device
+    this.handshakeAt = Date.now();
     this.#e = null;
   }
   ready() {
     return Boolean(this.sendCs && this.recvCs);
+  }
+  /** Messages carried under the current keys (max of both directions). */
+  usage() {
+    return Math.max(this.sendCs?.n ?? 0, this.recvCs?.n ?? 0);
   }
   async send(obj) {
     const { ct, n } = await this.sendCs.encrypt(this.#hs.h, utf8e(JSON.stringify(obj)));

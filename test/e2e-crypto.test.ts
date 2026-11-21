@@ -95,6 +95,43 @@ test("e2e: handshake and transport, both roles, plus tamper and counter rejectio
   await assert.rejects(() => hos.recv(rogue), /invalid nonce counter|decrypt|operation failed|The operation/i);
 });
 
+test("e2e: session lifetime — usage tracking, rekey predicate, rotation swaps both keys", async () => {
+  const { REKEY_AFTER_MESSAGES, REKEY_AFTER_MS, needsRekey } = E2E;
+  const host = await generateKeyPair();
+  const device = await generateKeyPair();
+  const up = async () => {
+    const dev = new DeviceChannel(device);
+    const hos = new HostChannel(host);
+    const m2 = await hos.acceptInit(await dev.begin());
+    await hos.acceptFinish(await dev.acceptReply(m2 as { e: string; c: string }));
+    return { dev, hos };
+  };
+  const { dev, hos } = await up();
+  assert.ok(needsRekey(dev) === false && needsRekey(hos) === false, "a fresh session needs no rotation");
+  assert.equal(dev.handshakeAt > 0 && hos.handshakeAt > 0, true, "the rotation clock starts at ready");
+  await dev.send({ op: "ping" });
+  await hos.send({ op: "pong" });
+  assert.equal(dev.usage(), 1, "usage counts messages under the current keys");
+  // Age bound: rewind the clock past the lifetime.
+  const aged = Date.now() - REKEY_AFTER_MS - 1;
+  dev.handshakeAt = aged;
+  hos.handshakeAt = aged;
+  assert.ok(needsRekey(dev) && needsRekey(hos), "an expired session needs rotation");
+  // Message bound: below-exhaustion threshold, checked without aging.
+  dev.handshakeAt = Date.now();
+  hos.handshakeAt = Date.now();
+  (dev as unknown as { sendCs: { n: number } }).sendCs.n = REKEY_AFTER_MESSAGES;
+  assert.ok(needsRekey(dev) && !needsRekey(hos), "the message bound trips per channel");
+  // Rotation is just a fresh handshake: new keys, counters reset, same identities.
+  const next = await up();
+  const wire = await next.dev.send({ op: "view" });
+  assert.equal(wire.n, 0, "the rotated channel starts its counters over");
+  assert.deepEqual(await next.hos.recv(wire), { op: "view" });
+  await assert.rejects(() => hos.recv(wire), /invalid nonce counter|decrypt|operation failed|The operation/i,
+    "the OLD channel cannot read the rotated traffic");
+  assert.equal(next.dev.hostFingerprint, dev.hostFingerprint, "the host pin survives rotation (same static key)");
+});
+
 interface WireRecv {
   t: string;
   [k: string]: unknown;

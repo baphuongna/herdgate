@@ -37,7 +37,7 @@ function clearLegacyPair() {
   localStorage.removeItem(DEVICE_SECRET_KEY);
 }
 
-import { DeviceChannel, generateKeyPair } from "/e2e.js";
+import { DeviceChannel, generateKeyPair, needsRekey } from "/e2e.js";
 
 // E2E payloads: this device's Noise_XX identity (kept locally, never sent to the cloud
 // in the clear) and the host fingerprints it has pinned (TOFU per room).
@@ -102,6 +102,19 @@ async function e2eBegin() {
   } finally {
     if (epoch === e2e.epoch) e2e.initing = false;
   }
+}
+
+/** Rotate the Noise session when a lifetime bound is hit (Paseo: handshake
+ *  lifetime). A fresh handshake swaps both directional keys and resets the
+ *  counters, fencing forward secrecy to the slice since the last rotation.
+ *  Runs after sends; the receive path checks on every inbound ciphertext. */
+function maybeRotateE2e() {
+  if (!e2e.ready || e2e.initing || e2e.keyChanged) return;
+  const ch = e2e.ch;
+  if (!ch?.ready() || !needsRekey(ch)) return;
+  console.info("e2e: rotating session (lifetime bound)");
+  e2eReset();
+  void e2eBegin();
 }
 
 // Resume bookkeeping: where this device stopped reading each room's stream, so a
@@ -1075,7 +1088,9 @@ async function onMessage(m, ws) {
           applyPayload(inner);
         } catch {
           if (state.ws === ws && e2e.ch === ch) restartEncryptedRoom();
+          return;
         }
+        maybeRotateE2e();
         return;
       }
       if (e2e.keyChanged) return;
@@ -1143,6 +1158,7 @@ async function sendPayload(message) {
     } catch {
       if (state.ws === ws && e2e.ch === ch) restartEncryptedRoom();
     }
+    maybeRotateE2e();
     return;
   }
   void e2eBegin();
