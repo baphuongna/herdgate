@@ -336,6 +336,12 @@ async function publisherLoop() {
     for (const sub of targets) {
       store.markDelivered(sub.device, entry.id);
       pushReceiptTo(sub.device, entry);
+      // A phone with the app closed misses the frame; the wake push brings it
+      // back so flushWatches can replay the settle (throttled per device).
+      const known = devices.find(d => d.id === sub.device);
+      if (known && known.connected !== false) continue;
+      log(`receipts: wake ${sub.device} (settle while offline)`);
+      wakeAway(true);
     }
   };
 

@@ -623,6 +623,7 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     await act({ op: 'worker.submit', id: replayId, prompt: 'Replay synthetic request' });
     await runWorker(); // settles with no subscriber socket attached
     assert.equal((await ask(replayId)).status, 'replied');
+    await waitFor('wake fired for the offline subscriber', () => log.some(entry => entry.includes(`receipts: wake ${probe.id}`)));
     const reconnected = new DeviceSock(`ws://127.0.0.1:${gatePort}/v1/device/ws`);
     try {
       await reconnected.hello({ device: probe.id, deviceSecret: probeSecret });
