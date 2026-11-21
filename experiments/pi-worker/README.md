@@ -148,3 +148,10 @@ scope bị `requires-act`.
   push/subscribe khi receipt đổi, PWA act UI, và đánh giá
   `@earendil-works/pi-durable` cho session durable thay SessionManager thường.
   Windows chưa nghiệm thu với `--real`.
+- **Tự khai sinh cha**: mỗi job tạo session với id chính là job id
+  (`SessionManager.create(…, {id})` — SDK hỗ trợ sẵn) rồi tự ghi vào registry
+  spawn (`experiments/pi-spawn`) với `parentSessionId: 'pi-worker'` kèm đường dẫn
+  transcript; verdict settle cập nhật lại bản ghi. Nghiệm thu live: job thật
+  `--real` → `spawn.mjs restore job-<id>` mở đúng transcript đó trong TUI
+  (restore ưu tiên `--session <file>`; `--session-id` trần sẽ tạo session rỗng
+  trùng id — bẫy đã bắt được lúc live).

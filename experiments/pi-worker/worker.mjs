@@ -84,6 +84,7 @@ if (check) {
 const { journalBase, scopeFor, findReceipt } = await import('../../plugin/server/pi-receipts.mjs');
 const { appendReceipt, loadJournal, openScope, writeBody } = await import('../pi-receipt/journal.mjs');
 const { appendJob, jobsFile, readJobs, readWorkspaces, workerBase } = await import('../../plugin/server/pi-worker.mjs');
+const { recordSelf } = await import('../pi-spawn/registry.mjs');
 
 const base = workerBase();
 const file = jobsFile(base);
@@ -127,10 +128,13 @@ function message(model, text) {
   };
 }
 
-async function makeSession(wsPath) {
+async function makeSession(wsPath, jobId) {
   const sessionsDir = join(base, 'sessions');
   mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
-  const sessionManager = SessionManager.create(wsPath, sessionsDir);
+  // One-id chain: the SDK accepts a chosen session id, so a job's Pi session IS its
+  // receipt request id — the same invariant the TUI spawn flow enforces with
+  // `pi --session-id`.
+  const sessionManager = SessionManager.create(wsPath, sessionsDir, jobId ? { id: jobId } : {});
   if (real) {
     // Real provider: the host Pi's own credentials, models.json and settings default
     // model. The manager is read-only here (no setters are called), so worker jobs
@@ -280,9 +284,21 @@ async function runJob(job, allowlist) {
     return verdict;
   }
   const wsPath = route.path;
-  const { session, sessionManager } = await makeSession(wsPath);
+  const { session, sessionManager } = await makeSession(wsPath, job.id);
   const sessionId = sessionManager.getSessionId();
   appendJob(file, { ...job, state: 'running', sessionId });
+  // The job session declares its own parent (ownership edge, pi-durable style), so
+  // the spawn registry covers SDK children too — restore reopens this exact session
+  // (by transcript file path: worker sessions live outside Pi's default storage,
+  // where a bare --session-id would silently mint an empty look-alike).
+  const selfRegister = status => {
+    try {
+      return recordSelf(receiptsBase, { sessionId, parentSessionId: 'pi-worker',
+        id: job.id, name: `job-${job.id.slice(0, 8)}`, cwd: wsPath,
+        sessionFile: sessionManager.getSessionFile(), ts: Date.now(), ...status });
+    } catch (error) { log(`self-register failed: ${error.message}`); return null; }
+  };
+  selfRegister();
   let verdict = { status: 'failed', reason: 'worker_error' };
   const done = (async () => {
     try {
@@ -344,6 +360,7 @@ async function runJob(job, allowlist) {
     ...('requestEntryId' in verdict ? { requestEntryId: verdict.requestEntryId } : {}),
     ...('responseEntryId' in verdict ? { responseEntryId: verdict.responseEntryId } : {}) });
   counters.verdicts[verdict.status] = (counters.verdicts[verdict.status] ?? 0) + 1;
+  selfRegister({ status: verdict.status }); // supersede in place: list reflects the settle
   log(`job ${job.id} -> ${verdict.status}${verdict.reason ? `/${verdict.reason}` : ''}`);
   return verdict;
 }

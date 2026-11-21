@@ -8,6 +8,7 @@ import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { appendJob, heartbeatPath, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, readWorkspaces, scheduledRunId, validJob, versionAtLeast, workspacesFile, writeHeartbeat, workerBase, JOB_ID, MIN_PI_VERSION } from '../plugin/server/pi-worker.mjs';
 import { findReceipt, journalBase, scopeFor } from '../plugin/server/pi-receipts.mjs';
+import { readSpawns } from '../experiments/pi-spawn/registry.mjs';
 
 const root = join(import.meta.dirname, '..');
 const piBin = process.env.TEST_PI_BIN;
@@ -241,6 +242,14 @@ test('the worker drains a seeded queue once and journals metadata-only receipts'
   assert.ok(!raw.includes('tiếng Việt') && !raw.includes('synthetic'), 'receipts must not contain prompt text');
   assert.equal(findReceipt(receiptsDir, one)?.status, 'replied');
   assert.equal(findReceipt(receiptsDir, one)?.responseEntryId, oneHash.responseEntryId);
+  // Each job session self-registers its parent in the spawn registry (same workspace scope).
+  const spawns = readSpawns(join(receiptsDir, scopeFor(workspace), 'spawns.jsonl'));
+  const selfEntry = spawns.find(s => s.sessionId === oneHash.sessionId);
+  assert.equal(selfEntry?.parentSessionId, 'pi-worker', 'a worker job declares its own parent');
+  assert.equal(selfEntry?.id, selfEntry?.sessionId, 'one-id chain: the self entry is its own receipt id');
+  assert.equal(selfEntry?.paneId, undefined, 'no pane — restore attaches one later');
+  assert.ok(selfEntry?.sessionFile && existsSync(selfEntry.sessionFile), 'the transcript path is recorded for exact restore');
+  assert.equal(selfEntry?.status, 'replied', 'the entry settles with the verdict, not the spawn-time status');
   const calls = () => events(fixtureDir).filter(e => e.event === 'call').length;
   assert.equal(calls(), 2);
   assert.equal(events(fixtureDir).find(e => e.event === 'call')?.inputHash,

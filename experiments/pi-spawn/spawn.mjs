@@ -6,6 +6,7 @@
 // closed pane reopens with one command using the same --session-id flag.
 //
 //   node experiments/pi-spawn/spawn.mjs spawn <name> [--cwd DIR] [--tab] [--parent-session ID] [-- extra pi args]
+//   node experiments/pi-spawn/spawn.mjs self --parent <id> --name <n> [--cwd DIR] [--id UUID]
 //   node experiments/pi-spawn/spawn.mjs arm <name-or-id> [--body]   # /herdgate-arm with THE spawn id
 //   node experiments/pi-spawn/spawn.mjs list                        # + receipt status per child
 //   node experiments/pi-spawn/spawn.mjs restore <name-or-id>
@@ -19,7 +20,8 @@
 // -- --thinking low for fast turns.
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { findSpawn, recordSpawn, readSpawns, spawnBase, spawnsFile, updateSpawn } from './registry.mjs';
+import { existsSync } from 'node:fs';
+import { findSpawn, recordSelf, recordSpawn, readSpawns, spawnBase, spawnsFile, updateSpawn } from './registry.mjs';
 import { findReceipt } from '../../plugin/server/pi-receipts.mjs';
 
 const herdr = () => process.env.HERDR_BIN_PATH || 'herdr';
@@ -74,6 +76,19 @@ if (command === 'spawn') {
     ...(parent ? { parentSessionId: parent } : {}), cwd, ts: Date.now() });
   console.log(JSON.stringify({ ...entry, parent: parent ?? null,
     bound: bindingOf(run('pane', 'list').result.panes ?? [], pane) === id }));
+} else if (command === 'self') {
+  // An agent declares its own parent (the pi-durable ownership edge, herdgate-style):
+  // worker job sessions and SDK-spawned children register themselves, so the registry
+  // covers every live child — not only ones a controller pane-split.
+  const parent = flag('parent');
+  const name = flag('name');
+  if (!parent || !name) fail('usage: self --parent <session-id> --name <name> [--cwd DIR] [--id UUID]');
+  const { parentSessionId } = myBinding();
+  const id = flag('id') ?? parentSessionId;
+  if (!id) fail('could not resolve this pane\'s session id — pass --id <uuid>');
+  const entry = recordSelf(spawnBase(), { sessionId: id, parentSessionId: parent, name,
+    cwd: flag('cwd', process.cwd()), ts: Date.now() });
+  console.log(JSON.stringify({ ...entry, registered: 'self' }));
 } else if (command === 'arm') {
   if (!arg) fail('usage: arm <name-or-id> [--body]');
   const entry = findSpawn(spawnBase(), arg);
@@ -110,8 +125,8 @@ if (command === 'spawn') {
 } else if (command === 'list') {
   const { panes } = myBinding();
   const rows = readSpawns(spawnsFile(spawnBase())).map(e => ({
-    name: e.name, id: e.id, pane: e.paneId, status: e.status,
-    live: panes.some(p => p.pane_id === e.paneId) ? 'attached' : 'gone',
+    name: e.name, id: e.id, pane: e.paneId ?? null, status: e.status,
+    live: e.paneId ? (panes.some(p => p.pane_id === e.paneId) ? 'attached' : 'gone') : (e.self ? 'self' : 'gone'),
     receipt: findReceipt(spawnBase(), e.id)?.status ?? 'none',
     parent: (e.parentSessionId ?? '').slice(0, 8) || null, ts: e.ts,
   }));
@@ -128,9 +143,13 @@ if (command === 'spawn') {
     : run(...(myPane
       ? ['pane', 'split', '--pane', myPane, '--direction', 'down', '--no-focus', '--cwd', dir]
       : ['pane', 'split', '--current', '--direction', 'down', '--no-focus', '--cwd', dir])).result.pane.pane_id;
+  // A transcript file path reopens the exact session (worker children live outside
+  // Pi's default storage; a bare --session-id would mint an empty look-alike).
+  const sessionArgs = entry.sessionFile && existsSync(entry.sessionFile)
+    ? ['--session', entry.sessionFile] : ['--session-id', entry.sessionId];
   try {
     run('agent', 'start', entry.name, '--kind', 'pi', '--pane', pane, '--timeout', '45000',
-      '--', '--session-id', entry.sessionId);
+      '--', ...sessionArgs);
   } catch (error) {
     fail(`agent start failed: ${String(error.message).slice(0, 300)}`);
   }

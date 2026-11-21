@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { COMPACT_AT, MAX_SPAWNS, readSpawns, recordSpawn, spawnsFile, updateSpawn } from '../experiments/pi-spawn/registry.mjs';
+import { COMPACT_AT, MAX_SPAWNS, readSpawns, recordSelf, recordSpawn, spawnsFile, spawnsFileFor, updateSpawn } from '../experiments/pi-spawn/registry.mjs';
 import { scopeFor } from '../plugin/server/pi-receipts.mjs';
 
 const roots: string[] = [];
@@ -45,6 +45,32 @@ test('the registry stays bounded and survives a fresh process', () => {
     `bounded between the keep floor and the compact bound (got ${stored.length})`);
   assert.equal(stored.at(-1)?.paneId, `p${COMPACT_AT + 4}`, 'the newest record is never dropped');
   assert.equal(readSpawns(spawnsFile(base)).length, stored.length, 'a new process reads the same registry');
+});
+
+test('self-registered children declare their own parent without a pane', () => {
+  const base = root();
+  const ws = join(base, 'ws');
+  mkdirSync(ws, { recursive: true });
+  // A worker job session: id defaults to its own session id (one-id chain), no pane yet.
+  const self = recordSelf(base, { sessionId: uuid(7), parentSessionId: 'pi-worker',
+    name: 'job-abc12345', cwd: ws, ts: 1 });
+  assert.equal(self.id, uuid(7), 'a self-registered child is its own receipt id');
+  assert.equal(self.status, 'self');
+  assert.equal(self.paneId, undefined);
+  const stored = readSpawns(spawnsFileFor(base, ws));
+  assert.equal(stored.length, 1, 'the record lands in the workspace scope the child runs in');
+  assert.equal(stored[0].parentSessionId, 'pi-worker');
+  // Restoring later attaches a pane; a re-registration (same id) still supersedes in place.
+  const again = recordSelf(base, { sessionId: uuid(7), parentSessionId: 'pi-worker',
+    name: 'job-abc12345', cwd: ws, ts: 2, paneId: 'w8:pZ' });
+  assert.equal(again.paneId, 'w8:pZ');
+  const after = readSpawns(spawnsFileFor(base, ws));
+  assert.equal(after.length, 1, 'supersede keeps one record');
+  assert.equal(after[0].paneId, 'w8:pZ', 'a self entry with a pane stays valid');
+  // Invalid: no parent declared, or a non-uuid session.
+  assert.throws(() => recordSelf(base, { sessionId: uuid(8), name: 'orphan', ts: 1 }), /invalid_self/);
+  assert.throws(() => recordSelf(base, { sessionId: 'not-a-uuid', parentSessionId: 'pi-worker',
+    name: 'job-x', ts: 1 }), /invalid_self/);
 });
 
 test('temporary spawn registries are cleaned up', () => {

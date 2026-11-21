@@ -10,17 +10,29 @@ export const MAX_SPAWNS = 200;
 export const COMPACT_AT = 300;
 export const SPAWN_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
 const PANE = /^[\w:.-]{1,32}$/;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+// Pi session ids are v7 (SDK-generated); receipt request ids are v4. Both are one-id
+// chain material, so the registry accepts either shape.
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+export function spawnsFileFor(base, cwd) {
+  return join(base, scopeFor(cwd), 'spawns.jsonl');
+}
 
 export function spawnsFile(base) {
-  return join(base, scopeFor(process.cwd()), 'spawns.jsonl');
+  return spawnsFileFor(base, process.cwd());
 }
 
 function valid(entry) {
+  // Controller entries carry the pane they run in; self-registered ones (an agent
+  // declaring its own parent, e.g. a worker job session) have no pane until restored.
+  const paneOk = entry?.self === true
+    ? (entry.paneId === undefined || PANE.test(entry.paneId))
+    : PANE.test(entry?.paneId ?? '');
   return Boolean(entry && UUID.test(entry.id ?? '') && typeof entry.sessionId === 'string' && entry.sessionId
-    && PANE.test(entry.paneId ?? '') && SPAWN_NAME.test(entry.name ?? '')
+    && paneOk && SPAWN_NAME.test(entry.name ?? '')
     && (entry.parentSessionId === undefined || typeof entry.parentSessionId === 'string')
     && (entry.cwd === undefined || typeof entry.cwd === 'string')
+    && (entry.sessionFile === undefined || typeof entry.sessionFile === 'string')
     && Number.isFinite(entry.ts));
 }
 
@@ -70,6 +82,22 @@ export function updateSpawn(base, id, patch) {
 export function findSpawn(base, ref) {
   const entries = readSpawns(spawnsFile(base));
   return entries.find(e => e.id === ref || e.name === ref) ?? null;
+}
+
+/** Record an agent declaring its OWN parent (no controller pane involved). */
+export function recordSelf(base, self) {
+  if (!self?.sessionId || !UUID.test(self.sessionId) || typeof self.parentSessionId !== 'string'
+    || !self.parentSessionId || !SPAWN_NAME.test(self.name ?? '')) throw new Error('invalid_self');
+  // One-id chain: a self-registered child serves as its own receipt request id.
+  // Scoped to the workspace the child runs in, so a controller sitting there sees it.
+  const spawn = { status: 'self', ...self, id: self.id ?? self.sessionId, self: true };
+  if (!valid(spawn)) throw new Error('invalid_self');
+  const file = spawnsFileFor(base, self.cwd ?? process.cwd());
+  let entries = readSpawns(file).filter(entry => entry.id !== spawn.id);
+  entries.push(spawn);
+  if (entries.length > COMPACT_AT) entries = entries.slice(-MAX_SPAWNS);
+  write(file, entries);
+  return spawn;
 }
 
 export function spawnBase() {
