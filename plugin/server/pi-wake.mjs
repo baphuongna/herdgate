@@ -55,13 +55,16 @@ export function wakeFrame(entry, spawn) {
 
 /** Build the onSettle callback for watchReceipts.
  *
- *  Delivery waits for the parent to be IDLE. Observed live (wtest2): a wake
- *  injected while the parent's turn is still writing parents itself to a stale
- *  leaf and forks the session tree — the handling turn then runs completely on
- *  an orphan branch that neither the human's view nor the parent's context ever
- *  adopts, and everyone swears nothing arrived. Injecting only between turns
- *  keeps the wake on the live branch. */
-export function wakeParentOnSettle({ spawnBase, run, listPanes, agentState, log = () => {}, retryDelayMs = () => new Promise(r => setTimeout(r, 3000)), maxWaitMs = 15 * 60 * 1000 }) {
+ *  Delivery waits for the parent to be BETWEEN TURNS, stably. Two live
+ *  incidents (wtest2, wfork1) showed why "idle" alone is not enough: herdr
+ *  flips the agent idle milliseconds BEFORE the turn's final message lands, so
+ *  a wake injected at that instant becomes a PENDING message, and Pi's pending
+ *  queue then forks the session tree from a stale leaf — the handling turn runs
+ *  in full on an orphan branch that neither the human's view nor the parent's
+ *  context ever adopts, and everyone swears nothing arrived. Waiting for the
+ *  agent revision to hold steady across two probes proves the turn truly
+ *  closed; the injected text then submits against the live leaf. */
+export function wakeParentOnSettle({ spawnBase, run, listPanes, agentState, agentProbe, log = () => {}, retryDelayMs = () => new Promise(r => setTimeout(r, 3000)), settleDelayMs = () => new Promise(r => setTimeout(r, 2000)), maxWaitMs = 15 * 60 * 1000 }) {
   return (entry) => {
     try {
       if (!entry?.sessionId || !entry?.id) return;
@@ -70,7 +73,7 @@ export function wakeParentOnSettle({ spawnBase, run, listPanes, agentState, log 
       const deliver = (pane, waited) => {
         try {
           run('agent', 'prompt', pane, wakeFrame(entry, spawn));
-          log(`wake: child ${spawn.name} ${entry.status} -> parent pane ${pane}${waited ? ` (waited ${(waited / 1000) | 0}s for idle)` : ''}`);
+          log(`wake: child ${spawn.name} ${entry.status} -> parent pane ${pane}${waited ? ` (waited ${(waited / 1000) | 0}s for a quiet parent)` : ''}`);
         } catch (error) {
           log(`wake failed: ${error instanceof Error ? error.message : String(error)}`); // agent_blocked etc: never fatal
         }
@@ -80,17 +83,46 @@ export function wakeParentOnSettle({ spawnBase, run, listPanes, agentState, log 
         log(`wake: parent ${String(spawn.parentSessionId).slice(0, 8)} pane gone — child ${spawn.name} ${entry.status}`);
         return;
       }
-      if (!agentState) return deliver(pane, 0); // no probe available: deliver as before
+      if (!agentProbe) {
+        // Legacy single-state probe: idle means deliver (kept for callers
+        // without a revision; the rich probe above is the safe path).
+        if (!agentState) return deliver(pane, 0);
+        const started = Date.now();
+        const attemptState = () => {
+          let state = 'unknown';
+          try { state = agentState(pane) ?? 'unknown'; }
+          catch { state = 'unknown'; }
+          if (state === 'idle') return deliver(pane, Date.now() - started);
+          if (Date.now() - started >= maxWaitMs) {
+            return log(`wake: parent pane ${pane} stayed ${state} for ${(maxWaitMs / 60000) | 0}min — dropped wake for ${spawn.name} (journal keeps the settle)`);
+          }
+          void retryDelayMs().then(attemptState);
+        };
+        return attemptState();
+      }
       const started = Date.now();
       const attempt = () => {
-        let state = 'unknown';
-        try { state = agentState(pane) ?? 'unknown'; }
-        catch { state = 'unknown'; }
-        if (state === 'idle') return deliver(pane, Date.now() - started);
-        if (Date.now() - started >= maxWaitMs) {
-          return log(`wake: parent pane ${pane} stayed ${state} for ${(maxWaitMs / 60000) | 0}min — dropped wake for ${spawn.name} (journal keeps the settle)`);
+        let probe = null;
+        try { probe = agentProbe(pane); } catch { probe = null; }
+        const state = probe?.status ?? 'unknown';
+        if (state === 'working' || state === 'blocked' || !probe) {
+          if (Date.now() - started >= maxWaitMs) {
+            return log(`wake: parent pane ${pane} stayed ${state} for ${(maxWaitMs / 60000) | 0}min — dropped wake for ${spawn.name} (journal keeps the settle)`);
+          }
+          return void retryDelayMs().then(attempt);
         }
-        void retryDelayMs().then(attempt);
+        // Idle-ish: prove the turn CLOSED — the revision must hold across a settle delay.
+        void settleDelayMs().then(() => {
+          let again = null;
+          try { again = agentProbe(pane); } catch { again = null; }
+          if (again && again.status !== 'working' && again.status !== 'blocked' && again.revision === probe.revision) {
+            return deliver(pane, Date.now() - started);
+          }
+          if (Date.now() - started >= maxWaitMs) {
+            return log(`wake: parent pane ${pane} never quieted (${state}→${again?.status ?? '?'}, rev ${probe.revision}→${again?.revision ?? '?'}) — dropped wake for ${spawn.name}`);
+          }
+          void retryDelayMs().then(attempt);
+        });
       };
       attempt();
     } catch (error) {

@@ -127,7 +127,7 @@ test('delivery waits for the parent to go idle — never forks the session tree'
   await new Promise(r => setTimeout(r, 60));
   assert.equal(delivered.length, 1, 'delivered exactly once, after idle');
   assert.equal(probes, 4, 'probed until the parent was idle');
-  assert.match(logs.at(-1)!, /waited \d+s for idle/);
+  assert.match(logs.at(-1)!, /waited \d+s/);
 
   // a parent that never goes idle: the wake is dropped, never injected mid-turn
   delivered.length = 0;
@@ -145,4 +145,36 @@ test('delivery waits for the parent to go idle — never forks the session tree'
   await new Promise(r => setTimeout(r, 80));
   assert.equal(delivered.length, 0, 'never injected into a busy parent');
   assert.match(logs.at(-1)!, /stayed working/);
+});
+
+test('idle is not enough: the revision must hold steady across the settle delay', async () => {
+  const base = spawnFixture();
+  const delivered: string[][] = [];
+  const logs: string[] = [];
+  const panes = [{ pane_id: 'w9:p0', agent_session: { value: `/x/a_${PARENT}.jsonl` } }];
+  // The wfork1 race, replayed: herdr flips 'idle' BEFORE the turn's final
+  // message lands — the revision keeps moving under an idle-looking status.
+  let revision = 681;
+  const bump = () => { revision += 1; };
+  let round = 0;
+  const wake = wakeParentOnSettle({
+    spawnBase: base,
+    run: (...args: string[]) => { delivered.push(args); return {}; },
+    listPanes: () => panes,
+    agentProbe: () => {
+      round += 1;
+      // round 1: idle but the turn is still closing (bumped during the settle delay)
+      if (round === 1) { setTimeout(bump, 5); return { status: 'idle', revision }; }
+      return { status: 'idle', revision };
+    },
+    log: (m: string) => logs.push(m),
+    retryDelayMs: () => new Promise(r => setTimeout(r, 5)),
+    settleDelayMs: () => new Promise(r => setTimeout(r, 10)),
+    maxWaitMs: 5_000,
+  });
+  wake(entry());
+  await new Promise(r => setTimeout(r, 120));
+  assert.equal(delivered.length, 1, 'delivered once the revision held steady');
+  assert.ok(round >= 3, `re-probed through the race (rounds: ${round})`);
+  assert.match(logs.at(-1)!, /quiet parent/);
 });

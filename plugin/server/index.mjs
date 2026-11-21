@@ -406,7 +406,10 @@ async function publisherLoop() {
             spawnBase: receiptJournalBase(),
             run: runHerdr,
             listPanes: () => { try { return runHerdr("pane", "list").result.panes ?? []; } catch { return []; } },
-            agentState: pane => runHerdr("agent", "get", pane).result.agent?.agent_status,
+            agentProbe: pane => {
+              const agent = runHerdr("agent", "get", pane).result.agent;
+              return { status: agent?.agent_status, revision: agent?.revision ?? null };
+            },
             log,
           });
           receiptWatch = watchReceipts(receiptJournalBase(), (entry) => {
