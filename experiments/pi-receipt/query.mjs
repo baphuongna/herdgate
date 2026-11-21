@@ -5,6 +5,9 @@
 //   node experiments/pi-receipt/query.mjs --gate https://gate.example.com \
 //     --device d_xxx --secret <device secret> --id <request uuid> [--wait [--timeout 300]]
 //     [--body [--out /path/to/report.md]]
+// or search the journal remotely (metadata hits only, no snippets):
+//   node experiments/pi-receipt/query.mjs --gate ... --device ... --secret ... \
+//     --search "noise rekey" [--limit 10] [--all]
 //
 // --wait listens for the settle push after one initial lookup. --body fetches
 // the archived reply for either a new push or an already-settled receipt.
@@ -22,13 +25,17 @@ const arg = (name, fallback) => {
   return value;
 };
 const opt = name => process.argv.includes(`--${name}`);
-const id = arg('id');
+const search = opt('search') ? process.argv[process.argv.indexOf('--search') + 1] : undefined;
+if (opt('search') && (!search || search.startsWith('--'))) { console.error('missing --search <query>'); process.exit(2); }
+const id = search ? null : arg('id');
 const wait = opt('wait');
 const wantBody = opt('body');
 const out = opt('out') ? arg('out') : undefined;
 const seconds = Number(arg('timeout', '300'));
 if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 2_147_483) { console.error('invalid --timeout'); process.exit(2); }
 if (out && !wantBody) { console.error('--out requires --body'); process.exit(2); }
+if (search && (id || wantBody || wait)) { console.error('--search cannot combine with --id/--body/--wait'); process.exit(2); }
+if (!search && !id) { console.error('missing --id (or use --search <query>)'); process.exit(2); }
 const timeoutMs = seconds * 1000;
 
 const gate = arg('gate').replace(/\/$/, '').replace(/^http/, 'ws');
@@ -47,14 +54,23 @@ ws.on('message', (data, isBinary) => {
   if (isBinary) return;
   const message = JSON.parse(String(data));
   if (message.t === 'hello') {
-    ws.send(JSON.stringify({ v: 1, t: 'frame', payload: { op: 'receipt.get', id } }));
+    ws.send(JSON.stringify({ v: 1, t: 'frame', payload: search
+      ? { op: 'receipt.search', query: search, limit: Number(arg('limit', '10')), all: opt('all') }
+      : { op: 'receipt.get', id } }));
     return;
   }
   if (message.t === 'error') return fail(JSON.stringify(message));
   if (message.t !== 'frame' || finished) return;
   const payload = message.payload ?? {};
   if (payload.op === 'error') return fail(JSON.stringify(payload));
-  if (payload.id !== id) return;
+  if (payload.op === 'receipt.search.result') {
+    finished = true;
+    clearTimeout(timer);
+    console.log(JSON.stringify(payload));
+    ws.close();
+    return;
+  }
+  if (search || payload.id !== id) return;
   if (payload.op === 'receipt.body.result' && fetchingBody) return finish(payload);
   if (payload.op === 'receipt.result' && wait && !settled(payload)) return registerWatch();
   if (payload.op === 'receipt.watched' && payload.pending) return; // armed; the settle will arrive as a push

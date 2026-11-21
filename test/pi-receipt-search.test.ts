@@ -5,8 +5,8 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
-const mod = await import('../experiments/pi-receipt/search.mjs');
-const { tokenize, buildIndex, searchIndex, snippet, collectDocs } = mod;
+const mod = await import('../plugin/server/pi-receipt-search.mjs');
+const { tokenize, buildIndex, searchIndex, snippet, collectDocs, searchReceipts } = mod;
 const cli = new URL('../experiments/pi-receipt/search.mjs', import.meta.url).pathname;
 const roots: string[] = [];
 const mkRoot = () => { const r = mkdtempSync(join(tmpdir(), 'hg-pi-search-')); roots.push(r); return r; };
@@ -73,7 +73,7 @@ test('collectDocs merges journal, body archive and transcript by sessionId', () 
     sessionLine('assistant', 'đã xoay xong, handshake mới lập'),
   ].join('\n') + '\n');
 
-  const docs = collectDocs({ base, sessionsDir: sessions });
+  const docs = collectDocs({ base, sessionsRoot: sessions });
   assert.equal(docs.length, 3);                                  // r1 r2 r3; corrupt + no-session skipped
   const r1 = docs.find(d => d.id === 'r1')!;
   assert.ok(r1.text.includes('FINAL ANSWER: the gate rotated')); // body archive searched
@@ -81,7 +81,7 @@ test('collectDocs merges journal, body archive and transcript by sessionId', () 
   assert.ok(r1.text.includes('đã xoay xong'));                   // transcript reply searched
   assert.equal(r1.sessionFile, join(sessions, 'slug-one', `2026-11-20T10-00-00-000Z_${sA}.jsonl`));
   assert.ok(docs.find(d => d.id === 'r2')!.text.includes('pi_error'));  // metadata tokens
-  const bare = collectDocs({ base, sessionsDir: join(root, 'missing') });
+  const bare = collectDocs({ base, sessionsRoot: join(root, 'missing') });
   assert.equal(bare.length, 3);                                  // missing sessions dir is not fatal
   rmSync(root, { recursive: true, force: true });
 });
@@ -116,4 +116,36 @@ test('cli: json shape, id mode, no-match exit, and session dedupe', () => {
   const none = run(['zzz-no-such-term', '--base', base, '--sessions', sessions]);
   assert.equal(none.status, 1);
   assert.match(none.stderr, /no receipts match/);
+});
+
+test('searchReceipts hands a device only publicReceipt-shaped hits', () => {
+  const { base, sessions } = fixture();
+  const sA = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  const sB = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+  writeFileSync(join(base, 'aaaaaaaaaaaaaaaa', 'receipts.jsonl'), [
+    JSON.stringify(entry({ id: 'hit-1', sessionId: sA, ts: 1, paneId: 'w8:pZ', usage: { totalTokens: 10, costUsd: 0.01 } })),
+    JSON.stringify(entry({ id: 'hit-2', sessionId: sA, ts: 2 })),
+    JSON.stringify(entry({ id: 'other', sessionId: sB, ts: 3 })),
+  ].join('\n') + '\n');
+  mkdirSync(join(sessions, 'slug-a'), { recursive: true });
+  writeFileSync(join(sessions, 'slug-a', `2026-11-20T13-00-00-000Z_${sA}.jsonl`),
+    sessionLine('user', 'wake frame scheduler bucket fired') + '\n');
+  mkdirSync(join(sessions, 'slug-b'), { recursive: true });
+  writeFileSync(join(sessions, 'slug-b', `2026-11-20T14-00-00-000Z_${sB}.jsonl`),
+    sessionLine('user', 'nothing relevant here') + '\n');
+
+  const hits = searchReceipts({ base, sessionsRoot: sessions, query: 'scheduler wake' });
+  assert.equal(hits.length, 1);                       // both sA receipts collapse into one hit
+  const hit = hits[0];
+  assert.equal(hit.id, 'hit-2');                      // newest receipt of the session wins the tie
+  assert.equal(hit.status, 'replied');
+  assert.ok(hit.score > 0);
+  // publicReceipt discipline: journal internals and text never leave the host.
+  for (const key of ['sessionId', 'ts', 'paneId', 'snippet', 'sessionFile', 'text'])
+    assert.ok(!(key in hit), `leaked ${key}`);
+  // the hit is the session's newest receipt — usage shows only when it has one
+  assert.equal(hit.usage, undefined);
+  assert.equal(searchReceipts({ base, sessionsRoot: sessions, query: 'zzz-none' }).length, 0);
+  assert.deepEqual(searchReceipts({ base: join(base, 'missing'), sessionsRoot: sessions, query: 'wake' }), []); // fail closed
+  assert.equal(searchReceipts({ base, sessionsRoot: sessions, query: 'scheduler wake', all: true, limit: 5 }).length, 2);
 });

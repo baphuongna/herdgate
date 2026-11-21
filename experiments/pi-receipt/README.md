@@ -133,7 +133,24 @@ Mỗi receipt là một document BM25 (Okapi k1=1.2 b=0.75) ghép từ: body arc
 theo `sessionId`) → token metadata (status/reason/pane/tokens/cost). Kết quả mặc định
 dedupe theo session (một transcript dài không tràn cả trang); `--all` tắt. Tokenizer
 chuẩn hoá NFC nên `khóa`/`khoá` NFD gõ tay vẫn khớp. Test: `node --test
- test/pi-receipt-search.test.ts` (5 test, gồm CLI e2e).
+ test/pi-receipt-search.test.ts` (6 test, gồm CLI e2e).
+
+### Tìm kiếm từ xa qua Gate (`receipt.search`)
+
+Core BM25 nằm ở `plugin/server/pi-receipt-search.mjs`; publisher phục vụ op
+`receipt.search` trên device channel (cùng gate `HERDGATE_PI_RECEIPTS=1`):
+
+```sh
+node experiments/pi-receipt/query.mjs --gate https://gate.example.com \
+  --device d_xxx --secret <secret> --search "noise rekey" [--limit 10] [--all]
+```
+
+Scoring chạy host-side (được đọc body/transcript — file local của user); kết quả
+đưa cho device **chỉ là metadata dạng publicReceipt**: `id, score, status, reason,
+usage` — không snippet, không sessionId, không timestamp (search chỉ *tìm ra id*;
+nội dung văn bản phải đi qua `receipt.body` với gate kép riêng của nó). Mỗi query
+cap 200 ký tự, limit 1–50, dedupe theo session mặc định. Fail-closed: journal
+không đọc được → trả mảng rỗng.
 
 ### Truy vấn qua Gate (thử nghiệm)
 

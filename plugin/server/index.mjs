@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead } from "./common.mjs";
 import { createSshBridge } from "./ssh.mjs";
 import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
+import { searchReceipts, sessionsDir as piSessionsDir } from "./pi-receipt-search.mjs";
 import { openWatchStore } from "./pi-receipt-watch.mjs";
 import { JOB_ID, MAX_PENDING, MAX_PROMPT, WORKSPACE_NAME, appendJob, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, workerBase } from "./pi-worker.mjs";
 import { registerPublisher } from "./publisher-tui-lifecycle.mjs";
@@ -447,6 +448,23 @@ async function publisherLoop() {
           log(`receipts: ${m.device} queried ${id || "?"} -> ${entry ? entry.status : "unknown"}`);
           return void replyTo({ op: "receipt.result", id: id || null,
             ...publicReceipt(entry), ...(enabled ? {} : { reason: "pi_receipts_disabled" }) });
+        }
+        if (op === "receipt.search") {
+          // Experimental (opt-in HERDGATE_PI_RECEIPTS=1): BM25 keyword search over
+          // the journal; bodies and transcripts score host-side only. Hits are
+          // publicReceipt-shaped (id, score, status, reason, usage) — no snippet,
+          // no sessionId, no session file, no timestamps. Search finds ids; the
+          // gated receipt.body op serves any text.
+          const enabled = process.env.HERDGATE_PI_RECEIPTS === "1";
+          const query = typeof payload.query === "string" ? payload.query.slice(0, 200) : "";
+          const limit = Number(payload.limit);
+          const hits = enabled && query.trim()
+            ? searchReceipts({ base: receiptJournalBase(), sessionsRoot: piSessionsDir(), query,
+                limit: Number.isFinite(limit) ? limit : 10, all: payload.all === true })
+            : [];
+          log(`receipts: ${m.device} search ${JSON.stringify(query)} -> ${hits.length} hit(s)`);
+          return void replyTo({ op: "receipt.search.result",
+            ...(enabled ? { hits } : { hits: [], reason: "pi_receipts_disabled" }) });
         }
         if (op === "receipt.watch" || op === "receipt.ack") {
           // Experimental (opt-in HERDGATE_PI_RECEIPTS=1): durable per-request push
