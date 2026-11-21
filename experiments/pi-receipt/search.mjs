@@ -60,7 +60,8 @@ for (const h of hits) {
   const m = h.doc.meta;
   const when = new Date(m.ts).toISOString().replace('T', ' ').slice(0, 19);
   const cost = m.usage ? ` ${m.usage.totalTokens}t $${m.usage.costUsd?.toFixed(4)}` : '';
-  console.log(`${h.score.toFixed(2).padStart(6)}  ${m.id}  ${when}  ${m.status}${m.reason ? `/${m.reason}` : ''}${cost}`);
+  const title = m.title ? `  ${m.title}` : '';
+  console.log(`${h.score.toFixed(2).padStart(6)}  ${m.id}  ${when}  ${m.status}${m.reason ? `/${m.reason}` : ''}${title}${cost}`);
   console.log(`        ${hl(snippet(h.doc.text, query, width))}`);
   if (h.doc.sessionFile) console.log(`        restore: ${h.doc.sessionFile}`);
   console.log();

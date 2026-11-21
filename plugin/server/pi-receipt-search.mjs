@@ -2,8 +2,8 @@
 // The scoring may read archived bodies and Pi session transcripts (host-local
 // files its user can already read); the RESULT handed to a device carries
 // publicReceipt-shaped metadata only: id, score, status, reason, usage.
-// No snippet, no sessionId, no session file, no timestamps — search finds ids,
-// and the existing receipt.body op serves text under its own explicit gate.
+// No snippet, no sessionId, no session file, no timestamps — and no title
+// (prompt-derived text) unless the caller explicitly opts in with withTitle.
 
 import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -158,7 +158,7 @@ export function sessionsDir(env = process.env) {
 }
 
 function metaLine(meta) {
-  const bits = [meta.status, meta.reason, meta.paneId, meta.principal];
+  const bits = [meta.status, meta.reason, meta.paneId, meta.principal, meta.title];
   if (meta.usage) bits.push(`${meta.usage.totalTokens ?? 0} tokens`, `$${meta.usage.costUsd ?? 0}`);
   return bits.filter(Boolean).join(' ');
 }
@@ -177,6 +177,7 @@ export function collectDocs({ base, sessionsRoot, withTranscripts = true } = {})
         id: entry.id, sessionId: entry.sessionId, ts: entry.ts ?? 0,
         status: entry.status, reason: entry.reason, paneId: entry.paneId, usage: entry.usage,
         ...(entry.principal ? { principal: entry.principal } : {}),
+        ...(entry.title ? { title: entry.title } : {}),
       };
       let text = metaLine(meta);
       let sessionFile = null;
@@ -197,7 +198,7 @@ export function collectDocs({ base, sessionsRoot, withTranscripts = true } = {})
  * One hit per session by default (a long transcript owns many receipts; without
  * collapsing it would flood the caller's result page). Never throws.
  */
-export function searchReceipts({ base, sessionsRoot, query, limit = 10, dedupe = true, all = false } = {}) {
+export function searchReceipts({ base, sessionsRoot, query, limit = 10, dedupe = true, all = false, withTitle = false } = {}) {
   try {
     const docs = collectDocs({ base, sessionsRoot });
     const ranked = searchIndex(buildIndex(docs), query, docs.length);
@@ -206,7 +207,7 @@ export function searchReceipts({ base, sessionsRoot, query, limit = 10, dedupe =
     for (const { doc, score } of ranked) {
       if (dedupe && !all && doc.meta.sessionId && seen.has(doc.meta.sessionId)) continue;
       if (doc.meta.sessionId) seen.add(doc.meta.sessionId);
-      hits.push({ id: doc.id, score: Math.round(score * 1000) / 1000, ...publicReceipt({ ...doc.meta, v: 1, ts: doc.meta.ts }) });
+      hits.push({ id: doc.id, score: Math.round(score * 1000) / 1000, ...publicReceipt({ ...doc.meta, v: 1, ts: doc.meta.ts }, { withTitle }) });
       if (hits.length >= Math.max(1, Math.min(50, limit))) break;
     }
     return hits;

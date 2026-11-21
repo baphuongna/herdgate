@@ -157,11 +157,41 @@ test('searchReceipts hands a device only publicReceipt-shaped hits', () => {
   assert.equal(hit.status, 'replied');
   assert.ok(hit.score > 0);
   // publicReceipt discipline: journal internals and text never leave the host.
-  for (const key of ['sessionId', 'ts', 'paneId', 'snippet', 'sessionFile', 'text'])
+  for (const key of ['sessionId', 'ts', 'paneId', 'snippet', 'sessionFile', 'text', 'title'])
     assert.ok(!(key in hit), `leaked ${key}`);
   // the hit is the session's newest receipt — usage shows only when it has one
   assert.equal(hit.usage, undefined);
   assert.equal(searchReceipts({ base, sessionsRoot: sessions, query: 'zzz-none' }).length, 0);
   assert.deepEqual(searchReceipts({ base: join(base, 'missing'), sessionsRoot: sessions, query: 'wake' }), []); // fail closed
   assert.equal(searchReceipts({ base, sessionsRoot: sessions, query: 'scheduler wake', all: true, limit: 5 }).length, 2);
+});
+
+test('titles are indexed host-side and hidden from device hits unless withTitle', () => {
+  const { base, sessions } = fixture();
+  const sA = '12121212-1212-4121-8121-121212121212';
+  writeFileSync(join(base, 'aaaaaaaaaaaaaaaa', 'receipts.jsonl'),
+    JSON.stringify(entry({ id: 't-1', sessionId: sA, title: 'zebra xoay khóa noise' })) + '\n');
+  // No transcript, no body: title tokens alone make the receipt findable.
+  const docs = collectDocs({ base, sessionsRoot: sessions });
+  assert.equal(docs.length, 1);
+  assert.ok(docs[0].text.includes('zebra xoay khóa noise'), 'title tokens are indexed');
+  assert.equal(docs[0].meta.title, 'zebra xoay khóa noise', 'meta keeps the title for the CLI');
+  const plain = searchReceipts({ base, sessionsRoot: sessions, query: 'zebra' });
+  assert.equal(plain.length, 1);
+  assert.ok(!('title' in plain[0]), 'device hits withhold the prompt-derived title by default');
+  const withTitle = searchReceipts({ base, sessionsRoot: sessions, query: 'zebra', withTitle: true });
+  assert.equal(withTitle[0].title, 'zebra xoay khóa noise');
+});
+
+test('cli: text and json output carry the title after the status', () => {
+  const { base, sessions } = fixture();
+  writeFileSync(join(base, 'aaaaaaaaaaaaaaaa', 'receipts.jsonl'),
+    JSON.stringify(entry({ id: 't-1', sessionId: '13131313-1313-4131-8131-131313131313', title: 'zebra xoay khóa noise' })) + '\n');
+  const run = (args: string[]) => spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8' });
+  const json = JSON.parse(run(['zebra', '--base', base, '--sessions', sessions, '--json']).stdout);
+  assert.equal(json[0].title, 'zebra xoay khóa noise');
+  const text = run(['zebra', '--base', base, '--sessions', sessions]).stdout;
+  const line = text.split('\n')[0];
+  assert.ok(line.includes('zebra xoay khóa noise'), 'the title renders on the result line');
+  assert.ok(line.indexOf('zebra xoay khóa noise') > line.indexOf('replied'), 'right after the status');
 });

@@ -5,10 +5,15 @@
 // the journal writer is shared with the worker experiment (experiments/pi-receipt/journal.mjs).
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { journalBase, PRINCIPAL } from '../../plugin/server/pi-receipts.mjs';
+import { deriveTitle, journalBase, PRINCIPAL } from '../../plugin/server/pi-receipts.mjs';
 import { MAX_JOURNAL, appendReceipt, compact as compactJournal, loadJournal, openScope, writeBody } from './journal.mjs';
 
-const TTL_MS = 10 * 60 * 1000;
+// Armed intents must not live forever, but real work takes longer than a coffee:
+// controller-spawned agents routinely run tens of minutes (a 10-minute TTL was
+// observed finalizing honest tasks as unknown/expired). One hour, overridable.
+const TTL_MS = Number(process.env.HERDGATE_PI_ARM_TTL_MS) > 0
+  ? Number(process.env.HERDGATE_PI_ARM_TTL_MS)
+  : 60 * 60 * 1000;
 const MAX_SUFFIX = 256;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const STATUSES = new Set(['replied', 'failed', 'canceled', 'unknown']);
@@ -29,6 +34,16 @@ function hasMarker(content, marker) {
   if (typeof text !== 'string' || !text.startsWith(marker)) return false;
   const tail = text.slice(marker.length, marker.length + 2);
   return tail === '' || tail.startsWith('\n') || tail === '\r\n';
+}
+
+// The prompt body following the marker line (undefined when unmarked). The
+// boundary newline that separated marker from prompt is dropped so the stored
+// text starts at the prompt's own first line. Kept on the active intent so
+// finish() can derive a host-local title from it.
+function promptAfterMarker(content, marker) {
+  const text = typeof content === 'string' ? content : content?.[0]?.type === 'text' ? content[0].text : undefined;
+  if (typeof text !== 'string' || !text.startsWith(marker)) return undefined;
+  return text.slice(marker.length).replace(/^\r?\n/, '');
 }
 
 function readSuffix(manager, baseline) {
@@ -78,12 +93,15 @@ export default function observer(pi) {
     catch (error) { receipts.set(entry.id, entry); warn(error.message); }
   }
   function finish(status, fields = {}) {
-    const { id, requestEntryId, sessionId: session, cwd, retainBody, bodyText, principal } = active;
+    const { id, requestEntryId, sessionId: session, cwd, retainBody, bodyText, principal, promptText } = active;
     if (status === 'replied' && retainBody && bodyText) {
       try { writeBody(base, cwd, id, bodyText); }
       catch (error) { console.error(`herdgate-receipt: body archive failed (${error.code ?? 'unknown'})`); }
     }
-    const entry = { v: 1, id, status, ...(requestEntryId ? { requestEntryId } : {}), sessionId: session, ts: Date.now(), ...(paneId ? { paneId } : {}), ...(principal ? { principal } : {}), ...fields };
+    // Title is prompt-derived: stored on the journal entry (host-local) only —
+    // the in-memory receipt and every notification stay metadata-only.
+    const title = deriveTitle(promptText);
+    const entry = { v: 1, id, status, ...(requestEntryId ? { requestEntryId } : {}), sessionId: session, ts: Date.now(), ...(paneId ? { paneId } : {}), ...(principal ? { principal } : {}), ...(title ? { title } : {}), ...fields };
     const receipt = { id, status, ...(requestEntryId ? { requestEntryId } : {}), ...fields };
     active = undefined;
     record(entry);
@@ -160,7 +178,9 @@ export default function observer(pi) {
       }
       const stored = receipts.get(id);
       if (!stored) return notify(ctx, { id, status: 'unknown', reason: 'not_retained_in_runtime' });
-      const { v, ts, sessionId: _session, paneId: _pane, ...receipt } = stored;
+      // Title stays out of the slash command's answer: notifications keep the
+      // old metadata-only shape; the journal and host-local search own the title.
+      const { v, ts, sessionId: _session, paneId: _pane, title: _title, ...receipt } = stored;
       notify(ctx, { id, ...receipt });
     },
   });
@@ -187,6 +207,7 @@ export default function observer(pi) {
     }
     if (active.requestEntryId && active.requestEntryId !== request.id) return invalidate('branch_changed');
     active.requestEntryId = request.id;
+    active.promptText = promptAfterMarker(request.message.content, active.marker);
     if (!settled) {
       active.lastTurnEntryId = event.messageEntryId;
       return;

@@ -11,6 +11,17 @@ thiết bị pair), `spawn:<id>` (pane do spawn registry sinh), thiếu = ngư�
 local. Chuẩn hoá bởi `PRINCIPAL` (dùng chung receipt + job record), lộ qua
 `publicReceipt`/`publicJob`/search hits.
 
+## Title — metadata rút ra từ prompt
+
+Receipt có thể mang tùy chọn `title`: dòng đầu không rỗng của prompt sau khi bỏ
+dòng marker `[herdr-request:…]` hoặc wake-frame `[herdgate-schedule …]`, trim, cắt
+96 ký tự, không ký tự điều khiển (`deriveTitle`). Vì title là nội dung **rút ra
+từ prompt**, nó bị đối xử như text nhạy cảm: chỉ lưu trong journal host-local
+và luôn được index cho BM25 search ở host; `publicReceipt`/`searchReceipts`
+mặc định **không** trả kèm — chỉ khi caller chủ động bật `withTitle`. Lệnh
+`/herdgate-receipt` và mọi notification giữ nguyên shape cũ (không title);
+CLI `search.mjs` hiển thị title ngay sau status vì host đã đọc được prompt.
+
 ## Thử trong một phiên mới
 
 Mỗi nhiệm vụ một **agent mới + ID mới**: mở pane riêng, khởi chạy agentfresh cho task
@@ -138,7 +149,8 @@ node experiments/pi-receipt/search.mjs "cron bucket" --id        # chỉ in rece
 
 Mỗi receipt là một document BM25 (Okapi k1=1.2 b=0.75) ghép từ: body archive
 (`responses/<id>.md`) nếu có → transcript session (user prompt + reply cuối, match
-theo `sessionId`) → token metadata (status/reason/pane/tokens/cost). Kết quả mặc định
+theo `sessionId`) → token metadata (status/reason/pane/principal/title/tokens/cost).
+Kết quả mặc định
 dedupe theo session (một transcript dài không tràn cả trang); `--all` tắt. Tokenizer
 chuẩn hoá NFC nên `khóa`/`khoá` NFD gõ tay vẫn khớp. Test: `node --test
  test/pi-receipt-search.test.ts` (6 test, gồm CLI e2e).
@@ -155,7 +167,8 @@ node experiments/pi-receipt/query.mjs --gate https://gate.example.com \
 
 Scoring chạy host-side (được đọc body/transcript — file local của user); kết quả
 đưa cho device **chỉ là metadata dạng publicReceipt**: `id, score, status, reason,
-usage` — không snippet, không sessionId, không timestamp (search chỉ *tìm ra id*;
+usage` — không snippet, không sessionId, không timestamp, không title (title là
+text rút từ prompt, chỉ kèm khi caller bật `withTitle`; search chỉ *tìm ra id*;
 nội dung văn bản phải đi qua `receipt.body` với gate kép riêng của nó). Mỗi query
 cap 200 ký tự, limit 1–50, dedupe theo session mặc định. Fail-closed: journal
 không đọc được → trả mảng rỗng.

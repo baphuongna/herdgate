@@ -442,7 +442,7 @@ test('an explicit controller-chosen id arms that exact request', async () => {
   const chosen = '00000000-0000-4000-8000-000000000011';
   const armed = await run.command('arm', `--id ${chosen} --body`);
   assert.deepEqual(armed, { id: chosen, status: 'armed', marker: `[herdr-request:${chosen}]`,
-    expiresInSeconds: 600, retainBody: true });
+    expiresInSeconds: 3600, retainBody: true });
   run.user(`${armed.marker}\nviệc`);
   const response = run.assistant();
   run.turn(response);
@@ -464,6 +464,53 @@ test('walking the session suffix fails closed at its bound', async () => {
   w.turn(w.assistant());
   w.settle();
   assert.deepEqual(await w.command('receipt', id), { id, status: 'unknown', reason: 'branch_limit' });
+});
+
+test('validEntry accepts optional titles and rejects malformed ones', () => {
+  const base = { v: 1, id: '00000000-0000-4000-8000-00000000000f', status: 'replied', sessionId: 's', ts: 1 };
+  assert.ok(receipts.validEntry(base), 'missing title stays valid, like principal');
+  assert.ok(receipts.validEntry({ ...base, title: 'xoay khóa noise channel' }));
+  assert.ok(receipts.validEntry({ ...base, title: 'x'.repeat(96) }), '96 chars is the cap');
+  for (const bad of ['', 'x'.repeat(97), 'a\nb', 'a\rb', 'a\tb', 'a\x1b[0mb', 7]) {
+    assert.equal(receipts.validEntry({ ...base, title: bad }), null, `title ${JSON.stringify(bad)} must be rejected`);
+  }
+});
+
+test('deriveTitle takes the first meaningful prompt line, markers stripped', () => {
+  assert.equal(receipts.deriveTitle('[herdr-request:00000000-0000-4000-8000-00000000000f]\r\nFix the noise rekey bug'), 'Fix the noise rekey bug');
+  assert.equal(receipts.deriveTitle('[herdgate-schedule id="nightly" run="r1" bucket=0 fired=2026-11-21T00:00:00.000Z]\n\nChạy job tổng hợp báo cáo'), 'Chạy job tổng hợp báo cáo');
+  assert.equal(receipts.deriveTitle('  \n\n  first real line  \nrest'), 'first real line');
+  assert.equal(receipts.deriveTitle('tab\tinside\tline'), 'tab inside line');
+  assert.equal(receipts.deriveTitle('x'.repeat(120)).length, 96, 'capped at 96');
+  assert.equal(receipts.deriveTitle('[herdr-request:x]\n\n'), '');
+  assert.equal(receipts.deriveTitle(undefined), '');
+});
+
+test('a settled receipt stores a derived title while notifications stay metadata-only', async () => {
+  const w = await worker();
+  const armed = await w.command('arm');
+  // After the marker, the prompt itself starts with a wake-frame line: the
+  // derived title must skip both wrappers and take the first real line.
+  const wake = '[herdgate-schedule id="nightly" run="r1" bucket=0 fired=2026-11-21T00:00:00.000Z]';
+  const requestEntryId = w.user(`${armed.marker}\r\n${wake}\n\nXoay khóa noise channel`);
+  const responseEntryId = w.assistant();
+  w.turn(responseEntryId);
+  w.settle();
+  const shown = await w.command('receipt', armed.id);
+  assert.equal(shown.status, 'replied');
+  assert.ok(!('title' in shown), 'the slash command keeps the old metadata-only shape');
+  assert.doesNotMatch(w.rendered(), /Xoay khóa noise/, 'notifications never carry prompt-derived text');
+  const journal = readFileSync(join(w.root, receipts.scopeFor(w.cwd), 'receipts.jsonl'), 'utf8')
+    .trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(journal.at(-1)!.title, 'Xoay khóa noise channel', 'the journal entry owns the title');
+  // A marker-only prompt derives nothing: the field stays absent.
+  const bare = await w.command('arm');
+  w.user(bare.marker);
+  w.turn(w.assistant());
+  w.settle();
+  const stored = readFileSync(join(w.root, receipts.scopeFor(w.cwd), 'receipts.jsonl'), 'utf8')
+    .trim().split('\n').map(line => JSON.parse(line));
+  assert.ok(!('title' in stored.at(-1)!), 'no prompt text, no title');
 });
 
 test('temporary journal workspaces are cleaned up', () => {

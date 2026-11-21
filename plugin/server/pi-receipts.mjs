@@ -37,6 +37,34 @@ export function scopeFor(cwd) {
 // human typed it locally in a pane and nothing programmatic claims the request.
 export const PRINCIPAL = /^[a-z][a-z0-9-]{0,15}:[A-Za-z0-9._-]{1,64}$/;
 
+// A receipt may carry an optional one-line title derived from the prompt
+// (deriveTitle). It is prompt-derived content, so it lives under the strictest
+// leak policy: stored in the host-local journal, never in publicReceipt unless
+// the caller explicitly opts in with withTitle.
+export const TITLE_MAX = 96;
+const TITLE_CTRL = /[\u0000-\u001f\u007f]/; // no control characters (\n, \r, \t included)
+
+function validTitle(value) {
+  return typeof value === 'string' && value.length >= 1 && value.length <= TITLE_MAX
+    && !TITLE_CTRL.test(value);
+}
+
+/**
+ * First meaningful line of a prompt: drop the first line when it is the request
+ * marker (`[herdr-request:…]`) or a scheduler wake frame (`[herdgate-schedule …]`),
+ * take the first non-empty line, drop control characters, trim, cap at
+ * TITLE_MAX. Returns '' when the prompt says nothing usable — title stays optional.
+ */
+export function deriveTitle(promptText) {
+  const lines = String(promptText ?? '').split(/\r?\n/);
+  const start = /^\[(herdr-request|herdgate-schedule)[^\]]*\]$/.test(lines[0].trim()) ? 1 : 0;
+  for (let i = start; i < lines.length; i++) {
+    const line = lines[i].replace(TITLE_CTRL, ' ').replace(/\s+/g, ' ').trim();
+    if (line) return line.slice(0, TITLE_MAX);
+  }
+  return '';
+}
+
 export function validEntry(entry) {
   return validEntryShape(entry) ? entry : null;
 }
@@ -50,7 +78,8 @@ function validEntryShape(entry) {
       && Object.keys(entry.usage).length > 0
       && Object.keys(entry.usage).every(key => ['totalTokens', 'costUsd', 'durationMs'].includes(key))
       && Object.values(entry.usage).every(value => Number.isFinite(value)))
-    && (entry.principal === undefined || PRINCIPAL.test(entry.principal))));
+    && (entry.principal === undefined || PRINCIPAL.test(entry.principal)))
+    && (entry.title === undefined || validTitle(entry.title)));
 }
 
 /** Parse a journal file; tolerate a torn tail and skip corrupt lines. */
@@ -91,11 +120,13 @@ export function findReceipt(base, id) {
   }
 }
 
-/** The public answer for a device: journal internals stay on the host. */
-export function publicReceipt(entry) {
+/** The public answer for a device: journal internals stay on the host.
+ *  Title is prompt-derived text, so it is withheld by default (fail-safe) and
+ *  only included when the caller explicitly passes withTitle: true. */
+export function publicReceipt(entry, { withTitle = false } = {}) {
   if (!entry) return { status: 'unknown', reason: 'not_retained_in_runtime' };
-  const { v, ts, sessionId, paneId, ...rest } = entry;
-  return rest;
+  const { v, ts, sessionId, paneId, title, ...rest } = entry;
+  return withTitle && title !== undefined ? { ...rest, title } : rest;
 }
 
 /**
