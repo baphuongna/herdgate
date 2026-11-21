@@ -145,8 +145,11 @@ scope bị `requires-act`.
 
 - Đã có `--real` (model host, đã nghiệm thu live: glm-5.3 thinking low, 435 tokens,
   $0.0006, body 0600) — còn: policy tools chi tiết (allowlist tool thay vì all/none),
-  push/subscribe khi receipt đổi, PWA act UI, và đánh giá
-  `@earendil-works/pi-durable` cho session durable thay SessionManager thường.
+  push/subscribe khi receipt đổi, PWA act UI. **Đã đánh giá
+  `@earendil-works/pi-durable`** (`DURABLE_EVAL.md` + probe runnable): crash giữa
+  turn → resume → job hoàn tất với đúng 1 retry, nhưng không phải drop-in (harness
+  riêng, transcript khác, đổi semantics fail-closed) — giữ SessionManager cho job,
+  pi-durable là ứng viên cho scheduler/daemon quanh worker.
   Windows chưa nghiệm thu với `--real`.
 - **Tự khai sinh cha**: mỗi job tạo session với id chính là job id
   (`SessionManager.create(…, {id})` — SDK hỗ trợ sẵn) rồi tự ghi vào registry
