@@ -137,6 +137,17 @@ hoặc văn thường là như không báo (đã xảy ra: user nhìn thẳng pa
  KHÔNG chỉ ack rồi kết thúc turn — mỗi lần ack suông là một phần việc chết chờ user nhắc
  (đã xảy ra: 3 wake đến, 0 được xử lý trọn). Cây agent: `node experiments/pi-spawn/dag.mjs`.
 
+## Giao việc cho subagent — MỘT lệnh
+
+```bash
+node experiments/pi-spawn/task.mjs start <tên> <taskfile> [--cwd DIR] [--tab]   # spawn+arm+prompt, marker tự đúng định dạng
+node experiments/pi-spawn/task.mjs continue <tên> <taskfile|text>               # re-prompt con đang sống
+node experiments/pi-spawn/task.mjs status [tên]                                  # recent-first, kèm receipt
+node experiments/pi-spawn/task.mjs close <tên>                                   # delegate spawn.mjs close
+```
+Lệnh gốc spawn.mjs giữ cho edge case. Không tự ghép spawn+arm+prompt tay nữa —
+marker sai định dạng từng làm cả đợt agent mù observation.
+
 ## Vòng đời con — dọn ngay, không tích tụ
 
 Parent là chủ vòng đời con mình. Sau khi wake đã xử lý (test/commit xong), nếu KHÔNG còn
@@ -147,6 +158,7 @@ node experiments/pi-spawn/spawn.mjs close <tên>   # đóng tab/pane con; từ c
 ```
 
 Record spawn vẫn còn nên cần lại chỉ là `spawn.mjs restore <tên>` (đúng session one-id).
+Sau reboot/machine restart: node experiments/pi-spawn/spawn.mjs revive (dry-run trước nếu muốn xem kế hoạch).
 Chỉ giữ con sống khi còn job tiếp theo cho nó. Pane/tab của NGƯỜI DÙNG không bao giờ tự đóng.
 
 ## Nhánh chính hay worktree? — tránh xung đột trước khi spawn

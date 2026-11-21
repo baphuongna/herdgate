@@ -10,6 +10,7 @@
 //   node experiments/pi-spawn/spawn.mjs arm <name-or-id> [--body]   # /herdgate-arm with THE spawn id
 //   node experiments/pi-spawn/spawn.mjs list                        # + receipt status per child
 //   node experiments/pi-spawn/spawn.mjs restore <name-or-id>
+//   node experiments/pi-spawn/spawn.mjs revive [--name <tên>] [--dry-run]
 //
 // spawn: splits a sibling pane stacked below (full width; side-by-side splits
 // wrap JSON notifications mid-token), or --tab gives the child its own tab;
@@ -24,7 +25,7 @@ import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { findSpawn, recordSelf, recordSpawn, readSpawns, spawnBase, spawnsFile, updateSpawn } from './registry.mjs';
 import { findReceipt } from '../../plugin/server/pi-receipts.mjs';
-import { patchSpawn } from '../../plugin/server/pi-wake.mjs';
+import { patchSpawn, readAllSpawns } from '../../plugin/server/pi-wake.mjs';
 
 const herdr = () => process.env.HERDR_BIN_PATH || 'herdr';
 const run = (...args) => JSON.parse(execFileSync(herdr(), args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }));
@@ -50,6 +51,43 @@ function bindingOf(panes, paneId) {
 }
 
 const fail = (message) => { console.error(message); process.exit(1); };
+
+/** Reopen one child's EXACT conversation in a fresh pane — the single restore
+ *  path shared by `restore` (one child by name/id) and `revive` (bulk after a
+ *  reboot). Throws instead of exiting so a bulk revive can skip one broken
+ *  child and keep going; the `restore` command turns the throw into the same
+ *  hard fail it always had. Returns { pane, updated } on success. */
+function openRestorePane(entry) {
+  const { myPane } = myBinding();
+  const dir = entry.cwd ?? process.cwd();
+  // A tab-spawned child restores into its own tab again; a split child stacks below.
+  // A self-registered child (worker job) has no pane lineage — its own tab avoids
+  // borrowing any caller's pane.
+  const wantTab = entry.tab || entry.self;
+  const pane = wantTab
+    ? run('tab', 'create', '--label', `hg-${entry.name}`, '--no-focus', '--cwd', dir).result.root_pane.pane_id
+    : run(...(myPane
+      ? ['pane', 'split', '--pane', myPane, '--direction', 'down', '--no-focus', '--cwd', dir]
+      : ['pane', 'split', '--current', '--direction', 'down', '--no-focus', '--cwd', dir])).result.pane.pane_id;
+  // A transcript file path reopens the exact session (worker children live outside
+  // Pi's default storage; a bare --session-id would mint an empty look-alike).
+  // If a self-registered child's transcript is GONE, refuse: an empty look-alike
+  // with the same id is worse than a clear error.
+  if (entry.self && entry.sessionFile && !existsSync(entry.sessionFile))
+    throw new Error(`transcript ${entry.sessionFile} is gone — cannot restore an SDK child without it`);
+  const sessionArgs = entry.sessionFile && existsSync(entry.sessionFile)
+    ? ['--session', entry.sessionFile] : ['--session-id', entry.sessionId];
+  try {
+    run('agent', 'start', entry.name, '--kind', 'pi', '--pane', pane, '--timeout', '45000',
+      '--', ...sessionArgs);
+  } catch (error) {
+    throw new Error(`agent start failed: ${String(error.message).slice(0, 300)}`);
+  }
+  // updateSpawn patches only the caller's cwd scope; revive scans every scope,
+  // so a record found elsewhere is patched where it actually lives.
+  const patch = { status: 'restored', paneId: pane, restoredAt: Date.now() };
+  return { pane, updated: updateSpawn(spawnBase(), entry.id, patch) ?? patchSpawn(spawnBase(), entry.id, patch) };
+}
 
 if (command === 'spawn') {
   const name = arg;
@@ -160,33 +198,55 @@ if (command === 'spawn') {
   if (!arg) fail('usage: restore <name-or-id>');
   const entry = findSpawn(spawnBase(), arg);
   if (!entry) fail(`no spawn record for ${arg}`);
-  const { myPane } = myBinding();
-  const dir = entry.cwd ?? process.cwd();
-  // A tab-spawned child restores into its own tab again; a split child stacks below.
-  // A self-registered child (worker job) has no pane lineage — its own tab avoids
-  // borrowing any caller's pane.
-  const wantTab = entry.tab || entry.self;
-  const pane = wantTab
-    ? run('tab', 'create', '--label', `hg-${entry.name}`, '--no-focus', '--cwd', dir).result.root_pane.pane_id
-    : run(...(myPane
-      ? ['pane', 'split', '--pane', myPane, '--direction', 'down', '--no-focus', '--cwd', dir]
-      : ['pane', 'split', '--current', '--direction', 'down', '--no-focus', '--cwd', dir])).result.pane.pane_id;
-  // A transcript file path reopens the exact session (worker children live outside
-  // Pi's default storage; a bare --session-id would mint an empty look-alike).
-  // If a self-registered child's transcript is GONE, refuse: an empty look-alike
-  // with the same id is worse than a clear error.
-  if (entry.self && entry.sessionFile && !existsSync(entry.sessionFile))
-    fail(`transcript ${entry.sessionFile} is gone — cannot restore an SDK child without it`);
-  const sessionArgs = entry.sessionFile && existsSync(entry.sessionFile)
-    ? ['--session', entry.sessionFile] : ['--session-id', entry.sessionId];
-  try {
-    run('agent', 'start', entry.name, '--kind', 'pi', '--pane', pane, '--timeout', '45000',
-      '--', ...sessionArgs);
-  } catch (error) {
-    fail(`agent start failed: ${String(error.message).slice(0, 300)}`);
-  }
-  const updated = updateSpawn(spawnBase(), entry.id, { status: 'restored', paneId: pane, restoredAt: Date.now() });
+  let opened;
+  try { opened = openRestorePane(entry); }
+  catch (error) { fail(error instanceof Error ? error.message : String(error)); }
+  const { updated, pane } = opened;
   console.log(JSON.stringify({ ...updated, bound: bindingOf(run('pane', 'list').result.panes ?? [], pane) === entry.sessionId }));
+} else if (command === 'revive') {
+  // The herdr-revive lesson: after a reboot/machine restart, bring back WHAT WAS
+  // RUNNING, on its EXACT conversation — never the latest one. Candidates are
+  // crash-lost children only: not closedBy the parent (that close was on
+  // purpose), not died (already mourned), pane gone, and a transcript still on
+  // disk so the SAME session file reopens (-- --session <file>).
+  const wantName = flag('name', null);
+  const dryRun = process.argv.includes('--dry-run');
+  const base = spawnBase();
+  let entries = readAllSpawns(base);
+  if (wantName) {
+    if (!entries.some(e => e.name === wantName)) fail(`no spawn record for ${wantName}`);
+    entries = entries.filter(e => e.name === wantName);
+  }
+  const alive = new Set(myBinding().panes.map(p => p.pane_id));
+  const revived = [], skipped = [], plan = [];
+  for (const entry of entries) {
+    if (entry.closedBy) { skipped.push({ name: entry.name, reason: `closedBy=${entry.closedBy}` }); continue; }
+    if (entry.died) { skipped.push({ name: entry.name, reason: 'died' }); continue; }
+    if (entry.paneId && alive.has(entry.paneId)) { skipped.push({ name: entry.name, reason: 'pane-alive' }); continue; }
+    if (!entry.sessionFile || !existsSync(entry.sessionFile)) {
+      // Same refusal as restore: an SDK child without its transcript would reopen
+      // as an empty look-alike — worse than a clear skip.
+      console.error(`[revive] ${entry.name}: no transcript on disk (${entry.sessionFile ?? 'no sessionFile recorded'}) — cannot reopen its exact conversation, skipped`);
+      skipped.push({ name: entry.name, reason: 'sessionFile-missing' });
+      continue;
+    }
+    if (dryRun) {
+      plan.push({ name: entry.name, id: entry.id, sessionFile: entry.sessionFile, cwd: entry.cwd ?? process.cwd() });
+      console.log(`would revive ${entry.name} id=${entry.id} session=${entry.sessionFile} cwd=${entry.cwd ?? process.cwd()}`);
+      continue;
+    }
+    try {
+      const { pane } = openRestorePane(entry);
+      // Append-style history: every revive adds its timestamp, prior ones survive.
+      const history = Array.isArray(entry.revivedAt) ? entry.revivedAt
+        : Number.isFinite(entry.revivedAt) ? [entry.revivedAt] : [];
+      patchSpawn(base, entry.id, { revivedAt: [...history, Date.now()] });
+      revived.push({ name: entry.name, paneId: pane });
+    } catch (error) {
+      skipped.push({ name: entry.name, reason: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  console.log(JSON.stringify(dryRun ? { dryRun: true, wouldRevive: plan, skipped } : { revived, skipped }, null, 2));
 } else {
-  fail('usage: spawn.mjs spawn|list|restore ...');
+  fail('usage: spawn.mjs spawn|list|close|restore|revive ...');
 }
