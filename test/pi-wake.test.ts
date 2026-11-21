@@ -68,7 +68,11 @@ test('wakeFrame is one terse line with the essentials, never the reply text', ()
 test('wakeParentOnSettle prompts the parent pane and survives every failure', () => {
   const base = spawnFixture();
   const calls: { args: string[]; error?: Error }[] = [];
-  const panes = [{ pane_id: 'w9:p0', agent_session: { value: `/x/a_${PARENT}.jsonl` } }];
+  const panes = [
+    { pane_id: 'w9:p0', agent_session: { value: `/x/2026-a_${PARENT}.jsonl` } },
+    { pane_id: 'w9:p1', agent_session: { value: `/x/2026-b_${CHILD}.jsonl` } },
+    { pane_id: 'w9:p2' },
+  ];
   const logs: string[] = [];
   const wake = wakeParentOnSettle({
     spawnBase: base,
@@ -145,6 +149,45 @@ test('delivery waits for the parent to go idle — never forks the session tree'
   await new Promise(r => setTimeout(r, 80));
   assert.equal(delivered.length, 0, 'never injected into a busy parent');
   assert.match(logs.at(-1)!, /stayed working/);
+});
+
+test('the recorded parent pane wins over a same-session ghost', () => {
+  const base = root();
+  mkdirSync(join(base, 'aaaaaaaaaaaaaaaa'), { recursive: true });
+  const REAL = 'w9:p9';
+  const GHOST = 'w9:p1';
+  writeFileSync(join(base, 'aaaaaaaaaaaaaaaa', 'spawns.jsonl'),
+    JSON.stringify({ id: CHILD, sessionId: CHILD, parentSessionId: PARENT, name: 'real', paneId: 'w9:px', parentPaneId: REAL, ts: 1 }) + '\n');
+  // Two panes bound to the SAME session file — the ghost sorts first.
+  const panes = [
+    { pane_id: GHOST, agent_session: { value: `/x/g_${PARENT}.jsonl` } },
+    { pane_id: REAL, agent_session: { value: `/x/r_${PARENT}.jsonl` } },
+  ];
+  const calls: string[][] = [];
+  const wake = wakeParentOnSettle({
+    spawnBase: base,
+    run: (...args: string[]) => { calls.push(args); return {}; },
+    listPanes: () => panes,
+    log: () => {},
+  });
+  wake(entry());
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][2], REAL, 'the recorded pane wins, not the first session match');
+
+  // recorded pane gone (parent moved/closed): fall back to session lookup — the
+  // ghost would get it, so this is last-resort only and logged loudly
+  panes.splice(1, 1);
+  calls.length = 0;
+  const logs: string[] = [];
+  const wake2 = wakeParentOnSettle({
+    spawnBase: base,
+    run: (...args: string[]) => { calls.push(args); return {}; },
+    listPanes: () => panes,
+    log: (m: string) => logs.push(m),
+  });
+  wake2(entry());
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][2], GHOST, 'legacy fallback still reaches some pane bound to the session');
 });
 
 test('idle is not enough: the revision must hold steady across the settle delay', async () => {

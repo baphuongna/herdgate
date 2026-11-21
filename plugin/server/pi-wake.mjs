@@ -83,7 +83,13 @@ export function wakeParentOnSettle({ spawnBase, run, listPanes, agentState, agen
           log(`wake failed: ${error instanceof Error ? error.message : String(error)}`); // agent_blocked etc: never fatal
         }
       };
-      const pane = paneForSession(listPanes(), spawn.parentSessionId);
+      const panes = listPanes();
+      // The parent's REAL pane, recorded at spawn time. Session-file lookup alone
+      // is ambiguous: a second pi bound to the same session (a restore leftover)
+      // makes every wake land in the ghost — observed live, four times.
+      let pane = spawn.parentPaneId && panes.some(p => p?.pane_id === spawn.parentPaneId)
+        ? spawn.parentPaneId
+        : paneForSession(panes, spawn.parentSessionId);
       if (!pane) {
         log(`wake: parent ${String(spawn.parentSessionId).slice(0, 8)} pane gone — child ${spawn.name} ${entry.status}`);
         return;
@@ -136,8 +142,11 @@ export function wakeParentOnSettle({ spawnBase, run, listPanes, agentState, agen
   };
 }
 
-/** Default herdr runner for the publisher process. */
+/** Default herdr runner for the publisher process (tolerates plain-text output). */
 export function herdrRunner() {
   const bin = process.env.HERDR_BIN_PATH ?? 'herdr';
-  return (...args) => JSON.parse(execFileSync(bin, args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }));
+  return (...args) => {
+    const out = execFileSync(bin, args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    try { return JSON.parse(out); } catch { return { raw: out }; }
+  };
 }

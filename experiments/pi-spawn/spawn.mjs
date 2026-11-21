@@ -73,7 +73,7 @@ if (command === 'spawn') {
   }
   const entry = recordSpawn(spawnBase(), { id, sessionId: id, paneId: pane, name,
     ...(wantTab ? { tab: true } : {}),
-    ...(parent ? { parentSessionId: parent } : {}), cwd, ts: Date.now() });
+    ...(parent ? { parentSessionId: parent, ...(myPane ? { parentPaneId: myPane } : {}) } : {}), cwd, ts: Date.now() });
   console.log(JSON.stringify({ ...entry, parent: parent ?? null,
     bound: bindingOf(run('pane', 'list').result.panes ?? [], pane) === id }));
 } else if (command === 'self') {
