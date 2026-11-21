@@ -6,8 +6,9 @@
  * permissions are checked before dispatching any interactive bridge commands.
  */
 
-import { spawn } from "node:child_process";
+import { execFile as execFileCb, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { promisify } from "node:util";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { hostname, homedir } from "node:os";
@@ -16,6 +17,7 @@ import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, su
 import { createSshBridge } from "./ssh.mjs";
 import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
 import { searchReceipts, sessionRoots as piSessionRoots } from "./pi-receipt-search.mjs";
+import { usageRollup } from "./pi-usage.mjs";
 import { herdrRunner, wakeParentOnSettle } from "./pi-wake.mjs";
 import { openWatchStore } from "./pi-receipt-watch.mjs";
 import { JOB_ID, MAX_PENDING, MAX_PROMPT, WORKSPACE_NAME, appendJob, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, workerBase } from "./pi-worker.mjs";
@@ -23,6 +25,10 @@ import { registerPublisher } from "./publisher-tui-lifecycle.mjs";
 import { HostChannel, b64d, b64e, fingerprint, generateKeyPair } from "./e2e.mjs";
 
 const D = dirs();
+const execFile = promisify(execFileCb);
+const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url));
+/** diff.get ships at most 128 KiB of `git show` output, marked truncated beyond. */
+const MAX_DIFF_BYTES = 128 * 1024;
 const NAME = process.env.HERDGATE_HOST_NAME || hostname();
 const log = (line) => console.error(`herdgate: ${line}`);
 /** The panel's settings file (app home herdgate dir) — the owner's switches live
@@ -116,6 +122,26 @@ function runningPid() {
   } catch {
     return null; // stale
   }
+}
+
+/** Which Herdr argv focuses a pane — probed once from --help (pane focus, else the
+ *  tab equivalent), null when this Herdr supports neither. Never throws. */
+let paneFocusArgv;
+async function paneFocusArgvProbe() {
+  if (paneFocusArgv !== undefined) return paneFocusArgv;
+  const help = async (...args) => {
+    try {
+      const { stdout } = await execFile(D.herdrBin, args, { timeout: 5_000 });
+      return stdout;
+    } catch {
+      return "";
+    }
+  };
+  if (/\bfocus\b/.test(await help("pane", "--help"))) return (paneFocusArgv = ["pane", "focus"]);
+  const tabHelp = await help("tab", "--help");
+  if (/\bfocus\b/.test(tabHelp)) return (paneFocusArgv = ["tab", "focus"]);
+  if (/\bselect\b/.test(tabHelp)) return (paneFocusArgv = ["tab", "select"]);
+  return (paneFocusArgv = null);
 }
 
 /** --- serve: the startup hook. Start the publisher once, then exit (Herdr's hook is one-shot). --- */
@@ -483,6 +509,17 @@ async function publisherLoop() {
           return void replyTo({ op: "receipt.search.result",
             ...(enabled ? { hits } : { hits: [], reason: "pi_receipts_disabled" }) });
         }
+        if (op === "usage.rollup") {
+          // The PWA's Timeline/Usage views: the receipt journal rolled into daily
+          // buckets and per-principal spend (the raw usageRollup shape). Aggregates
+          // only and usageRollup fails closed to a zeroed result, so read scope is
+          // enough and a missing journal answers zeros, never an error.
+          const n = Number(payload.days);
+          const days = Number.isFinite(n) ? Math.min(31, Math.max(1, Math.floor(n))) : 7;
+          const rollup = usageRollup({ base: receiptJournalBase(), days });
+          log(`usage: ${m.device} roll-up ${days}d -> ${rollup.total.requests} request(s), ${rollup.total.tokens} token(s)`);
+          return void replyTo({ op: "usage.rollup.result", ...rollup });
+        }
         if (op === "receipt.watch" || op === "receipt.ack") {
           // Experimental (opt-in HERDGATE_PI_RECEIPTS=1): durable per-request push
           // subscriptions. Registering targets receipt.push at this device only;
@@ -633,6 +670,51 @@ async function publisherLoop() {
           } catch (e) {
             return void replyTo({ op: "error", code: "herdr", message: `read failed: ${e instanceof Error ? e.message : String(e)}` });
           }
+        }
+        if (op === "diff.get") {
+          // READ-ONLY code archeology: one `git show --stat --patch` of a host-local
+          // ref (hash/branch/tag) in the plugin's repo dir (HERDGATE_DIFF_REPO_DIR
+          // lets a test point elsewhere). execFile never shells out and the ref is
+          // whitelisted hard — a `;`, a space or `$()` never reaches git at all.
+          const ref = typeof payload.ref === "string" ? payload.ref : "";
+          if (!/^[A-Za-z0-9._\/-]{1,64}$/.test(ref)) {
+            return void replyTo({ op: "error", code: "bad-ref", message: "diff.get needs a git ref of [A-Za-z0-9._/-], 1..64 chars" });
+          }
+          const repoDir = process.env.HERDGATE_DIFF_REPO_DIR || PLUGIN_DIR;
+          try {
+            const { stdout } = await execFile("git", ["show", "--no-color", "--stat", "--patch", ref],
+              { cwd: repoDir, timeout: 10_000, maxBuffer: 8 << 20 });
+            const bytes = Buffer.byteLength(stdout, "utf8");
+            const truncated = bytes > MAX_DIFF_BYTES;
+            const text = truncated ? Buffer.from(stdout, "utf8").subarray(0, MAX_DIFF_BYTES).toString("utf8") : stdout;
+            log(`diff: ${m.device} show ${ref} -> ${bytes}B${truncated ? " (capped at 128KiB)" : ""}`);
+            return void replyTo({ op: "diff.result", ref, text, bytes, truncated });
+          } catch (e) {
+            const err = e instanceof Error ? e : new Error(String(e));
+            const stderr = String(e?.stderr ?? "");
+            const noRepo = /not a git repository/i.test(`${err.message}\n${stderr}`);
+            log(`diff: ${m.device} show ${ref} refused: ${err.message}`);
+            return void replyTo({ op: "error", code: noRepo ? "diff.repo" : "diff.ref",
+              message: noRepo ? "the plugin directory is not a git repository"
+                : stderr.split("\n")[0] || err.message });
+          }
+        }
+        if (op === "pane.focus") {
+          // Focus a pane on the host's Herdr. Fire-and-forget spawn, never awaited:
+          // a phone must not hang on a TUI command. argv comes from the --help probe.
+          const paneId = typeof payload.paneId === "string" ? payload.paneId : "";
+          if (!/^w\d+:p\d+$/.test(paneId)) {
+            return void replyTo({ op: "error", code: "bad-pane", message: "pane.focus needs a pane id like w0:p1" });
+          }
+          const argv = await paneFocusArgvProbe();
+          if (!argv) {
+            return void replyTo({ op: "error", code: "pane.focus", message: "this Herdr has no pane focus command" });
+          }
+          const child = spawn(D.herdrBin, [...argv, paneId], { stdio: "ignore", detached: true });
+          child.on("error", (e) => log(`pane: focus spawn failed: ${e.message}`));
+          child.unref();
+          log(`pane: ${m.device} focus ${paneId} via \`${argv.join(" ")}\``);
+          return void replyTo({ op: "pane.focused", paneId, via: argv.join(" ") });
         }
         return void replyTo({ op: "error", code: "read-only", message: `dev.herdgate.host has no op ${String(op)}` });
       }

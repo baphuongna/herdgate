@@ -11,7 +11,7 @@
 //   - the token lives in localStorage on this device and is never sent anywhere but the
 //     cloud's own WS endpoint.
 
-const BUILD = "v0.9.33-web.1";
+const BUILD = "v0.9.34-web.2";
 
 const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = "herdgate.token";
@@ -160,6 +160,7 @@ const state = {
   termPre: null,
   retry: 0,
   worker: { health: null, jobs: new Map(), error: null, search: null, tab: "jobs", usage: null },
+  diff: null,
 };
 
 /** The cloud base: an explicit setting, else this page's origin (same-origin deployment). */
@@ -366,6 +367,10 @@ const WORKER_ERROR_CODES = new Set([
   "receipt.watch", "pi_receipts_disabled", "pi_receipt_body_disabled",
 ]);
 
+// Diff/pane refusals are scoped the same way: they fault one view, never the room.
+const DIFF_ERROR_CODES = new Set(["bad-ref", "diff", "diff.ref", "diff.repo"]);
+const PANE_ERROR_CODES = new Set(["pane.focus", "bad-pane"]); // no surface yet — swallow, never blank the room
+
 // Recap answers "đến lượt ai?" — whose move it is — for every tracked job; Usage
 // rolls the host's receipt journal into daily and per-principal tables.
 const RECAP_GROUPS = [
@@ -381,6 +386,29 @@ function recapBucket(job) {
   if (job.status === "failed") return "fixing";
   if (job.status === "replied") return opened || job.duplicate ? "done" : "needs-you";
   return "done"; // canceled or unknown verdicts — nothing waits on us
+}
+
+// Herdr's status glyphs — one verdict per row in every list (Recap, Jobs/Receipts,
+// Search): ◉ needs you (an unopened reply, an unknown or failed request),
+// ◐ working, ● done (replied and read), ✓ idle (nothing waits on anyone).
+function statusGlyph(job) {
+  const status = job?.status;
+  if (status === "queued" || status === "running" || status === "pending") return { glyph: "◐", cls: "glyph-working", title: "working" };
+  if (status === "unknown" || status === "failed") return { glyph: "◉", cls: "glyph-needs", title: status === "failed" ? "needs fixing" : "needs you" };
+  if (status === "replied") {
+    const opened = typeof job.body === "string" || job.duplicate || job.opened === true;
+    return opened ? { glyph: "●", cls: "glyph-done", title: "done" } : { glyph: "◉", cls: "glyph-needs", title: "needs you" };
+  }
+  return { glyph: "✓", cls: "glyph-idle", title: "idle" }; // canceled — nothing waits on us
+}
+
+function glyphNode(job) {
+  const g = statusGlyph(job);
+  const span = document.createElement("span");
+  span.className = `glyph ${g.cls}`;
+  span.textContent = g.glyph;
+  span.title = g.title;
+  return span;
 }
 
 const usageUsd = (value) => `$${(Number.isFinite(value) ? value : 0).toFixed(4)}`;
@@ -411,7 +439,7 @@ function renderWorkerRecap(box, w) {
       row.className = "row";
       const span = document.createElement("span");
       span.textContent = `${job.id.slice(0, 8)} · ${job.status}${job.reason ? ` (${job.reason})` : ""}`;
-      row.append(span);
+      row.append(span, glyphNode(job));
       list.append(row);
     }
     box.append(head, list);
@@ -483,6 +511,121 @@ function renderWorkerUsage(box, w, online) {
   box.append(days, byPrincipal);
 }
 
+// Timeline: the same usage.rollup data as one row per day — date, a mini token
+// bar scaled to the busiest day, replies/failed, cost. Failing hosts get a plain
+// friendly line, never a broken table.
+function renderWorkerTimeline(box, w, online) {
+  box.replaceChildren();
+  const head = document.createElement("p");
+  head.textContent = "Timeline — 7 ngày qua, mỗi ngày một hàng";
+  const again = document.createElement("button");
+  again.type = "button";
+  again.className = "link";
+  again.textContent = "tải lại";
+  again.addEventListener("click", () => sendPayload({ op: "usage.rollup", days: 7 }));
+  box.append(head, again);
+  const line = (msg, kind) => {
+    const p = document.createElement("p");
+    p.className = kind === "error" ? "error small" : "muted small";
+    p.textContent = msg;
+    box.append(p);
+  };
+  if (!online) {
+    line("host offline — Timeline cần máy đang chạy");
+    return;
+  }
+  const u = w.usage;
+  if (!u) {
+    line("đang tải số liệu từ máy… (usage.rollup)");
+    return;
+  }
+  if (u.unavailable) {
+    line("usage chưa sẵn sàng trên máy này — bật HERDGATE_PI_RECEIPTS để ghi receipt journal.");
+    return;
+  }
+  const days = Array.isArray(u.days) ? u.days : [];
+  const busy = days.some((d) => (d.tokens ?? 0) > 0 || (d.requests ?? 0) > 0);
+  if (!busy) {
+    line("7 ngày qua chưa có request nào — máy đang rảnh ✓");
+    return;
+  }
+  const max = Math.max(1, ...days.map((d) => d.tokens ?? 0));
+  const rows = document.createElement("ul");
+  rows.className = "tl";
+  for (const day of days) {
+    const row = document.createElement("li");
+    row.className = "tl-row";
+    const date = document.createElement("span");
+    date.className = "tl-date";
+    date.textContent = day.date ?? "";
+    const bar = document.createElement("span");
+    bar.className = "tl-bar";
+    bar.title = `${day.tokens ?? 0} tokens`;
+    const fill = document.createElement("i");
+    fill.setAttribute("style", `width:${Math.round(((day.tokens ?? 0) / max) * 100)}%`);
+    bar.append(fill);
+    const counts = document.createElement("span");
+    counts.className = "tl-count";
+    counts.textContent = `${day.replied ?? 0}✓ · ${day.failed ?? 0}✗`;
+    const cost = document.createElement("span");
+    cost.className = "tl-cost";
+    cost.textContent = usageUsd(day.costUsd);
+    row.append(date, bar, counts, cost);
+    rows.append(row);
+  }
+  box.append(rows);
+}
+
+// Diff: render one `git show --stat --patch` answer — the stat block first, then
+// the patch with + green, - red, @@ purple. A truncated patch says so plainly.
+function renderWorkerDiff(out, d) {
+  out.replaceChildren();
+  if (!d) {
+    out.append(note("Nhập một ref (hash / branch / tag) rồi Load — diff chạy `git show --stat --patch` trên máy, chỉ đọc."));
+    return;
+  }
+  if (d.loading) {
+    out.append(note(`đang tải ${d.ref}…`));
+    return;
+  }
+  if (d.error) {
+    out.append(note(d.error, "error"));
+    return;
+  }
+  const text = typeof d.text === "string" ? d.text : "";
+  const statLines = [];
+  const patchLines = [];
+  let inPatch = false;
+  for (const line of text.split("\n")) {
+    if (line.startsWith("diff --git ")) inPatch = true;
+    (inPatch ? patchLines : statLines).push(line);
+  }
+  if (statLines.length) {
+    const stat = document.createElement("pre");
+    stat.className = "diff-stat";
+    stat.textContent = statLines.join("\n");
+    out.append(stat);
+  }
+  if (d.truncated) {
+    const warn = document.createElement("p");
+    warn.className = "muted small";
+    warn.textContent = `patch quá dài — đã cắt còn 128KB (bản đầy đủ ${d.bytes ?? "?"} bytes)`;
+    out.append(warn);
+  }
+  const patch = document.createElement("div");
+  patch.className = "diff-patch";
+  for (const line of patchLines) {
+    const row = document.createElement("div");
+    if (line.startsWith("+")) row.className = "diff-add";
+    else if (line.startsWith("-")) row.className = "diff-del";
+    else if (line.startsWith("@@")) row.className = "diff-hunk";
+    else row.className = "diff-ctx";
+    row.textContent = line || " ";
+    patch.append(row);
+  }
+  out.append(patch);
+}
+
 function renderWorkerBox(box) {
   const details = document.createElement("details");
   details.className = "worker";
@@ -500,7 +643,7 @@ function renderWorkerBox(box) {
   const bar = document.createElement("div");
   bar.className = "activity-bar";
   const tabButtons = new Map();
-  for (const [key, label] of [["jobs", "Jobs"], ["search", "Search"], ["recap", "Recap"], ["usage", "Usage"]]) {
+  for (const [key, label] of [["jobs", "Jobs"], ["search", "Search"], ["recap", "Recap"], ["usage", "Usage"], ["timeline", "Timeline"], ["diff", "Diff"]]) {
     const tab = document.createElement("button");
     tab.type = "button";
     tab.textContent = label;
@@ -557,7 +700,30 @@ function renderWorkerBox(box) {
   const usageView = document.createElement("div");
   usageView.className = "usage-view";
   usageView.hidden = true;
-  details.append(summary, health, refresh, bar, form, formError, search, recap, usageView, jobs);
+  // Timeline (usage.rollup as daily mini bars) and Diff (git show of one ref)
+  // share the same activity-bar surface; both stay above the jobs list.
+  const timelineView = document.createElement("div");
+  timelineView.className = "timeline-view";
+  timelineView.hidden = true;
+  const diffView = document.createElement("div");
+  diffView.className = "diff-view";
+  diffView.hidden = true;
+  const diffForm = document.createElement("form");
+  diffForm.autocomplete = "off";
+  const diffLabel = document.createElement("label");
+  diffLabel.textContent = "Diff — một ref (hash / branch / tag) trên máy, chỉ đọc";
+  const diffInput = document.createElement("input");
+  diffInput.type = "text";
+  diffInput.maxLength = 64;
+  diffInput.placeholder = "HEAD · main · v1.2.0 · <commit sha>";
+  const diffButton = document.createElement("button");
+  diffButton.type = "submit";
+  diffButton.textContent = "Load";
+  diffForm.append(diffLabel, diffInput, diffButton);
+  const diffOut = document.createElement("div");
+  diffOut.className = "diff-out";
+  diffView.append(diffForm, diffOut);
+  details.append(summary, health, refresh, bar, form, formError, search, recap, usageView, timelineView, diffView, jobs);
   box.append(details);
 
   const askHealth = () => sendPayload({ op: "worker.health" });
@@ -575,18 +741,38 @@ function renderWorkerBox(box) {
     event.preventDefault();
     const query = searchInput.value.trim();
     if (!query) return;
+    state.worker.lastQuery = query;
     sendPayload({ op: "receipt.search", query, limit: 8 });
+  });
+  diffForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const ref = diffInput.value.trim();
+    if (!ref) return;
+    state.diff = { ref, text: null, truncated: false, bytes: 0, error: null, loading: true };
+    sendPayload({ op: "diff.get", ref });
+    update(liveOnline);
   });
 
   const ui = { details, health, jobs, formError, asked: false };
   let liveOnline = false;
   for (const [key, tab] of tabButtons) {
-    tab.addEventListener("click", () => { state.worker.tab = key; update(liveOnline); });
+    tab.addEventListener("click", () => {
+      state.worker.tab = key;
+      if (key === "timeline" && !state.worker.usage) sendPayload({ op: "usage.rollup", days: 7 });
+      update(liveOnline);
+    });
   }
+  // The Cmd+K palette jumps here: open the surface, pick the tab, fetch on demand.
+  state.openWorkerTab = (key) => {
+    details.open = true;
+    state.worker.tab = key;
+    if (key === "timeline" && !state.worker.usage) sendPayload({ op: "usage.rollup", days: 7 });
+    update(liveOnline);
+  };
   const update = (online) => {
     liveOnline = online;
     const w = state.worker;
-    const tab = ["search", "recap", "usage"].includes(w.tab) ? w.tab : "jobs";
+    const tab = ["search", "recap", "usage", "timeline", "diff"].includes(w.tab) ? w.tab : "jobs";
     const working = [...w.jobs.values()].filter((job) => ["queued", "running", "pending"].includes(job.status)).length;
     tabButtons.get("jobs").textContent = `Jobs (${working})`;
     for (const [key, button] of tabButtons) button.className = key === tab ? "active" : "";
@@ -594,7 +780,10 @@ function renderWorkerBox(box) {
     search.hidden = !online || tab !== "search";
     recap.hidden = tab !== "recap";
     usageView.hidden = tab !== "usage";
+    timelineView.hidden = tab !== "timeline";
+    diffView.hidden = tab !== "diff";
     jobs.hidden = tab !== "jobs";
+    if (state.diff?.ref && diffInput.value !== state.diff.ref) diffInput.value = state.diff.ref;
     if (online && details.open && !ui.asked) { ui.asked = true; askHealth(); }
     const h = w.health;
     if (!online) {
@@ -619,7 +808,7 @@ function renderWorkerBox(box) {
           const head = document.createElement("span");
           head.textContent = `${hit.id.slice(0, 8)} · ${hit.status}${hit.reason ? ` (${hit.reason})` : ""}`
             + `${hit.principal ? ` · ${hit.principal}` : ""} · score ${hit.score}`;
-          row.append(head);
+          row.append(head, glyphNode(hit));
           if (hit.status === "replied") {
             const view = document.createElement("button");
             view.type = "button";
@@ -642,6 +831,19 @@ function renderWorkerBox(box) {
               row.append(why);
             }
           }
+          if (hit.status === "unknown") {
+            // An unknown receipt may be a settle this device never saw: ack retires
+            // the push intent, receipt.get refreshes the row's verdict in place.
+            const ack = document.createElement("button");
+            ack.type = "button";
+            ack.className = "link";
+            ack.textContent = "ack";
+            ack.addEventListener("click", () => {
+              sendPayload({ op: "receipt.ack", id: hit.id });
+              sendPayload({ op: "receipt.get", id: hit.id });
+            });
+            row.append(" ", ack);
+          }
           searchHits.append(row);
         }
       } else {
@@ -659,7 +861,7 @@ function renderWorkerBox(box) {
       row.className = "row";
       const head = document.createElement("span");
       head.textContent = `${job.id.slice(0, 8)} · ${job.status}${job.reason ? ` (${job.reason})` : ""}${job.duplicate ? " · duplicate" : ""}`;
-      row.append(head);
+      row.append(head, glyphNode(job));
       if (job.status === "replied" && job.hasBody) {
         const view = document.createElement("button");
         view.type = "button";
@@ -682,10 +884,23 @@ function renderWorkerBox(box) {
           row.append(why);
         }
       }
+      if (job.status === "unknown") {
+        const ack = document.createElement("button");
+        ack.type = "button";
+        ack.className = "link";
+        ack.textContent = "ack";
+        ack.addEventListener("click", () => {
+          sendPayload({ op: "receipt.ack", id: job.id });
+          sendPayload({ op: "receipt.get", id: job.id });
+        });
+        row.append(" ", ack);
+      }
       jobs.append(row);
     }
     renderWorkerRecap(recap, w);
     renderWorkerUsage(usageView, w, online);
+    renderWorkerTimeline(timelineView, w, online);
+    renderWorkerDiff(diffOut, state.diff);
   };
   return update;
 }
@@ -1441,6 +1656,30 @@ function applyPayload(payload) {
       state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
     }
     return;
+  } else if (payload && typeof payload === "object" && payload.op === "diff.result") {
+    state.diff = {
+      ref: typeof payload.ref === "string" ? payload.ref : (state.diff?.ref ?? ""),
+      text: typeof payload.text === "string" ? payload.text : "",
+      bytes: payload.bytes ?? 0,
+      truncated: payload.truncated === true,
+      error: null,
+      loading: false,
+    };
+    state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "receipt.result") {
+    // An ack/refresh follow-up: fold the verdict back into the row that asked.
+    if (payload.id) {
+      workerJobTouched(payload.id, { status: payload.status ?? "unknown", ...(payload.reason ? { reason: payload.reason } : {}) });
+      const s = state.worker.search;
+      const hit = Array.isArray(s?.hits) ? s.hits.find((h) => h.id === payload.id) : null;
+      if (hit) {
+        hit.status = payload.status ?? "unknown";
+        if (payload.reason) hit.reason = payload.reason;
+        state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
+      }
+    }
+    return;
   } else if (payload && typeof payload === "object" && payload.op === "usage.rollup.result") {
     state.worker.usage = payload;
     state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
@@ -1453,6 +1692,13 @@ function applyPayload(payload) {
     return;
   } else if (payload && typeof payload === "object" && payload.op === "error" && payload.code === "busy") {
     return; // our poll raced the host's 1/s throttle — the next tick catches up
+  } else if (payload && typeof payload === "object" && payload.op === "error" && DIFF_ERROR_CODES.has(payload.code)) {
+    // A refused diff faults only the Diff view, never the room.
+    state.diff = { ...(state.diff ?? { ref: "", text: null }), error: payload.message ?? payload.code ?? "the host refused", loading: false };
+    state.roomUi?.updateWorker?.(true);
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "error" && PANE_ERROR_CODES.has(payload.code)) {
+    return; // no pane-focus surface yet — the refusal is not the room's problem
   } else if (payload && typeof payload === "object" && payload.op === "error" && WORKER_ERROR_CODES.has(payload.code)) {
     // Scoped to the worker panel: a refused submit/watch must not blank the room view.
     state.worker.error = payload.message ?? payload.code ?? "the host refused";
@@ -1536,6 +1782,171 @@ function deviceName() {
   if (/Macintosh/.test(ua)) return "Mac browser";
   return "browser";
 }
+
+// ---- Cmd+K fuzzy jump -------------------------------------------------------
+
+// The palette's fixed destinations: the activity-bar views of the open room.
+const CMDK_VIEWS = [
+  ["jobs", "Jobs — hàng đợi và receipts"],
+  ["search", "Search — tìm receipt theo nội dung"],
+  ["recap", "Recap — đến lượt ai?"],
+  ["usage", "Usage — bảng 7 ngày"],
+  ["timeline", "Timeline — thanh token theo ngày"],
+  ["diff", "Diff — git show một ref"],
+];
+
+/** Subsequence match with a small score: earlier + consecutive hits win. */
+function fuzzyScore(query, target) {
+  const q = query.toLowerCase();
+  const t = target.toLowerCase();
+  if (!q) return 1;
+  let qi = 0;
+  let score = 0;
+  let streak = 0;
+  let last = -2;
+  for (let ti = 0; ti < t.length && qi < q.length; ti += 1) {
+    if (t[ti] !== q[qi]) continue;
+    qi += 1;
+    streak = last === ti - 1 ? streak + 1 : 1;
+    score += 1 + streak * 2 + (ti === 0 ? 3 : 0);
+    last = ti;
+  }
+  return qi === q.length ? score - t.length * 0.05 : -1;
+}
+
+/** Everything Enter can open right now: views, recent receipts/jobs, and — when
+ *  the query itself is a legal ref — a diff of exactly that ref. */
+function cmdkItems(query) {
+  const items = [];
+  for (const [key, label] of CMDK_VIEWS) {
+    items.push({ label: `View · ${label}`, score: fuzzyScore(query, `${key} ${label}`), run: () => state.openWorkerTab?.(key) });
+  }
+  for (const job of [...state.worker.jobs.values()].slice(-10).reverse()) {
+    items.push({
+      label: `Receipt · ${job.id.slice(0, 8)} · ${job.status}${job.reason ? ` (${job.reason})` : ""}`,
+      score: fuzzyScore(query, `${job.id} ${job.status} ${job.reason ?? ""}`),
+      run: () => {
+        state.openWorkerTab?.("jobs");
+        if (job.status === "replied") sendPayload({ op: "receipt.body", id: job.id });
+        else if (job.status === "unknown") sendPayload({ op: "receipt.get", id: job.id });
+      },
+    });
+  }
+  if (/^[A-Za-z0-9._\/-]{3,64}$/.test(query)) {
+    items.push({ label: `Diff · git show ${query}`, score: 0.5, run: () => openDiffRef(query) });
+  }
+  return items.filter((item) => item.score >= 0).sort((a, b) => b.score - a.score).slice(0, 9);
+}
+
+/** Jump straight to the Diff view with a ref (palette or URL hand-off). */
+function openDiffRef(ref) {
+  state.openWorkerTab?.("diff");
+  state.diff = { ref, text: null, truncated: false, bytes: 0, error: null, loading: true };
+  sendPayload({ op: "diff.get", ref });
+  state.roomUi?.updateWorker?.(true);
+}
+
+let cmdk = null;
+
+function ensureCmdk() {
+  if (cmdk) return cmdk;
+  const root = document.createElement("div");
+  root.className = "cmdk";
+  root.hidden = true;
+  const box = document.createElement("div");
+  box.className = "cmdk-box";
+  const input = document.createElement("input");
+  input.type = "search";
+  input.placeholder = "nhảy tới… (view, receipt, git ref)";
+  const list = document.createElement("ul");
+  list.className = "cmdk-list";
+  const hint = document.createElement("p");
+  hint.className = "muted small";
+  hint.textContent = "↑ ↓ chọn · Enter mở · Esc đóng";
+  box.append(input, list, hint);
+  root.append(box);
+  root.addEventListener("click", (event) => {
+    if (event.target === root) closeCmdk();
+  });
+  document.documentElement.append(root);
+  const ui = { root, input, list, items: [], sel: 0 };
+  input.addEventListener("input", () => {
+    ui.sel = 0;
+    renderCmdk(ui);
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      ui.sel = Math.min(ui.sel + 1, ui.items.length - 1);
+      renderCmdk(ui);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      ui.sel = Math.max(ui.sel - 1, 0);
+      renderCmdk(ui);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      const item = ui.items[ui.sel];
+      if (item) {
+        closeCmdk();
+        item.run();
+      }
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeCmdk();
+    }
+  });
+  cmdk = ui;
+  return ui;
+}
+
+function renderCmdk(ui) {
+  ui.items = cmdkItems(ui.input.value.trim());
+  if (ui.sel >= ui.items.length) ui.sel = Math.max(0, ui.items.length - 1);
+  ui.list.replaceChildren();
+  ui.items.forEach((item, i) => {
+    const row = document.createElement("li");
+    row.className = i === ui.sel ? "active" : "";
+    row.textContent = item.label;
+    row.addEventListener("click", () => {
+      closeCmdk();
+      item.run();
+    });
+    ui.list.append(row);
+  });
+  if (!ui.items.length) {
+    const none = document.createElement("li");
+    none.className = "muted small";
+    none.textContent = "không có gì khớp";
+    ui.list.append(none);
+  }
+}
+
+function openCmdk() {
+  const ui = ensureCmdk();
+  ui.root.hidden = false;
+  ui.input.value = "";
+  ui.sel = 0;
+  renderCmdk(ui);
+  ui.input.focus();
+}
+
+function closeCmdk() {
+  if (cmdk) cmdk.root.hidden = true;
+}
+
+function toggleCmdk() {
+  if (cmdk && !cmdk.root.hidden) closeCmdk();
+  else openCmdk();
+}
+
+// The standard web chord, captured wherever it lands; the header button says so.
+document.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && String(event.key ?? "").toLowerCase() === "k") {
+    event.preventDefault();
+    toggleCmdk();
+  }
+});
+$("cmdk-open")?.addEventListener("click", () => toggleCmdk());
 
 // ---- pairing ---------------------------------------------------------------
 
@@ -1687,6 +2098,8 @@ function resetRoomView() {
   state.view = null;
   state.viewError = null;
   state.roomUi = null;
+  state.diff = null;
+  state.openWorkerTab = null;
   $("view").replaceChildren();
 }
 
@@ -1722,6 +2135,16 @@ function forgetToken() {
 {
   const el = document.getElementById("build");
   if (el) el.textContent = "herdgate " + BUILD;
+}
+
+// QR pairing round: a scan opens the app with #pair=<code> — prefill the one-line
+// approval input so the owner only has to press Approve.
+{
+  const m = /#pair=([A-Za-z0-9]{4,64})/.exec(location.hash ?? "");
+  if (m) {
+    const input = $("addmachine-code");
+    if (input) input.value = m[1];
+  }
 }
 
 render();

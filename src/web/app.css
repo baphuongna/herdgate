@@ -392,3 +392,165 @@ dialog::backdrop {
 #view .worker th {
   font-weight: 600;
 }
+
+/* PWA v2 — Herdr status glyphs: ◉ needs-you, ◐ working, ● done, ✓ idle. */
+:root {
+  --warn: #e0af68;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --warn: #a8781f;
+  }
+}
+.glyph {
+  margin-left: 8px;
+  font-weight: 700;
+}
+.glyph-needs {
+  color: var(--bad);
+}
+.glyph-working {
+  color: var(--warn);
+}
+.glyph-done {
+  color: var(--good);
+}
+.glyph-idle {
+  color: var(--muted);
+}
+
+/* Timeline: one row per day; the token bar scales to the busiest day. */
+.timeline-view .tl {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tl-row {
+  display: grid;
+  grid-template-columns: 6.5em 1fr auto auto;
+  gap: 10px;
+  align-items: center;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.tl-date {
+  color: var(--muted);
+}
+.tl-bar {
+  display: block;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.tl-bar i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+.tl-count,
+.tl-cost {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* Diff: stat header, then the patch with + green, - red, @@ purple. */
+.diff-view .diff-out {
+  margin-top: 4px;
+}
+.diff-stat {
+  margin: 6px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--muted);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.diff-patch {
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  max-height: 60vh;
+  overflow: auto;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.diff-add {
+  color: var(--good);
+  white-space: pre;
+}
+.diff-del {
+  color: var(--bad);
+  white-space: pre;
+}
+.diff-hunk {
+  color: #c678dd;
+  white-space: pre;
+}
+.diff-ctx {
+  color: var(--muted);
+  white-space: pre;
+}
+
+/* Cmd+K fuzzy-jump overlay (opened by the chord or the header hint). */
+#cmdk-open {
+  background: none;
+  border: 1px solid var(--line);
+  color: var(--dim);
+  border-radius: 8px;
+  width: auto;
+  height: 30px;
+  padding: 0 10px;
+  margin: 0;
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.cmdk {
+  position: fixed;
+  inset: 0;
+  background: rgb(0 0 0 / 0.45);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 12vh 16px 16px;
+  z-index: 40;
+}
+.cmdk[hidden] {
+  display: none;
+}
+.cmdk-box {
+  width: min(92vw, 480px);
+  height: fit-content;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: 0 18px 50px rgb(0 0 0 / 0.35);
+}
+.cmdk-box input {
+  margin-bottom: 8px;
+}
+.cmdk-list {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  max-height: 46vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cmdk-list li {
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13.5px;
+}
+.cmdk-list li.active {
+  background: var(--bg);
+  outline: 1px solid var(--accent);
+}
