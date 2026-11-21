@@ -46,6 +46,13 @@ thiết bị ──receipt.get──▶ publisher ──▶ receipts.jsonl (như
   `failed/job_timeout` — khác abort của người (`canceled/aborted`) — rồi queue chạy
   tiếp job kế; job chạy đúng một lần, không retry/resend. Yêu cầu
   Pi tối thiểu `1.5.2` (floor qua `MIN_PI_VERSION`).
+- **Đã nghiệm thu `--real` + tự khai sinh cha trên Windows (NTFS, node 22.14,
+  Pi 1.5.2, 2026-11-21)**: job thật qua model host → `replied` 469 tokens/$0.00069,
+  body 0600, self-register đầy đủ (parent `pi-worker`, `sessionFile` Windows path,
+  status supersede theo verdict), scope case-insensitive hội tụ. Hai phát hiện
+  Windows đã sửa trong worker: dynamic import absolute path phải qua `file://`
+  URL; undici 8.12 của Pi đụng `zlib.createZstdDecompress` lúc load (node < 22.15
+  chưa có) — worker tự shim trong tiến trình mình, không đụng cài đặt của ai.
 - Receipt chỉ chứa `id/status/reason/entry IDs/sessionId`. Prompt chỉ nằm trong
   `jobs.jsonl` local 0600 và session JSONL của host.
 - Worker có hai chế độ: **once** (mặc định — drain xong exit 0, không daemon, không
@@ -153,7 +160,7 @@ scope bị `requires-act`.
   turn → resume → job hoàn tất với đúng 1 retry, nhưng không phải drop-in (harness
   riêng, transcript khác, đổi semantics fail-closed) — giữ SessionManager cho job,
   pi-durable là ứng viên cho scheduler/daemon quanh worker.
-  Windows chưa nghiệm thu với `--real`.
+  Restore-by-file trên Windows chưa chạy end-to-end (thành phần Windows-specific — path, scope, self-register — đã verify riêng).
 - **Tự khai sinh cha**: mỗi job tạo session với id chính là job id
   (`SessionManager.create(…, {id})` — SDK hỗ trợ sẵn) rồi tự ghi vào registry
   spawn (`experiments/pi-spawn`) với `parentSessionId: 'pi-worker'` kèm đường dẫn

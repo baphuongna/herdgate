@@ -30,6 +30,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, unwatchFile, watchFile, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import zlib from 'node:zlib';
 import { MIN_PI_VERSION, versionAtLeast } from '../../plugin/server/pi-worker.mjs';
 
 const arg = name => {
@@ -67,14 +69,23 @@ assert.ok(Number.isFinite(idleExitSeconds) && idleExitSeconds >= 0, '--idle-exit
 assert.ok(Number.isFinite(jobTimeoutSeconds) && jobTimeoutSeconds >= 0, '--job-timeout expects seconds (0 = off)');
 assert.ok(!fixtureDir || !real, '--fixture-dir and --real are mutually exclusive');
 if (thinking) assert.ok(['low', 'medium', 'high'].includes(thinking), '--thinking expects low|medium|high');
-assert.ok(workspace, 'pass --workspace <dir> (the Pi workspace whose receipt scope to use)');
+assert.ok(workspace || check, 'pass --workspace <dir> (the Pi workspace whose receipt scope to use)');
 assert.ok(fixtureDir || check || real, 'pass --fixture-dir <dir> (synthetic tests) or --real (host-configured models)');
 
 const root = piPackage();
+// undici 8.12 (bundled with Pi 1.5.x) touches zlib.createZstdDecompress at load
+// time; node < 22.15 lacks it and boot crashes. Shim it inside THIS process only:
+// no installed file changes, zstd responses fail loudly if ever requested.
+if (typeof zlib.createZstdDecompress !== 'function') {
+  zlib.createZstdDecompress = () => { throw new Error('zstd unsupported on this node build'); };
+  log(`note: shimmed zlib.createZstdDecompress (node ${process.versions.node} < 22.15) for undici boot`);
+}
+// Absolute Windows paths are not import specifiers — go through file:// URLs.
+const fromRoot = rel => pathToFileURL(join(root, rel)).href;
 const { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, VERSION } =
-  await import(join(root, 'dist/index.js'));
+  await import(fromRoot('dist/index.js'));
 const { createAssistantMessageEventStream, InMemoryModelsStore } =
-  await import(join(root, '../pi-ai/dist/index.js'));
+  await import(fromRoot('../pi-ai/dist/index.js'));
 assert.ok(versionAtLeast(VERSION, MIN_PI_VERSION),
   `Pi ${VERSION} is older than the verified minimum ${MIN_PI_VERSION} — pass a newer package dir`);
 if (check) {
