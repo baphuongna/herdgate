@@ -331,3 +331,26 @@ dialog::backdrop {
   word-break: break-word;
   margin: 0;
 }
+
+/* Pi worker panel (experimental) — mirrors the SSH leg's disclosure block. */
+#view details.worker {
+  border: 1px solid var(--line, #2a2f3a);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin: 8px 0;
+}
+#view details.worker summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+#view details.worker textarea,
+#view details.worker input {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 4px 0 8px;
+}
+#view details.worker pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 4px 0;
+}

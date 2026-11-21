@@ -146,6 +146,7 @@ const state = {
   termBody: null,
   termPre: null,
   retry: 0,
+  worker: { health: null, jobs: new Map(), error: null },
 };
 
 /** The cloud base: an explicit setting, else this page's origin (same-origin deployment). */
@@ -245,10 +246,12 @@ function renderRoom() {
   if (!state.roomUi) {
     const summary = document.createElement("div");
     const live = document.createElement("div");
+    const worker = document.createElement("div");
     const controls = document.createElement("div");
-    $("view").replaceChildren(summary, live, controls);
+    $("view").replaceChildren(summary, live, worker, controls);
     const updateSshHint = renderRoomControls(controls);
-    state.roomUi = { summary, live, updateSshHint };
+    const updateWorker = renderWorkerBox(worker);
+    state.roomUi = { summary, live, worker, controls, updateSshHint, updateWorker };
   }
   const ui = state.roomUi;
   const online = Boolean(room?.online);
@@ -259,8 +262,9 @@ function renderRoom() {
     ui.summary.replaceChildren();
     renderHostView(ui.summary, room);
   }
-  const { live, updateSshHint } = ui;
+  const { live, updateSshHint, updateWorker } = ui;
   renderLiveTerminals(live, online);
+  updateWorker?.(online);
   updateSshHint?.();
 }
 
@@ -338,6 +342,126 @@ function renderLiveTerminals(box, online) {
     state.termBody = tbody;
     renderTerms();
   }
+}
+
+// ---- Pi worker panel (experimental) -----------------------------------------
+// Submit/health/status against the host's opt-in worker queue (HERDGATE_PI_WORKER=1)
+// plus per-request receipt watches: the settle report pushes back, no polling loop.
+
+const WORKER_ERROR_CODES = new Set([
+  "pi_worker_disabled", "requires-act", "bad-prompt", "bad-workspace", "queue-full", "worker-queue",
+  "receipt.watch", "pi_receipts_disabled", "pi_receipt_body_disabled",
+]);
+
+function renderWorkerBox(box) {
+  const details = document.createElement("details");
+  details.className = "worker";
+  const summary = document.createElement("summary");
+  summary.textContent = "Pi worker (experimental)";
+  const health = document.createElement("p");
+  health.className = "muted small";
+  const refresh = document.createElement("button");
+  refresh.type = "button";
+  refresh.className = "link";
+  refresh.textContent = "refresh";
+  const form = document.createElement("form");
+  form.autocomplete = "off";
+  const promptLabel = document.createElement("label");
+  promptLabel.textContent = "Prompt for a fresh worker run (one job, one session)";
+  const prompt = document.createElement("textarea");
+  prompt.rows = 3;
+  prompt.maxLength = 16384;
+  prompt.required = true;
+  prompt.placeholder = "e.g. summarize today's commits in 5 bullets";
+  const wsLabel = document.createElement("label");
+  wsLabel.textContent = "Workspace (optional name from the host allowlist)";
+  const workspace = document.createElement("input");
+  workspace.type = "text";
+  workspace.maxLength = 64;
+  workspace.placeholder = "default";
+  workspace.pattern = "[a-z0-9][a-z0-9-]{0,63}";
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.textContent = "Submit job";
+  const formError = document.createElement("p");
+  formError.className = "error small";
+  formError.hidden = true;
+  form.append(promptLabel, prompt, wsLabel, workspace, submit, formError);
+  const jobs = document.createElement("ul");
+  jobs.className = "list";
+  details.append(summary, health, refresh, form, formError, jobs);
+  box.append(details);
+
+  const askHealth = () => sendPayload({ op: "worker.health" });
+  refresh.addEventListener("click", askHealth);
+  details.addEventListener("toggle", () => { if (details.open) askHealth(); });
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    formError.hidden = true;
+    const text = prompt.value.trim();
+    if (!text) return;
+    sendPayload({ op: "worker.submit", prompt: text, ...(workspace.value.trim() ? { workspace: workspace.value.trim() } : {}) });
+    prompt.value = "";
+  });
+
+  const ui = { details, health, jobs, formError, asked: false };
+  const update = (online) => {
+    const w = state.worker;
+    form.hidden = !online;
+    if (online && details.open && !ui.asked) { ui.asked = true; askHealth(); }
+    const h = w.health;
+    if (!online) {
+      health.textContent = "host offline";
+    } else if (!h) {
+      health.textContent = h === null ? "asking the host…" : "";
+    } else if (!h.enabled) {
+      health.textContent = "worker queue disabled on this host (HERDGATE_PI_WORKER)";
+    } else {
+      const beat = h.heartbeat ? ` · heartbeat ${h.heartbeat.source} ${h.heartbeat.ageSeconds}s ago` : " · no heartbeat";
+      health.textContent = `queue ${h.queued ?? "?"} waiting, ${h.running ?? "?"} running${beat}`;
+    }
+    formError.hidden = !w.error;
+    formError.textContent = w.error ?? "";
+    jobs.replaceChildren();
+    for (const job of [...w.jobs.values()].slice(-12).reverse()) {
+      const row = document.createElement("li");
+      row.className = "row";
+      const head = document.createElement("span");
+      head.textContent = `${job.id.slice(0, 8)} · ${job.status}${job.reason ? ` (${job.reason})` : ""}${job.duplicate ? " · duplicate" : ""}`;
+      row.append(head);
+      if (job.status === "replied" && job.hasBody) {
+        const view = document.createElement("button");
+        view.type = "button";
+        view.className = "link";
+        view.textContent = job.body === undefined ? "view report" : "hide report";
+        view.addEventListener("click", () => {
+          if (job.body === undefined) sendPayload({ op: "receipt.body", id: job.id });
+          else job.body = undefined;
+          update(online);
+        });
+        row.append(" ", view);
+        if (typeof job.body === "string") {
+          const pre = document.createElement("pre");
+          pre.textContent = job.body;
+          row.append(pre);
+        } else if (job.body && typeof job.body === "object") {
+          const why = document.createElement("span");
+          why.className = "muted small";
+          why.textContent = `report not available (${job.body.reason ?? "unavailable"})`;
+          row.append(why);
+        }
+      }
+      jobs.append(row);
+    }
+  };
+  return update;
+}
+
+function workerJobTouched(id, fields) {
+  const job = state.worker.jobs.get(id);
+  if (!job) return;
+  Object.assign(job, fields);
+  state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
 }
 
 function renderRoomControls(box) {
@@ -1043,8 +1167,39 @@ function applyPayload(payload) {
       paintTerm();
     }
     return;
+  } else if (payload && typeof payload === "object" && payload.op === "worker.health.result") {
+    state.worker.health = payload;
+    state.worker.error = payload.enabled === false ? payload.message ?? "worker queue disabled on this host" : null;
+    state.roomUi?.updateWorker?.(true);
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "worker.submitted") {
+    state.worker.jobs.set(payload.id, { id: payload.id, status: payload.state, duplicate: payload.duplicate === true, hasBody: false });
+    sendPayload({ op: "receipt.watch", id: payload.id, wantBody: true });
+    state.roomUi?.updateWorker?.(true);
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "worker.status.result") {
+    workerJobTouched(payload.id, { status: payload.state, ...(payload.reason ? { reason: payload.reason } : {}) });
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "receipt.watched") {
+    workerJobTouched(payload.id, payload.pending ? { status: "pending" } : { status: payload.status, ...(payload.reason ? { reason: payload.reason } : {}) });
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "receipt.push") {
+    workerJobTouched(payload.id, { status: payload.status, ...(payload.reason ? { reason: payload.reason } : {}), hasBody: payload.hasBody === true });
+    sendPayload({ op: "receipt.ack", id: payload.id }); // displayed — retire the intent
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "receipt.body.result") {
+    workerJobTouched(payload.id, payload.text !== undefined
+      ? { body: payload.text }
+      : { body: { reason: payload.reason ?? "unavailable" } });
+    return;
   } else if (payload && typeof payload === "object" && payload.op === "error" && payload.code === "busy") {
     return; // our poll raced the host's 1/s throttle — the next tick catches up
+  } else if (payload && typeof payload === "object" && payload.op === "error" && WORKER_ERROR_CODES.has(payload.code)) {
+    // Scoped to the worker panel: a refused submit/watch must not blank the room view.
+    state.worker.error = payload.message ?? payload.code ?? "the host refused";
+    state.worker.health = null;
+    state.roomUi?.updateWorker?.(true);
+    return;
   } else if (payload && typeof payload === "object" && payload.op === "error") {
     // The host refused or could not answer: an op we may not use, or its Herdr is down.
     state.viewError = payload.message ?? payload.code ?? "the host refused";

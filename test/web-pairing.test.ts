@@ -50,6 +50,120 @@ async function until(check: () => boolean, message: string) {
   assert.fail(message);
 }
 
+test("web: the worker panel submits, tracks the settle push, fetches the report, and scopes errors", async () => {
+  const accountToken = "web-worker-owner";
+  const cloud = await startCloud({ accounts: [{ id: "a", name: "owner", token: accountToken }], log: () => {} });
+  const base = `http://127.0.0.1:${cloud.port}`;
+  const ws = base.replace("http", "ws");
+  const sockets: { close(): void }[] = [];
+  const stopDrainRef = { stop: () => {} };
+  try {
+    const post = (path: string, body: object) => fetch(`${base}/v1/agent/${path}`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${accountToken}` }, body: JSON.stringify(body) });
+    const { code } = await (await post("code", { name: "WorkerHost" })).json() as { code: string };
+    assert.equal((await post("approve", { code })).status, 200);
+    const { roomId, roomToken } = await (await fetch(`${base}/v1/agent/code/${code}/status`)).json() as { roomId: string; roomToken: string };
+    const agent = new DeviceSock(`${ws}/v1/agent/ws`);
+    sockets.push(agent);
+    await agent.hello({ roomToken, info: { name: "WorkerHost", version: "test" } });
+    const device = new DeviceSock(`${ws}/v1/device/ws`);
+    sockets.push(device);
+    await device.hello({ accountToken });
+    await device.send({ t: "pair.begin", roomId, scope: "act", name: "worker-tab" });
+    // act scope needs the host's approval: the cloud asks this agent, then grants.
+    const approve = await agent.expect("pair.request", 2_000) as unknown as { requestId: string };
+    await agent.send({ t: "pair.response", requestId: approve.requestId, ok: true });
+    const grant = await device.expect("pair.granted") as unknown as { device: { id: string }; deviceSecret: string };
+    device.close();
+
+    const storage = new Map([["herdgate.token", accountToken], ["herdgate.device", grant.device.id], ["herdgate.deviceSecret", grant.deviceSecret]]);
+    const source = readFileSync(new URL("../src/web/app.js", import.meta.url), "utf8").replace(/^import .* from "\/e2e.js";$/m, "");
+    const doc = new Element();
+    const $ = (id: string) => doc.querySelector(id);
+    runInNewContext(source, {
+      document: Object.assign(doc, { getElementById: $, createElement: () => new Element() }), Element,
+      navigator: { userAgent: "test" }, location: { origin: base },
+      localStorage: { getItem: (k: string) => storage.get(k) ?? null, setItem: (k: string, v: string) => storage.set(k, v), removeItem: (k: string) => storage.delete(k) },
+      WebSocket: class extends WebSocket { constructor(url: string) { super(url); sockets.push(this); } },
+      generateKeyPair: async () => ({ jwk: {}, pub: new Uint8Array() }),
+      DeviceChannel: class { ready() { return false; } async begin() { return { e: "mock" }; } },
+      fetch, btoa, atob, setTimeout, clearTimeout,
+    });
+    await until(() => $("room-name").textContent === "WorkerHost", "the paired device should open WorkerHost");
+    await until(() => $("status").textContent === "online", "device socket should attach");
+
+    // The host side of this test answers worker ops directly on the relay.
+    const reply = (payload: object) => agent.send({ t: "frame", device: grant.device.id, payload });
+    const saw = { ack: false };
+    let submits = 0;
+    let stopDrain = false;
+    const draining = (async () => {
+      while (!stopDrain) {
+        let message: { t?: string; payload?: { op?: string; id?: string } };
+        try { message = await agent.next(200) as { t?: string; payload?: { op?: string; id?: string } }; }
+        catch { continue; } // no frame this tick — keep draining
+        if (message.t !== "frame") continue;
+        const op = message.payload?.op;
+        if (op === "worker.health") {
+          reply({ op: "worker.health.result", enabled: true, queued: 0, running: 1, heartbeat: { ts: Date.now(), source: "herdgate-scheduler", ageSeconds: 3 } });
+        } else if (op === "worker.submit") {
+          submits += 1;
+          if (submits === 1) reply({ op: "worker.submitted", id: "11111111-2222-4333-8444-555555555555", state: "queued", duplicate: false });
+          else reply({ op: "error", code: "queue-full", message: "worker queue is full (100 pending)" });
+        } else if (op === "receipt.watch") {
+          reply({ op: "receipt.watched", id: message.payload!.id, pending: true });
+        } else if (op === "receipt.ack") {
+          saw.ack = true;
+        } else if (op === "receipt.body") {
+          reply({ op: "receipt.body.result", id: message.payload!.id, text: "Báo cáo: xong.", bytes: 15, truncated: false });
+        }
+      }
+    })();
+    void draining.catch(() => {});
+    stopDrainRef.stop = () => { stopDrain = true; };
+
+    const view = $("view");
+    const workerBox = view.find((node) => node.className === "worker");
+    assert.ok(workerBox, "the worker panel is part of the room view");
+    workerBox.open = true;
+    workerBox.fire("toggle");
+    const healthLine = workerBox.children.find((node) => node.className === "muted small")!;
+    await until(() => /queue 0 waiting, 1 running/.test(healthLine.textContent), "health should render queue depth and heartbeat");
+    assert.match(healthLine.textContent, /heartbeat herdgate-scheduler 3s ago/);
+
+    const form = workerBox.children.find((node) => node instanceof Element && node.children.length > 0 && node.handlers.has("submit"))!;
+    const prompt = form.children[1]!;
+    const workspace = form.children[3]!;
+    prompt.value = "  tóm tắt commit hôm nay  ";
+    workspace.value = "other";
+    form.fire("submit");
+    await until(() => JSON.stringify(workerBox.children.at(-1)?.children).includes("11111111"), "the submitted job should be tracked");
+    await until(() => workerBox.children.at(-1)!.children.some((row) => /pending/.test(row.children[0]?.textContent ?? "")), "the watch registration should surface as pending");
+
+    // Settle pushes to THIS device only after its watch; displaying it ACKs.
+    reply({ op: "receipt.push", id: "11111111-2222-4333-8444-555555555555", status: "replied", hasBody: true });
+    await until(() => workerBox.children.at(-1)!.children.some((row) => /replied/.test(row.children[0]?.textContent ?? "")), "the settle push should update the row");
+    await until(() => saw.ack, "displaying the push must ACK the watch");
+
+    const row = workerBox.children.at(-1)!.children.find((r) => /replied/.test(r.children[0]?.textContent ?? ""))!;
+    const rowBody = () => workerBox.children.at(-1)!.children.some((r) => r.children.some((node) => node.textContent === "Báo cáo: xong."));
+    const viewBtn = row.children.find((node) => node instanceof Element && node.handlers.has("click"))!;
+    viewBtn.fire("click");
+    await until(rowBody, "the report body should render after fetch");
+
+    // A refused submit must scope its error to the panel, never blank the room.
+    prompt.value = "another one";
+    workspace.value = "";
+    form.fire("submit");
+    await until(() => /queue is full/.test(String(workerBox.children.find((node) => node.className === "error small")?.textContent)), "the panel should show the refusal");
+    assert.equal($("room-name").textContent, "WorkerHost", "a worker error must not blank the room view");
+    assert.ok(view.children.length > 0, "the room view stays rendered");
+  } finally {
+    stopDrainRef.stop();
+    for (const socket of sockets) socket.close();
+    await cloud.close();
+  }
+});
+
 test("web: separate room pairings survive reload, and pinned rooms reject plaintext and a changed host key", async () => {
   const accountToken = "web-pair-owner";
   const cloud = await startCloud({ accounts: [{ id: "a", name: "owner", token: accountToken }], log: () => {} });
