@@ -41,7 +41,10 @@ thiết bị ──receipt.get──▶ publisher ──▶ receipts.jsonl (như
   tổng hợp không mạng cho test. Hai flag loại nhau. `--tools` (opt-in) bật tools cho
   job — cùng mức tin với SSH bridge của thiết bị đã pair, nhưng tường minh;
   `--thinking low|medium|high` ghim mức suy nghĩ (mặc định: theo settings). Thiếu
-  credential → job chốt `failed/pi_no_auth` fail-closed, worker không chết. Yêu cầu
+  credential → job chốt `failed/pi_no_auth` fail-closed, worker không chết.
+  `--job-timeout <giây>` (0 = tắt) chặn treo: stream treo quá hạn bị abort và chốt
+  `failed/job_timeout` — khác abort của người (`canceled/aborted`) — rồi queue chạy
+  tiếp job kế; job chạy đúng một lần, không retry/resend. Yêu cầu
   Pi tối thiểu `1.5.2` (floor qua `MIN_PI_VERSION`).
 - Receipt chỉ chứa `id/status/reason/entry IDs/sessionId`. Prompt chỉ nằm trong
   `jobs.jsonl` local 0600 và session JSONL của host.

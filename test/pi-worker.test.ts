@@ -314,6 +314,53 @@ test('a worker killed mid-run fails closed on restart and resumes the next job',
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('a hung job is bounded by --job-timeout: failed/job_timeout, queue moves on, user abort stays canceled', {
+  skip: (!piBin || process.platform !== 'linux') && 'requires TEST_PI_BIN on Linux',
+  timeout: 90_000,
+}, async () => {
+  const pkg = piPackage();
+  assert.ok(pkg, 'resolvable Pi package');
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-worker-'));
+  const workspace = join(dir, 'ws');
+  const workerDir = join(dir, 'worker');
+  const receiptsDir = join(dir, 'receipts');
+  const fixtureDir = join(dir, 'fixture');
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(fixtureDir, { recursive: true });
+  const file = jobsFile(workerDir);
+  const held = '00000000-0000-4000-8000-000000000031';
+  const next = '00000000-0000-4000-8000-000000000032';
+  appendJob(file, { v: 1, id: held, prompt: 'Synthetic hung request', ts: 1, state: 'queued' });
+  appendJob(file, { v: 1, id: next, prompt: 'Synthetic after-hang request', ts: 2, state: 'queued' });
+  writeFileSync(join(fixtureDir, 'hold'), '', { mode: 0o600 }); // the first stream never ends on its own
+
+  const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/worker.mjs'),
+    '--workspace', workspace, '--pi', pkg, '--fixture-dir', fixtureDir, '--job-timeout', '2'],
+    { env: { PATH: process.env.PATH, HOME: dir, HERDGATE_PI_WORKER_DIR: workerDir, HERDGATE_PI_RECEIPT_DIR: receiptsDir, PI_TELEMETRY: '0' }, stdio: ['ignore', 'ignore', 'pipe'] });
+  const err: string[] = [];
+  child.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
+  // The first stream parks in the hold loop (released only by abort); drop the hold
+  // file before the second job starts so it streams normally.
+  await waitFor('fixture holds the first call', () => events(fixtureDir).some(e => e.event === 'holding' && e.call === 1));
+  rmSync(join(fixtureDir, 'hold'));
+  const code = await new Promise<number | null>(resolve => child.once('exit', resolve));
+  assert.equal(code, 0, err.join(''));
+  assert.match(err.join(''), /exceeded 2s — aborting/, 'the timeout fired and said so');
+
+  const jobs = readJobs(file);
+  assert.equal(jobs.get(held)?.state, 'failed');
+  assert.equal(jobs.get(held)?.reason, 'job_timeout');
+  assert.equal(jobs.get(next)?.state, 'replied', 'the queue moved on to the next job');
+  const receipt = findReceipt(receiptsDir, held);
+  assert.equal(receipt?.status, 'failed');
+  assert.equal(receipt?.reason, 'job_timeout');
+  assert.equal(findReceipt(receiptsDir, next)?.status, 'replied');
+  // The hung prompt ran exactly once: the timeout aborts, it never retries or resends.
+  const hashOf = (prompt: string) => createHash('sha256').update(prompt).digest('hex');
+  assert.equal(events(fixtureDir).filter(e => e.event === 'call' && e.inputHash === hashOf('Synthetic hung request')).length, 1);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('rpc mode: ping/stats/drain over JSONL, junk tolerated, oversize frame kills, EOF exits cleanly', {
   skip: (!piBin || process.platform !== 'linux') && 'requires TEST_PI_BIN on Linux',
   timeout: 90_000,

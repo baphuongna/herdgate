@@ -15,10 +15,13 @@ Type=simple
 #   --real            host Pi's own configured models (auth.json + settings default
 #                     model of this user); add --tools to let jobs use tools and
 #                     --thinking low|medium|high to pin a level (default: settings)
+# --job-timeout bounds one job's wall clock: a hung stream aborts into a
+#   failed/job_timeout receipt instead of stalling the queue forever.
 #   --fixture-dir ... synthetic no-network provider for tests
 ExecStart=/usr/bin/node %h/source/herdgate/experiments/pi-worker/worker.mjs \
   --workspace %h/source/your-project \
   --real \
+  --job-timeout 1800 \
   --mode rpc --idle-exit 3600
 Environment=HERDGATE_PI_WORKER_DIR=%h/.local/state/herdgate/pi-worker
 Environment=HERDGATE_PI_RECEIPT_DIR=%h/.local/state/herdgate/pi-receipts

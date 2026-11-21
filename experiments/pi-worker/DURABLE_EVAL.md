@@ -45,8 +45,9 @@ mất; (2) requestId idempotent — submit lại trả **cùng submission**, kh�
   == cơ chế "agent tự khai sinh cha" vừa land ở pi-spawn (`self` op, commit
   `9ae009c`). Xác nhận độc lập hướng thiết kế.
 - Commit-before-show == journal-before-push của receipt (đã có).
-- Retry limit chặn vòng "request giết process" — worker chưa có tương đương ở tầng
-  job (systemd `Restart=on-failure` xử lý ở tầng tiến trình).
+- Retry limit chặn vòng "request giết process" — **đã có tương đương từ 2026-11-21:
+  `--job-timeout`** chặn hướng đối xứng (request *treo* vĩnh viễn): stream treo quá hạn
+  → abort → `failed/job_timeout`, queue chạy tiếp, job không bao giờ chạy lần hai.
 
 **Kết luận.** Giữ `SessionManager` + Pi SDK cho job worker — coding agent thật là giá
 trị cốt lõi, chuỗi receipt/restore dựa trên session format Pi. pi-durable là lớp đúng

@@ -9,7 +9,7 @@
 // (auth.json + models.json + settings default model of the user running it).
 //
 //   node experiments/pi-worker/worker.mjs --workspace <dir> [--pi <pi-coding-agent pkg>] \
-//     [--fixture-dir <dir> | --real] [--tools] [--thinking <level>] \
+//     [--fixture-dir <dir> | --real] [--tools] [--thinking <level>] [--job-timeout <seconds>] \
 //     [--check] [--mode once|rpc] [--idle-exit <seconds>]
 //
 // once (default): drain what is queued, then exit 0 — the original one-shot binary.
@@ -53,16 +53,18 @@ function piPackage() {
   return join(releases, versions.at(-1), 'node_modules', '@earendil-works', 'pi-coding-agent');
 }
 
-const workspace = resolve(arg('workspace') ?? '');
+const workspace = arg('workspace') ? resolve(arg('workspace')) : '';
 const fixtureDir = arg('fixture-dir') ? resolve(arg('fixture-dir')) : '';
 const real = process.argv.includes('--real');
 const toolsOn = process.argv.includes('--tools');
 const thinking = arg('thinking');
+const jobTimeoutSeconds = Number(arg('job-timeout') ?? 0);
 const check = process.argv.includes('--check');
 const mode = arg('mode') ?? 'once';
 const idleExitSeconds = Number(arg('idle-exit') ?? 0);
 assert.ok(['once', 'rpc'].includes(mode), 'pass --mode once|rpc');
 assert.ok(Number.isFinite(idleExitSeconds) && idleExitSeconds >= 0, '--idle-exit expects seconds');
+assert.ok(Number.isFinite(jobTimeoutSeconds) && jobTimeoutSeconds >= 0, '--job-timeout expects seconds (0 = off)');
 assert.ok(!fixtureDir || !real, '--fixture-dir and --real are mutually exclusive');
 if (thinking) assert.ok(['low', 'medium', 'high'].includes(thinking), '--thinking expects low|medium|high');
 assert.ok(workspace, 'pass --workspace <dir> (the Pi workspace whose receipt scope to use)');
@@ -341,9 +343,23 @@ async function runJob(job, allowlist) {
   })();
   running = { job, session, done };
   counters.started += 1;
+  // A hung stream would stall the whole queue forever; the wall clock bounds one
+  // job (pi-durable's retry-limit analog: pathological requests end, they never loop).
+  // Timed-out aborts settle failed/job_timeout — distinct from a user abort's canceled.
+  let timedOut = false;
+  const timer = jobTimeoutSeconds > 0 ? setTimeout(() => {
+    timedOut = true;
+    log(`job ${job.id} exceeded ${jobTimeoutSeconds}s — aborting`);
+    session.abort().catch(() => {});
+  }, jobTimeoutSeconds * 1000) : null;
   try {
     await done;
+    if (timedOut && verdict.status === 'canceled') {
+      verdict = { status: 'failed', reason: 'job_timeout',
+        ...('responseEntryId' in verdict ? { responseEntryId: verdict.responseEntryId } : {}) };
+    }
   } finally {
+    if (timer) clearTimeout(timer);
     session.dispose();
     running = null;
   }
@@ -439,7 +455,8 @@ const ops = {
     return { pid: process.pid, uptimeMs: Date.now() - startedAt, queued,
       running: running?.job.id ?? null, runningSinceMs: running ? Date.now() - startedAt : null,
       busy: passActive, started: counters.started, verdicts: { ...counters.verdicts },
-      scope: scopeFor(workspace), workspaces: readWorkspaces(base).size, rpc: RPC_VERSION };
+      scope: scopeFor(workspace), workspaces: readWorkspaces(base).size, rpc: RPC_VERSION,
+      jobTimeoutSeconds };
   },
   async drain({ wait } = {}) {
     if (passActive || passPromise) return { started: false, busy: true, current: running?.job.id ?? null };
