@@ -2,7 +2,7 @@
 # copy to ~/.config/systemd/user/ and edit paths before use; the repo checkout must
 # stay in place because ExecStart points into it).
 [Unit]
-Description=Herdgate experimental Pi worker (queue drain, fixture prototype)
+Description=Herdgate experimental Pi worker (queue drain, real or fixture provider)
 After=network.target
 
 [Service]
@@ -10,9 +10,15 @@ Type=simple
 # RPC daemon: graceful on stop (SIGTERM aborts the running job into a canceled
 # receipt), exits on its own after an idle hour. once-mode owners should use a
 # timer instead and drop --mode/--idle-exit.
+#
+# Provider choice — exactly one of:
+#   --real            host Pi's own configured models (auth.json + settings default
+#                     model of this user); add --tools to let jobs use tools and
+#                     --thinking low|medium|high to pin a level (default: settings)
+#   --fixture-dir ... synthetic no-network provider for tests
 ExecStart=/usr/bin/node %h/source/herdgate/experiments/pi-worker/worker.mjs \
   --workspace %h/source/your-project \
-  --fixture-dir %h/.local/state/herdgate/pi-worker/fixture \
+  --real \
   --mode rpc --idle-exit 3600
 Environment=HERDGATE_PI_WORKER_DIR=%h/.local/state/herdgate/pi-worker
 Environment=HERDGATE_PI_RECEIPT_DIR=%h/.local/state/herdgate/pi-receipts

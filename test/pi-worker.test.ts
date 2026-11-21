@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -159,6 +159,41 @@ test('a second worker refuses to start while a live pid owns the queue', { skip:
   const [code] = await Promise.all([new Promise<number | null>(resolve => child.once('exit', resolve)), new Promise(r => child.stderr!.once('end', r))]);
   assert.equal(code, 1);
   assert.match(err.join(''), /another worker is running/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('real-provider mode is flag-guarded: mutually exclusive with the fixture and fails closed without auth', {
+  skip: (!piBin || process.platform !== 'linux') && 'requires TEST_PI_BIN on Linux',
+  timeout: 60_000,
+}, async () => {
+  const pkg = piPackage();
+  assert.ok(pkg, 'resolvable Pi package');
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-real-'));
+  const run = (args: string[], env: NodeJS.ProcessEnv) => {
+    const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/worker.mjs'), '--pi', pkg, ...args],
+      { env, stdio: ['ignore', 'ignore', 'pipe'] });
+    const err: string[] = [];
+    child.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
+    return Promise.all([new Promise<number | null>(resolve => child.once('exit', resolve)),
+      new Promise(r => child.stderr!.once('end', r))]).then(([code]) => ({ code, err: err.join('') }));
+  };
+  const baseEnv = { PATH: process.env.PATH, HERDGATE_PI_WORKER_DIR: join(dir, 'worker'),
+    HERDGATE_PI_RECEIPT_DIR: join(dir, 'receipts') };
+  const both = await run(['--workspace', dir, '--fixture-dir', join(dir, 'fx'), '--real'], baseEnv);
+  assert.equal(both.code, 1);
+  assert.match(both.err, /mutually exclusive/);
+  // No credentials in scope: a queued job settles failed/pi_no_auth instead of hanging.
+  const emptyAgent = join(dir, 'pi-empty');
+  mkdirSync(baseEnv.HERDGATE_PI_WORKER_DIR as string, { recursive: true });
+  const id = randomUUID();
+  appendJob(jobsFile(baseEnv.HERDGATE_PI_WORKER_DIR as string), { v: 1, id, prompt: 'hello', ts: Date.now(), state: 'queued' });
+  const noAuth = await run(['--workspace', dir, '--real', '--mode', 'once'], { ...baseEnv, PI_CODING_AGENT_DIR: emptyAgent });
+  assert.equal(noAuth.code, 0); // the worker itself survives; the job is the thing that failed
+  assert.match(noAuth.err, /failed\/pi_no_auth/);
+  const receipt = findReceipt(join(dir, 'receipts'), id);
+  assert.equal(receipt?.status, 'failed');
+  assert.equal(receipt?.reason, 'pi_no_auth');
+  assert.equal(readJobs(jobsFile(baseEnv.HERDGATE_PI_WORKER_DIR as string)).get(id)?.state, 'failed');
   rmSync(dir, { recursive: true, force: true });
 });
 

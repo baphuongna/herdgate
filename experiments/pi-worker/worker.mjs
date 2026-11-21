@@ -4,10 +4,13 @@
 // worker.submit/worker.status device ops) and runs each request through a real Pi SDK
 // session in the given workspace, journaling a receipt exactly like the TUI observer.
 // The worker owns admission idempotency, resume and fail-closed restarts; it is not a
-// scheduler and never resends. Fixture provider only in this prototype: no network.
+// scheduler and never resends. Providers: --fixture-dir runs the synthetic
+// no-network provider (tests); --real runs the host Pi's own configured models
+// (auth.json + models.json + settings default model of the user running it).
 //
 //   node experiments/pi-worker/worker.mjs --workspace <dir> [--pi <pi-coding-agent pkg>] \
-//     [--fixture-dir <dir>] [--check] [--mode once|rpc] [--idle-exit <seconds>]
+//     [--fixture-dir <dir> | --real] [--tools] [--thinking <level>] \
+//     [--check] [--mode once|rpc] [--idle-exit <seconds>]
 //
 // once (default): drain what is queued, then exit 0 — the original one-shot binary.
 // rpc: stay resident and speak one JSON request/response pair per line on stdio
@@ -51,14 +54,19 @@ function piPackage() {
 }
 
 const workspace = resolve(arg('workspace') ?? '');
-const fixtureDir = resolve(arg('fixture-dir') ?? '');
+const fixtureDir = arg('fixture-dir') ? resolve(arg('fixture-dir')) : '';
+const real = process.argv.includes('--real');
+const toolsOn = process.argv.includes('--tools');
+const thinking = arg('thinking');
 const check = process.argv.includes('--check');
 const mode = arg('mode') ?? 'once';
 const idleExitSeconds = Number(arg('idle-exit') ?? 0);
 assert.ok(['once', 'rpc'].includes(mode), 'pass --mode once|rpc');
 assert.ok(Number.isFinite(idleExitSeconds) && idleExitSeconds >= 0, '--idle-exit expects seconds');
+assert.ok(!fixtureDir || !real, '--fixture-dir and --real are mutually exclusive');
+if (thinking) assert.ok(['low', 'medium', 'high'].includes(thinking), '--thinking expects low|medium|high');
 assert.ok(workspace, 'pass --workspace <dir> (the Pi workspace whose receipt scope to use)');
-assert.ok(fixtureDir || check, 'pass --fixture-dir <dir> (this prototype runs the synthetic provider only)');
+assert.ok(fixtureDir || check || real, 'pass --fixture-dir <dir> (synthetic tests) or --real (host-configured models)');
 
 const root = piPackage();
 const { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, VERSION } =
@@ -81,7 +89,7 @@ const base = workerBase();
 const file = jobsFile(base);
 const receiptsBase = journalBase();
 mkdirSync(base, { recursive: true, mode: 0o700 });
-mkdirSync(fixtureDir, { recursive: true, mode: 0o700 });
+if (fixtureDir) mkdirSync(fixtureDir, { recursive: true, mode: 0o700 });
 const agentDir = join(base, 'agent');
 mkdirSync(agentDir, { recursive: true, mode: 0o700 });
 
@@ -96,8 +104,8 @@ if (existsSync(pidFile)) {
 }
 writeFileSync(pidFile, `${process.pid}\n`, { mode: 0o600 });
 
-const events = join(fixtureDir, 'events.jsonl');
-const note = record => appendFileSync(events, `${JSON.stringify(record)}\n`);
+const events = fixtureDir ? join(fixtureDir, 'events.jsonl') : '';
+const note = fixtureDir ? record => appendFileSync(events, `${JSON.stringify(record)}\n`) : () => {};
 let currentPrompt = '';
 // Keep call numbers monotonic across worker restarts: seed from the events file.
 let calls = 0;
@@ -120,6 +128,35 @@ function message(model, text) {
 }
 
 async function makeSession(wsPath) {
+  const sessionsDir = join(base, 'sessions');
+  mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
+  const sessionManager = SessionManager.create(wsPath, sessionsDir);
+  if (real) {
+    // Real provider: the host Pi's own credentials, models.json and settings default
+    // model. The manager is read-only here (no setters are called), so worker jobs
+    // never write user settings; sessions stay isolated under the worker base.
+    const realAgentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent');
+    const settingsManager = SettingsManager.create(process.cwd(), realAgentDir);
+    const modelRuntime = await ModelRuntime.create({
+      authPath: join(realAgentDir, 'auth.json'), modelsPath: join(realAgentDir, 'models.json'),
+    });
+    const resourceLoader = new DefaultResourceLoader({
+      cwd: wsPath, agentDir: realAgentDir, settingsManager, noSkills: true, noContextFiles: true,
+      noThemes: true, noPromptTemplates: true, noExtensions: true,
+    });
+    await resourceLoader.reload();
+    assert.deepEqual(resourceLoader.getExtensions().errors, []);
+    const { session } = await createAgentSession({
+      cwd: wsPath, agentDir: realAgentDir, settingsManager, modelRuntime,
+      sessionManager, resourceLoader,
+      ...(thinking ? { thinkingLevel: thinking } : {}),
+      // Tools stay off unless the owner opts in — same trust as the paired-device
+      // SSH bridge, but explicit.
+      ...(toolsOn ? {} : { noTools: 'all' }),
+    });
+    assert.ok(session.model, 'no configured model — log in with pi on this host first');
+    return { session, sessionManager };
+  }
   const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false } }, { projectTrusted: false });
   settingsManager.setEnableInstallTelemetry(false);
   const modelRuntime = await ModelRuntime.create({
@@ -163,9 +200,6 @@ async function makeSession(wsPath) {
       return stream;
     },
   });
-  const sessionsDir = join(base, 'sessions');
-  mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
-  const sessionManager = SessionManager.create(wsPath, sessionsDir);
   const resourceLoader = new DefaultResourceLoader({
     cwd: wsPath, agentDir, settingsManager, noSkills: true, noContextFiles: true,
     noThemes: true, noPromptTemplates: true, noExtensions: true,
@@ -284,6 +318,7 @@ async function runJob(job, allowlist) {
       if (requestEntryId) verdict.requestEntryId = requestEntryId;
     } catch (error) {
       if (error?.name === 'AbortError') verdict = { status: 'canceled', reason: 'aborted' };
+      else if (/no api key/i.test(String(error?.message))) verdict = { status: 'failed', reason: 'pi_no_auth' };
       else log(`job ${job.id} prompt threw: ${error?.message ?? error}`);
     }
     return verdict;

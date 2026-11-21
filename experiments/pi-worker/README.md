@@ -35,9 +35,14 @@ thiết bị ──receipt.get──▶ publisher ──▶ receipts.jsonl (như
   (job + receipt), **không chạy lại** — duplicate id trong queue/ journal → trả
   `duplicate: true`, không append. Kill -9 giữa chừng không kịp ghi thì truy vấn sau
   là `unknown`.
-- Prototype chỉ chạy provider **fixture** (`--fixture-dir`, không mạng, không tool,
-  không extension); yêu cầu Pi tối thiểu `1.5.2` (floor qua `MIN_PI_VERSION`, bản mới hơn
-  chạy không đổi code). Wire provider thật là slice sau.
+- Provider: **`--real`** chạy model đã cấu hình của host Pi (đọc `auth.json` +
+  `models.json` + model mặc định trong settings của user chạy worker — không ghi
+  settings; sessions vẫn cách ly dưới worker dir). **`--fixture-dir`** chạy provider
+  tổng hợp không mạng cho test. Hai flag loại nhau. `--tools` (opt-in) bật tools cho
+  job — cùng mức tin với SSH bridge của thiết bị đã pair, nhưng tường minh;
+  `--thinking low|medium|high` ghim mức suy nghĩ (mặc định: theo settings). Thiếu
+  credential → job chốt `failed/pi_no_auth` fail-closed, worker không chết. Yêu cầu
+  Pi tối thiểu `1.5.2` (floor qua `MIN_PI_VERSION`).
 - Receipt chỉ chứa `id/status/reason/entry IDs/sessionId`. Prompt chỉ nằm trong
   `jobs.jsonl` local 0600 và session JSONL của host.
 - Worker có hai chế độ: **once** (mặc định — drain xong exit 0, không daemon, không
@@ -138,7 +143,8 @@ scope bị `requires-act`.
 
 ## Chưa làm (thuộc slice sau)
 
-- Provider/tool thật cho worker (hiện fixture-only, `noTools`), multi-workspace routing
-  (một worker/host), push/subscribe khi receipt đổi, PWA act UI, và đánh giá
+- Đã có `--real` (model host, đã nghiệm thu live: glm-5.3 thinking low, 435 tokens,
+  $0.0006, body 0600) — còn: policy tools chi tiết (allowlist tool thay vì all/none),
+  push/subscribe khi receipt đổi, PWA act UI, và đánh giá
   `@earendil-works/pi-durable` cho session durable thay SessionManager thường.
-  Windows chưa nghiệm thu.
+  Windows chưa nghiệm thu với `--real`.
