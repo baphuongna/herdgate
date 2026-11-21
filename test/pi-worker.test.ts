@@ -6,7 +6,7 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
-import { appendJob, heartbeatPath, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, readWorkspaces, scheduledRunId, validJob, versionAtLeast, workspacesFile, writeHeartbeat, workerBase, JOB_ID, MIN_PI_VERSION } from '../plugin/server/pi-worker.mjs';
+import { appendJob, heartbeatPath, jobsFile, MAX_RUN, publicJob, queueDepth, readHeartbeat, readJobs, readWorkspaces, scheduledRunId, validJob, versionAtLeast, workspacesFile, writeHeartbeat, workerBase, JOB_ID, MIN_PI_VERSION } from '../plugin/server/pi-worker.mjs';
 import { findReceipt, journalBase, scopeFor } from '../plugin/server/pi-receipts.mjs';
 import { readSpawns } from '../experiments/pi-spawn/registry.mjs';
 
@@ -28,6 +28,59 @@ function piPackage(): string | undefined {
     dir = dirname(dir);
   }
   return undefined;
+}
+
+/** The worker boots the Pi SDK even for run jobs (no session is created, but the
+ *  import happens at startup), so tests resolve a package from TEST_PI_BIN when
+ *  set — otherwise from the host's own install tree, no TEST_PI_BIN needed. */
+function hostPiPackage(): string | undefined {
+  if (piBin) return piPackage();
+  const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent');
+  const releases = join(agentDir, 'install', 'releases');
+  if (!existsSync(releases)) return undefined;
+  const versions = readdirSync(releases).filter(v => /^\d+\.\d+\.\d+$/.test(v))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const latest = versions.length ? versions[versions.length - 1] : '';
+  const pkg = latest ? join(releases, latest, 'node_modules', '@earendil-works', 'pi-coding-agent') : '';
+  return pkg && existsSync(pkg) ? pkg : undefined;
+}
+
+const runJobsSkip = (process.platform !== 'linux' || !hostPiPackage()) && 'requires a local Pi install on Linux';
+
+type EnqueuedRun = { id: string; run: string; prompt?: string; principal?: string };
+
+/** Seed a fresh queue of run jobs, drain it once, and hand back every path the
+ *  assertions need. The fixture dir proves no model session was ever created. */
+async function drainCommandQueue(opts: {
+  jobs: EnqueuedRun[];
+  commands?: boolean;
+  body?: boolean;
+  args?: string[];
+}): Promise<{ dir: string; workspace: string; file: string; receiptsDir: string; fixtureDir: string; code: number | null; err: string }> {
+  const pkg = hostPiPackage();
+  assert.ok(pkg, 'resolvable Pi package');
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-run-'));
+  const workspace = join(dir, 'ws');
+  const workerDir = join(dir, 'worker');
+  const receiptsDir = join(dir, 'receipts');
+  const fixtureDir = join(dir, 'fixture');
+  mkdirSync(workspace, { recursive: true });
+  const file = jobsFile(workerDir);
+  let ts = 0;
+  for (const job of opts.jobs) {
+    appendJob(file, { v: 1, id: job.id, ts: ++ts, state: 'queued', run: job.run,
+      ...(job.prompt !== undefined ? { prompt: job.prompt } : {}),
+      ...(job.principal ? { principal: job.principal } : {}) });
+  }
+  const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/worker.mjs'),
+    '--workspace', workspace, '--pi', pkg, '--fixture-dir', fixtureDir, ...(opts.args ?? [])],
+    { env: { PATH: process.env.PATH, HOME: dir, HERDGATE_PI_WORKER_DIR: workerDir, HERDGATE_PI_RECEIPT_DIR: receiptsDir,
+      PI_TELEMETRY: '0', ...(opts.commands ? { HERDGATE_PI_WORKER_COMMANDS: '1' } : {}),
+      ...(opts.body ? { HERDGATE_PI_RECEIPT_BODY: '1' } : {}) }, stdio: ['ignore', 'ignore', 'pipe'] });
+  const err: string[] = [];
+  child.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
+  const code = await new Promise<number | null>(resolve => child.once('exit', resolve));
+  return { dir, workspace, file, receiptsDir, fixtureDir, code, err: err.join('') };
 }
 
 async function waitFor<T>(label: string, check: () => T | Promise<T>): Promise<NonNullable<T>> {
@@ -297,7 +350,11 @@ test('the worker drains a seeded queue once and journals metadata-only receipts'
   assert.ok(oneHash.sessionId && twoHash.sessionId && oneHash.sessionId !== twoHash.sessionId);
   const journal = join(receiptsDir, scopeFor(workspace), 'receipts.jsonl');
   const raw = readFileSync(journal, 'utf8');
-  assert.ok(!raw.includes('tiếng Việt') && !raw.includes('synthetic'), 'receipts must not contain prompt text');
+  // Receipts carry a bounded title (the first prompt line, cut to 96) and nothing
+  // more of the prompt or the reply — metadata-only, as before titles existed.
+  assert.equal(findReceipt(receiptsDir, one)?.title, 'Synthetic worker request: tiếng Việt');
+  assert.equal(findReceipt(receiptsDir, two)?.title, 'Second synthetic request');
+  assert.ok(!raw.includes('SYNTHETIC_WORKER_REPLY'), 'the model reply never enters the receipt');
   assert.equal(findReceipt(receiptsDir, one)?.status, 'replied');
   assert.equal(findReceipt(receiptsDir, one)?.responseEntryId, oneHash.responseEntryId);
   // Each job session self-registers its parent in the spawn registry (same workspace scope).
@@ -368,7 +425,11 @@ test('a worker killed mid-run fails closed on restart and resumes the next job',
   const callCount = (prompt: string) => events(fixtureDir).filter(e => e.event === 'call' && e.inputHash === hashOf(prompt)).length;
   assert.equal(callCount('Synthetic held request'), 1, 'the held request ran exactly once');
   assert.equal(callCount('Synthetic next request'), 1, 'only the next job ran after the restart');
-  assert.ok(!readFileSync(join(receiptsDir, scopeFor(workspace), 'receipts.jsonl'), 'utf8').includes('Synthetic'));
+  const rawJournal = readFileSync(join(receiptsDir, scopeFor(workspace), 'receipts.jsonl'), 'utf8');
+  assert.ok(!rawJournal.includes('SYNTHETIC_WORKER_REPLY'), 'no reply text enters receipts; titles stay bounded');
+  for (const settled of [findReceipt(receiptsDir, held), findReceipt(receiptsDir, next)]) {
+    assert.ok(!settled?.title || settled.title.length <= 96, 'a title is at most the first line, cut to 96');
+  }
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -669,11 +730,123 @@ test('workspace routing: allowlist names route jobs per-scope, unknown names fai
   assert.equal(jobs.get(stranger)?.state, 'failed');
   assert.equal(jobs.get(stranger)?.reason, 'unknown_workspace');
   assert.equal(events(fixtureDir).filter(e => e.event === 'call').length, 2, 'the unroutable job never ran');
-  assert.ok(!raw.includes('Routed scope request') && !raw.includes('Unroutable'), 'receipts stay prompt-free');
+  assert.equal(findReceipt(receiptsDir, routed)?.title, 'Routed scope request', 'titles are the bounded first line only');
+  assert.ok(!raw.includes('SYNTHETIC_WORKER_REPLY'), 'the reply body never enters the journal');
 
   // Shape rules: only allowlisted-style names pass validJob; the reader skips junk rows.
   assert.equal(validJob({ v: 1, id: plain, prompt: 'x', ts: 1, state: 'queued', workspace: 'Other' }), null);
   assert.equal(validJob({ v: 1, id: plain, prompt: 'x', ts: 1, state: 'queued', workspace: 'a'.repeat(65) }), null);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('run jobs fail closed when HERDGATE_PI_WORKER_COMMANDS is off: the command never executes', {
+  skip: runJobsSkip,
+  timeout: 60_000,
+}, async () => {
+  const markerDir = mkdtempSync(join(tmpdir(), 'hg-pi-sentinel-'));
+  const sentinel = join(markerDir, 'ran');
+  const id = '00000000-0000-4000-8000-000000000081';
+  const out = await drainCommandQueue({ jobs: [{ id, run: `touch "${sentinel}"` }] }); // gate off: no HERDGATE_PI_WORKER_COMMANDS
+  assert.equal(out.code, 0, out.err); // the worker survives; the job is what failed
+  const jobs = readJobs(out.file);
+  assert.equal(jobs.get(id)?.state, 'failed');
+  assert.equal(jobs.get(id)?.reason, 'command_jobs_disabled');
+  const receipt = findReceipt(out.receiptsDir, id);
+  assert.equal(receipt?.status, 'failed');
+  assert.equal(receipt?.reason, 'command_jobs_disabled');
+  assert.equal(receipt?.sessionId, id, 'one-id chain: the job id stands in for the session');
+  assert.equal(receipt?.title, `touch "${sentinel}"`.slice(0, 96));
+  assert.ok(!existsSync(sentinel), 'the command must not run with the gate closed');
+  assert.equal(events(out.fixtureDir).filter(e => e.event === 'call').length, 0, 'no model session either');
+  rmSync(markerDir, { recursive: true, force: true });
+  rmSync(out.dir, { recursive: true, force: true });
+});
+
+test('gated run jobs execute in the workspace: exit 0 replies with output, exit!=0 fails, run wins over prompt', {
+  skip: runJobsSkip,
+  timeout: 90_000,
+}, async () => {
+  const echo = '00000000-0000-4000-8000-000000000082';
+  const fails = '00000000-0000-4000-8000-000000000083';
+  const dual = '00000000-0000-4000-8000-000000000084';
+  const pwd = '00000000-0000-4000-8000-000000000085';
+  const out = await drainCommandQueue({
+    commands: true,
+    body: true,
+    jobs: [
+      { id: echo, run: 'echo ok', principal: 'schedule:nightly-build' },
+      { id: fails, run: 'echo boom >&2; exit 3' },
+      { id: dual, run: 'echo dual-mode', prompt: 'must not reach the model' },
+      { id: pwd, run: 'printf %s "$PWD"' },
+    ],
+  });
+  assert.equal(out.code, 0, out.err);
+  const jobs = readJobs(out.file);
+  assert.equal(jobs.get(echo)?.state, 'replied');
+  assert.equal(jobs.get(fails)?.state, 'failed');
+  assert.equal(jobs.get(fails)?.reason, 'exit:3');
+  assert.equal(jobs.get(dual)?.state, 'replied', 'a job with both fields runs the command');
+  const echoReceipt = findReceipt(out.receiptsDir, echo);
+  assert.equal(echoReceipt?.status, 'replied');
+  assert.equal(echoReceipt?.sessionId, echo);
+  assert.equal(echoReceipt?.title, 'echo ok');
+  assert.equal(echoReceipt?.principal, 'schedule:nightly-build', 'the principal rides run-job receipts too');
+  assert.ok(echoReceipt?.usage && Number.isFinite(echoReceipt.usage.durationMs) && echoReceipt.usage.durationMs > 0,
+    'usage carries the measured durationMs');
+  const failReceipt = findReceipt(out.receiptsDir, fails);
+  assert.equal(failReceipt?.status, 'failed');
+  assert.equal(failReceipt?.reason, 'exit:3');
+  assert.equal(findReceipt(out.receiptsDir, dual)?.title, 'echo dual-mode', 'run supplies the title when both fields exist');
+  const body = (id: string) => readFileSync(join(out.receiptsDir, scopeFor(out.workspace), 'responses', `${id}.md`), 'utf8');
+  assert.ok(body(echo).includes('ok'), 'exit 0 archives the output as the reply body');
+  assert.ok(body(fails).includes('boom'), 'stderr is captured with stdout');
+  assert.equal(body(pwd).trim(), realpathSync(out.workspace), 'the command runs with the workspace as cwd');
+  assert.equal(events(out.fixtureDir).filter(e => e.event === 'call').length, 0, 'run jobs never prompt a model');
+  rmSync(out.dir, { recursive: true, force: true });
+});
+
+test('a hung run job is bounded by --job-timeout: killed, failed/job_timeout, never canceled', {
+  skip: runJobsSkip,
+  timeout: 60_000,
+}, async () => {
+  const id = '00000000-0000-4000-8000-000000000086';
+  const t0 = Date.now();
+  const out = await drainCommandQueue({
+    commands: true,
+    args: ['--job-timeout', '1'],
+    jobs: [{ id, run: 'sleep 5' }],
+  });
+  assert.equal(out.code, 0, out.err);
+  assert.ok(Date.now() - t0 < 4_500, 'the timeout must not wait out the full sleep');
+  const jobs = readJobs(out.file);
+  assert.equal(jobs.get(id)?.state, 'failed');
+  assert.equal(jobs.get(id)?.reason, 'job_timeout');
+  const receipt = findReceipt(out.receiptsDir, id);
+  assert.equal(receipt?.status, 'failed');
+  assert.equal(receipt?.reason, 'job_timeout');
+  assert.equal(receipt?.sessionId, id);
+  rmSync(out.dir, { recursive: true, force: true });
+});
+
+test('validJob admits bounded run jobs without a prompt and never leaks the command', () => {
+  const id = '00000000-0000-4000-8000-000000000090';
+  const base = { v: 1, id, ts: 1, state: 'queued' };
+  assert.equal(validJob({ ...base, run: 'echo hi' })?.run, 'echo hi', 'a prompt-less run job is admitted');
+  assert.equal(validJob({ ...base, run: 'x'.repeat(MAX_RUN) })?.run?.length, MAX_RUN, 'the bound itself passes');
+  assert.equal(validJob({ ...base, run: 'x'.repeat(MAX_RUN + 1) }), null);
+  assert.equal(validJob({ ...base, run: '' }), null);
+  assert.equal(validJob({ ...base, run: 'echo \0nope' }), null, 'NUL never crosses admission');
+  assert.equal(validJob({ ...base, run: 42 }), null);
+  assert.equal(validJob({ ...base, prompt: 'x', run: 'x'.repeat(MAX_RUN + 1) }), null, 'a malformed run fails the whole job');
+  assert.equal(validJob({ ...base, prompt: 'x'.repeat(16 * 1024 + 1), run: 'echo hi' }), null, 'the prompt bound still applies when present');
+  const dual = validJob({ ...base, prompt: 'also present', run: 'echo hi' });
+  assert.ok(dual, 'both fields may ride one job; the worker takes run');
+  const pub = publicJob(dual!);
+  assert.equal('run' in pub, false, 'publicJob must not leak the command');
+  assert.equal('prompt' in pub, false);
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-runq-'));
+  appendJob(jobsFile(dir), { ...base, run: 'echo hi' });
+  assert.equal(readJobs(jobsFile(dir)).get(id)?.run, 'echo hi', 'run-only jobs round-trip the queue');
   rmSync(dir, { recursive: true, force: true });
 });
 

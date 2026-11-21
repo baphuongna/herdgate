@@ -26,6 +26,7 @@
 // Receipts:  the shared journal (HERDGATE_PI_RECEIPT_DIR | XDG default), per workspace.
 // Sessions:  persistent JSONL audit trail under the worker dir (one session per job).
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, unwatchFile, watchFile, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -121,6 +122,10 @@ writeFileSync(pidFile, `${process.pid}\n`, { mode: 0o600 });
 const events = fixtureDir ? join(fixtureDir, 'events.jsonl') : '';
 const note = fixtureDir ? record => appendFileSync(events, `${JSON.stringify(record)}\n`) : () => {};
 let currentPrompt = '';
+// Run jobs (job.run: a shell command) are opt-in — the gate is read once here at
+// start, and a closed gate settles the job without ever spawning a shell.
+const commandJobsOn = process.env.HERDGATE_PI_WORKER_COMMANDS === '1';
+const MAX_OUTPUT = 128 * 1024; // captured stdout+stderr per command job, tail-kept
 // Keep call numbers monotonic across worker restarts: seed from the events file.
 let calls = 0;
 try {
@@ -249,6 +254,23 @@ function writeReceipt(wsPath, id, status, sessionId, fields = {}) {
     { v: 1, id, status, sessionId, ts: Date.now(), ...fields });
 }
 
+/** First readable line of a prompt or command for the receipt title: scheduler
+ *  wake frames and herdr request markers are stripped so the title is the human
+ *  text, trimmed and cut to 96 chars. Empty input yields no title. */
+function receiptTitle(text) {
+  for (const line of String(text ?? '').split('\n')) {
+    const clean = line
+      .replace(/\[herdgate-schedule[^\]]*\]/g, '')
+      .replace(/\[herdr-request:[^\]]*\]/g, '')
+      .trim();
+    if (clean) return clean.slice(0, 96);
+  }
+  return '';
+}
+
+/** A job's title comes from its run command when present (run wins over prompt). */
+const titleOf = job => receiptTitle(job.run !== undefined ? job.run : job.prompt);
+
 /** Resolve a job's routing key: a name from the host allowlist, else the default.
  *  A name that is not allowlisted fails closed — the job never runs. */
 function resolveWorkspace(job, allowlist) {
@@ -273,7 +295,10 @@ for (const job of initialJobs.values()) {
     continue;
   }
   const route = resolveWorkspace(job, initialAllowlist);
-  writeReceipt(route.path, job.id, 'unknown', job.sessionId || 'pi-worker', { reason: 'worker_restarted', ...(job.principal ? { principal: job.principal } : {}) });
+  const resumedTitle = titleOf(job);
+  writeReceipt(route.path, job.id, 'unknown', job.sessionId || 'pi-worker',
+    { reason: 'worker_restarted', ...(resumedTitle ? { title: resumedTitle } : {}),
+      ...(job.principal ? { principal: job.principal } : {}) });
   appendJob(file, { ...job, state: 'unknown', reason: 'worker_restarted' });
   log(`job ${job.id} was running when the previous worker died -> unknown/worker_restarted`);
 }
@@ -285,18 +310,73 @@ let shuttingDown = false; // set by the rpc shutdown paths; stops new jobs mid-p
 const counters = { started: 0, verdicts: { replied: 0, unknown: 0, failed: 0, canceled: 0 } };
 const startedAt = Date.now();
 
-async function runJob(job, allowlist) {
-  const route = resolveWorkspace(job, allowlist);
-  if (route.error) {
-    // Unknown routing key: fail closed in the default scope. Never run, never resend.
-    const verdict = { status: 'failed', reason: route.error };
-    writeReceipt(workspace, job.id, verdict.status, 'pi-worker', { reason: verdict.reason, ...(job.principal ? { principal: job.principal } : {}) });
-    appendJob(file, { ...job, state: verdict.status, reason: verdict.reason });
-    counters.verdicts.failed = (counters.verdicts.failed ?? 0) + 1;
-    log(`job ${job.id} -> failed/${route.error} (workspace "${route.name}" not allowlisted)`);
-    return verdict;
+/** Run job: execute job.run through the platform shell instead of prompting a
+ *  model — no Pi session is created at all. Opt-in gate read once at start; a
+ *  closed gate settles failed/command_jobs_disabled without ever spawning. */
+async function runCommandJob(job, wsPath) {
+  if (!commandJobsOn) {
+    log(`job ${job.id} run job refused: HERDGATE_PI_WORKER_COMMANDS is not 1`);
+    return { verdict: { status: 'failed', reason: 'command_jobs_disabled' }, sessionId: job.id };
   }
-  const wsPath = route.path;
+  appendJob(file, { ...job, state: 'running', sessionId: job.id });
+  counters.started += 1;
+  const shell = process.platform === 'win32'
+    ? { file: 'cmd.exe', args: ['/c', job.run] }
+    : { file: '/bin/sh', args: ['-c', job.run] };
+  // Own process group on unix: a timeout kills the whole command tree, not just sh.
+  const detached = process.platform !== 'win32';
+  const child = spawn(shell.file, shell.args, { cwd: wsPath, detached, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = '';
+  const capture = chunk => {
+    output += chunk;
+    if (output.length > MAX_OUTPUT) output = output.slice(-MAX_OUTPUT); // keep the tail
+  };
+  child.stdout.setEncoding('utf8').on('data', capture);
+  child.stderr.setEncoding('utf8').on('data', capture);
+  const commandStartedAt = Date.now();
+  let timedOut = false;
+  let spawnFailure = null;
+  const killTree = () => {
+    const hit = signal => {
+      try { if (detached && child.pid) process.kill(-child.pid, signal); else child.kill(signal); }
+      catch { /* already gone */ }
+    };
+    hit('SIGTERM');
+    if (detached) setTimeout(() => hit('SIGKILL'), 2000).unref(); // a stubborn tree still ends
+  };
+  // Same wall clock as prompt jobs: a hung command is killed and settles
+  // failed/job_timeout — never canceled, which is reserved for a user abort.
+  const timer = jobTimeoutSeconds > 0 ? setTimeout(() => {
+    timedOut = true;
+    log(`job ${job.id} exceeded ${jobTimeoutSeconds}s — killing command`);
+    killTree();
+  }, jobTimeoutSeconds * 1000) : null;
+  const ended = new Promise(resolve => {
+    child.once('close', (code, signal) => resolve({ code, signal }));
+    child.once('error', error => { spawnFailure = error; resolve({ code: null, signal: null }); });
+  });
+  const { code, signal } = await ended;
+  if (timer) clearTimeout(timer);
+  const usage = { durationMs: Math.max(0, Math.round(Date.now() - commandStartedAt)) };
+  let verdict;
+  if (spawnFailure) {
+    log(`job ${job.id} command spawn failed: ${spawnFailure.message}`);
+    verdict = { status: 'failed', reason: 'spawn_error', usage };
+  } else if (timedOut && code !== 0) {
+    verdict = { status: 'failed', reason: 'job_timeout', usage };
+  } else if (code === 0) {
+    verdict = { status: 'replied', bodyText: output, usage }; // exit 0: the output IS the reply
+  } else if (code !== null) {
+    verdict = { status: 'failed', reason: `exit:${code}`, bodyText: output, usage };
+  } else {
+    verdict = { status: 'failed', reason: `signal:${signal ?? 'unknown'}`, usage };
+  }
+  return { verdict, sessionId: job.id }; // one-id chain: no Pi session, the job id stands in
+}
+
+/** Prompt job: one Pi SDK session per job, unchanged. Returns the verdict, the
+ *  session id (the job id) and a settle hook for the spawn-registry supersede. */
+async function runPromptJob(job, wsPath) {
   const { session, sessionManager } = await makeSession(wsPath, job.id);
   const sessionId = sessionManager.getSessionId();
   appendJob(file, { ...job, state: 'running', sessionId });
@@ -374,14 +454,40 @@ async function runJob(job, allowlist) {
     session.dispose();
     running = null;
   }
-  if (verdict.status === 'replied' && verdict.bodyText && process.env.HERDGATE_PI_RECEIPT_BODY === '1') {
+  return { verdict, sessionId, onSettled: status => selfRegister({ status }) };
+}
+
+/** Settle one job of either kind: body archive, receipt, queue state, counters.
+ *  Run jobs keep the whole discipline — one-id session, principal, fail-closed. */
+async function runJob(job, allowlist) {
+  const route = resolveWorkspace(job, allowlist);
+  if (route.error) {
+    // Unknown routing key: fail closed in the default scope. Never run, never resend.
+    const verdict = { status: 'failed', reason: route.error };
+    const title = titleOf(job);
+    writeReceipt(workspace, job.id, verdict.status, 'pi-worker',
+      { reason: verdict.reason, ...(title ? { title } : {}), ...(job.principal ? { principal: job.principal } : {}) });
+    appendJob(file, { ...job, state: verdict.status, reason: verdict.reason });
+    counters.verdicts.failed = (counters.verdicts.failed ?? 0) + 1;
+    log(`job ${job.id} -> failed/${route.error} (workspace "${route.name}" not allowlisted)`);
+    return verdict;
+  }
+  const wsPath = route.path;
+  const { verdict, sessionId, onSettled } = job.run !== undefined
+    ? await runCommandJob(job, wsPath)
+    : await runPromptJob(job, wsPath);
+  // bodyText rides only replied prompt verdicts and executed run verdicts; the
+  // archive stays opt-in and the receipt itself metadata-only.
+  if (verdict.bodyText && process.env.HERDGATE_PI_RECEIPT_BODY === '1') {
     try { writeBody(receiptsBase, wsPath, job.id, verdict.bodyText); } catch (error) { log(`body archive failed: ${error.message}`); }
   }
+  const title = titleOf(job);
   writeReceipt(wsPath, job.id, verdict.status, sessionId,
     { ...('reason' in verdict ? { reason: verdict.reason } : {}),
       ...('requestEntryId' in verdict ? { requestEntryId: verdict.requestEntryId } : {}),
       ...('responseEntryId' in verdict ? { responseEntryId: verdict.responseEntryId } : {}),
       ...('usage' in verdict ? { usage: verdict.usage } : {}),
+      ...(title ? { title } : {}),
       // The actor that caused this job stays on its receipt (herdr-sched §3.1):
       // schedule:<id> for scheduler-fired runs, device:<id> for remote submits.
       ...(job.principal ? { principal: job.principal } : {}) });
@@ -390,7 +496,7 @@ async function runJob(job, allowlist) {
     ...('requestEntryId' in verdict ? { requestEntryId: verdict.requestEntryId } : {}),
     ...('responseEntryId' in verdict ? { responseEntryId: verdict.responseEntryId } : {}) });
   counters.verdicts[verdict.status] = (counters.verdicts[verdict.status] ?? 0) + 1;
-  selfRegister({ status: verdict.status }); // supersede in place: list reflects the settle
+  if (onSettled) onSettled(verdict.status); // supersede in place: list reflects the settle
   log(`job ${job.id} -> ${verdict.status}${verdict.reason ? `/${verdict.reason}` : ''}`);
   return verdict;
 }

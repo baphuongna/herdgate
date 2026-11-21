@@ -12,6 +12,7 @@ import { PRINCIPAL } from './pi-receipts.mjs';
 
 export const JOB_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export const MAX_PROMPT = 16 * 1024; // admission bound for one prompt
+export const MAX_RUN = 2048;         // admission bound for one shell command (run jobs)
 export const MAX_PENDING = 100;      // queued + running jobs admitted at once
 export const JOB_STATES = new Set(['queued', 'running', 'replied', 'failed', 'canceled', 'unknown']);
 /** Routing key a device may reference — resolved against the host's allowlist. */
@@ -77,10 +78,18 @@ export function validJob(job) {
   return validJobShape(job) ? job : null;
 }
 
+const validPrompt = value => typeof value === 'string' && value.length <= MAX_PROMPT;
+const validRun = value => typeof value === 'string' && value.length >= 1
+  && value.length <= MAX_RUN && !value.includes('\0');
+
 function validJobShape(job) {
   return Boolean(job && job.v === 1 && JOB_ID.test(job.id ?? '')
     && JOB_STATES.has(job.state)
-    && typeof job.prompt === 'string' && job.prompt.length <= MAX_PROMPT
+    // Payload: a model prompt, a shell command (run job), or both (the worker
+    // takes run). Whichever fields are present must each be well-formed.
+    && (validPrompt(job.prompt) || validRun(job.run))
+    && (job.prompt === undefined || validPrompt(job.prompt))
+    && (job.run === undefined || validRun(job.run))
     && typeof job.ts === 'number'
     && (job.workspace === undefined || WORKSPACE_NAME.test(job.workspace))
     && (job.principal === undefined || PRINCIPAL.test(job.principal))
@@ -111,10 +120,10 @@ export function appendJob(file, job) {
   appendFileSync(file, `${JSON.stringify(job)}\n`, { mode: 0o600 });
 }
 
-/** The public answer for a device: the prompt never leaves the host. */
+/** The public answer for a device: neither the prompt nor the command leaves the host. */
 export function publicJob(job) {
   if (!job) return { state: 'unknown', reason: 'not_admitted' };
-  const { v, prompt, ...rest } = job;
+  const { v, prompt, run, ...rest } = job;
   return rest;
 }
 

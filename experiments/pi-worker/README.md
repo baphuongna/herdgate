@@ -73,6 +73,27 @@ Device gửi `worker.submit` kèm `workspace: "other"` (remote.mjs: `--workspace
 được): tên hợp lệ → job chạy + ghi receipt trong scope workspace đó; tên lạ →
 `failed/unknown_workspace` chốt ngay ở scope mặc định, không chạy, không gửi lại.
 
+## Run jobs — lệnh shell thay cho prompt (gate riêng)
+
+Ngoài `prompt`, job có thể mang `run` (chuỗi lệnh shell 1..2048 ký tự, cấm `\0`);
+`validJob` chấp nhận run không cần prompt; job có cả hai thì worker chạy `run`
+(prompt vẫn phải hợp lệ nếu có). Run job **không tạo Pi session** nhưng giữ nguyên kỷ
+luật receipt: one-id (sessionId = job id), `principal`, `--job-timeout`, fail-closed;
+`publicJob` strip cả `run` — lệnh không bao giờ rời host.
+
+- **Gate `HERDGATE_PI_WORKER_COMMANDS=1`** đọc lúc worker khởi động. Gate tắt →
+  job chốt `failed/command_jobs_disabled` (receipt + queue state), lệnh **không bao
+  giờ** được thực thi.
+- Gate bật: lệnh chạy qua shell của platform (`/bin/sh -c` / `cmd.exe /c`), cwd là
+  workspace route (allowlist như prompt jobs), stdout+stderr gộp cap 128 KB giữ
+  phần cuối. Exit 0 → `replied` (body = output khi `HERDGATE_PI_RECEIPT_BODY=1`);
+  exit ≠ 0 → `failed/exit:<code>`; quá `--job-timeout` → kill cả process group →
+  `failed/job_timeout`. `usage.durationMs` = thời gian thực thi.
+- Receipt entry có `title` (dòng đầu của lệnh/prompt sau khi bỏ wake-frame
+  `[herdgate-schedule …]` và marker `[herdr-request:…]`, trim cắt 96 ký tự) —
+  prompt jobs cũng được thêm `title` từ bản này (search có thể lộ title qua
+  `withTitle`, `publicReceipt` mặc định strip).
+
 ## Chạy daemon như service
 
 `herdgate-pi-worker.service` (cùng thư mục) là template local cho chế độ rpc:
