@@ -72,7 +72,12 @@ export function wakeParentOnSettle({ spawnBase, run, listPanes, agentState, agen
       if (!spawn) return;                       // not a spawned child: nothing to wake
       const deliver = (pane, waited) => {
         try {
-          run('agent', 'prompt', pane, wakeFrame(entry, spawn));
+          // pane run TYPES into the parent's terminal — the same live-branch path
+          // as /herdgate-arm markers. herdr agent prompt submits through the
+          // agent/RPC handle whose leaf pointer stagnates after one fork: every
+          // wake then extends an orphan branch no one ever sees (three live
+          // incidents, each parented to the previous orphan's leaf).
+          run('pane', 'run', pane, wakeFrame(entry, spawn));
           log(`wake: child ${spawn.name} ${entry.status} -> parent pane ${pane}${waited ? ` (waited ${(waited / 1000) | 0}s for a quiet parent)` : ''}`);
         } catch (error) {
           log(`wake failed: ${error instanceof Error ? error.message : String(error)}`); // agent_blocked etc: never fatal

@@ -83,7 +83,7 @@ test('wakeParentOnSettle prompts the parent pane and survives every failure', ()
   });
   wake(entry());
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].args.slice(0, 3), ['agent', 'prompt', 'w9:p0']);
+  assert.deepEqual(calls[0].args.slice(0, 3), ['pane', 'run', 'w9:p0']);
   assert.match(calls[0].args[3], /^\[herdgate-wake child=title /);
 
   // a blocked parent (herdr rejects) logs and drops — never throws
