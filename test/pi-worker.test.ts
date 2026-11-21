@@ -133,7 +133,10 @@ test('the scheduler admits one deterministic run per bucket and heartbeats', asy
   await runScheduler(t0);
   let jobs = readJobs(file);
   assert.deepEqual([...jobs.keys()], [expected], 'only the valid schedule is admitted');
-  assert.equal(jobs.get(expected)?.prompt, 'Scheduled synthetic request');
+  const framed = jobs.get(expected)?.prompt ?? '';
+  assert.ok(framed.startsWith(`[herdgate-schedule id="synthetic-hourly" run="${expected}" bucket=${bucket0} fired=`),
+    'the wake frame names the schedule and run before the prompt');
+  assert.ok(framed.endsWith('\n\nScheduled synthetic request'), 'the original prompt follows the frame');
   await runScheduler(t0 + 60_000); // same bucket -> idempotent
   assert.equal(readJobs(file).size, 1, 'a restarted tick in the same bucket must not duplicate');
   await runScheduler(t0 + 3_600_000); // next bucket -> new deterministic id
@@ -141,6 +144,56 @@ test('the scheduler admits one deterministic run per bucket and heartbeats', asy
   assert.deepEqual([...jobs.keys()], [expected, scheduledRunId('synthetic-hourly', bucket0 + 1)]);
   const beat = readHeartbeat(workerDir);
   assert.ok(beat && beat.source === 'herdgate-scheduler' && typeof beat.ts === 'number');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('a schedule routed to a missing workspace is gone for good; a raw prompt skips the frame', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-sched-'));
+  const workerDir = join(dir, 'worker');
+  const receiptsDir = join(dir, 'receipts');
+  const config = join(dir, 'schedule.json');
+  writeFileSync(config, JSON.stringify({ schedules: [
+    { id: 'routed', everySeconds: 3600, prompt: 'Routed synthetic request', workspace: 'nope' },
+    { id: 'plain', everySeconds: 3600, prompt: 'Raw synthetic request' },
+  ] }), { mode: 0o600 });
+  const file = jobsFile(workerDir);
+  const runScheduler = async (args: string[]) => {
+    const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/scheduler.mjs'),
+      '--config', config, '--once', ...args],
+      { env: { PATH: process.env.PATH, HOME: dir, HERDGATE_PI_WORKER_DIR: workerDir, HERDGATE_PI_RECEIPT_DIR: receiptsDir }, stdio: ['ignore', 'ignore', 'pipe'] });
+    const err: string[] = [];
+    child.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
+    const code = await new Promise<number | null>(resolve => child.once('exit', resolve));
+    assert.equal(code, 0, err.join(''));
+    return err.join('');
+  };
+  const t0 = 1_700_000_000_000;
+  let out = await runScheduler(['--now', String(t0)]);
+  assert.match(out, /target workspace "nope" is not allowlisted/);
+  let jobs = readJobs(file);
+  assert.deepEqual([...jobs.keys()], [scheduledRunId('plain', Math.floor(t0 / 3_600_000))],
+    'the gone schedule enqueues nothing');
+  // Still gone one bucket later — no failed job spam, no retroactive catch-up.
+  out = await runScheduler(['--now', String(t0 + 3_600_000)]);
+  assert.match(out, /target workspace "nope" is not allowlisted/);
+  assert.equal(readJobs(file).size, 2, 'only the plain schedule advanced');
+  assert.equal(readHeartbeat(workerDir)?.gone, 1, 'the heartbeat counts the gone target');
+  // Allow the name: the routed schedule fires for the CURRENT bucket only.
+  const workspaces = join(workerDir, 'workspaces.json');
+  mkdirSync(workerDir, { recursive: true });
+  writeFileSync(workspaces, JSON.stringify({ v: 1, workspaces: { nope: join(dir, 'ws') } }), { mode: 0o600 });
+  const t2 = t0 + 7_200_000;
+  out = await runScheduler(['--now', String(t2)]);
+  jobs = readJobs(file);
+  const routed = jobs.get(scheduledRunId('routed', Math.floor(t2 / 3_600_000)));
+  assert.ok(routed?.workspace === 'nope', 'the job carries the routing key');
+  assert.ok(routed.prompt.includes('[herdgate-schedule id="routed"'), 'the wake frame rides the routed job');
+  assert.ok(!jobs.has(scheduledRunId('routed', Math.floor(t0 / 3_600_000))),
+    'buckets missed while gone never fire retroactively');
+  // Raw prompts skip the frame entirely.
+  await runScheduler(['--now', String(t0 + 10_800_000), '--raw-prompts']);
+  const raw = readJobs(file).get(scheduledRunId('plain', Math.floor((t0 + 10_800_000) / 3_600_000)));
+  assert.equal(raw?.prompt, 'Raw synthetic request', 'raw prompts are passed through verbatim');
   rmSync(dir, { recursive: true, force: true });
 });
 

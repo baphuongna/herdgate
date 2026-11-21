@@ -122,12 +122,23 @@ node experiments/pi-worker/remote.mjs --gate ... --device d_read --secret ... --
 
 ## Scheduler, heartbeat, MCP (bước 4, prototype)
 
-- `scheduler.mjs --config <schedule.json> [--once|--loop <s>] [--now <ms>]`: enqueue
-  prompt theo lịch **deterministic** — một job mỗi (schedule id, time bucket), run ID
-  suy ra từ bucket nên restart `--once` (cron/systemd timer) không bao giờ chạy trùng.
-  Mỗi tick ghi heartbeat (`heartbeat.json`) mà publisher phục vụ qua op `worker.health`
-  (read scope): queue depth + heartbeat gần nhất (`ts/source/ageSeconds`), thiếu thì
-  `null` — fail-closed. Không gửi lại run failed/unknown.
+- `scheduler.mjs --config <schedule.json> [--once|--loop <s>] [--now <ms>] [--raw-prompts]`:
+  enqueue prompt theo lịch **deterministic** — một job mỗi (schedule id, time bucket),
+  run ID suy ra từ bucket nên restart `--once` (cron/systemd timer) không bao giờ chạy
+  trùng. Mỗi tick ghi heartbeat (`heartbeat.json`) mà publisher phục vụ qua op
+  `worker.health` (read scope): queue depth + heartbeat gần nhất
+  (`ts/source/ageSeconds`), thiếu thì `null` — fail-closed. Không gửi lại run
+  failed/unknown.
+  Bài học scheduler Paseo đã áp (2026-11-21):
+  - **Khung prompt đánh thức**: prompt được bọc mặc định trong
+    `[herdgate-schedule id=… run=… bucket=… fired=…]` — agent tỉnh dậy biết rõ lịch
+    nào đánh thức và run nào để truy vết (run ID = receipt request ID);
+    `--raw-prompts` giữ nguyên văn.
+  - **`workspace` tùy chọn** trên từng schedule (tên allowlist): job mang routing key,
+    worker chạy đúng workspace.
+  - **Target-gone là vĩnh viễn**: schedule trỏ tên không còn trong allowlist → skip
+    (đếm `gone` trong heartbeat), không spam job failed mỗi bucket; tên quay lại thì
+    chỉ bucket MỚI chạy — bucket lỡ trong lúc gone không bao giờ bắn bù.
 - `mcp.mjs --gate --device --secret`: MCP stdio server (JSON-RPC newline) nối **OUT**
   tới Gate, không listener. Tools: `herdgate_worker_submit` (act), `herdgate_worker_status`,
   `herdgate_receipt`, `herdgate_receipt_wait` (chờ settle push, timeout trả trạng thái
