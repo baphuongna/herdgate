@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { COMPACT_AT, MAX_SPAWNS, readSpawns, recordSelf, recordSpawn, spawnsFile, spawnsFileFor, updateSpawn } from '../experiments/pi-spawn/registry.mjs';
 import { scopeFor } from '../plugin/server/pi-receipts.mjs';
+import { openWatchStore } from '../plugin/server/pi-receipt-watch.mjs';
 
 const roots: string[] = [];
 const root = () => { const dir = mkdtempSync(join(tmpdir(), 'hg-spawn-')); roots.push(dir); return dir; };
@@ -71,6 +74,78 @@ test('self-registered children declare their own parent without a pane', () => {
   assert.throws(() => recordSelf(base, { sessionId: uuid(8), name: 'orphan', ts: 1 }), /invalid_self/);
   assert.throws(() => recordSelf(base, { sessionId: 'not-a-uuid', parentSessionId: 'pi-worker',
     name: 'job-x', ts: 1 }), /invalid_self/);
+});
+
+// ── dag.mjs: the spawn-tree DAG view (registry + receipts + checked column) ──
+
+const CONTROLLER = 'c0c0c0c0-0000-4000-8000-00000000c0c0';
+const CHILD1 = 'a1a1a1a1-0000-4000-8000-00000000a1a1';
+const CHILD2 = 'b2b2b2b2-0000-4000-8000-00000000b2b2';
+const GRAND = 'd3d3d3d3-0000-4000-8000-00000000d3d3';
+const ROOT_SESSION = 'e4e4e4e4-0000-4000-8000-00000000e4e4'; // live but unregistered: not drawn
+
+function dagFixture() {
+  const base = root();
+  const scopeA = join(base, 'aaaaaaaaaaaaaaaa');
+  const scopeB = join(base, 'bbbbbbbbbbbbbbbb');
+  mkdirSync(scopeA, { recursive: true });
+  mkdirSync(scopeB, { recursive: true });
+  writeFileSync(join(scopeA, 'spawns.jsonl'), [
+    { id: CONTROLLER, sessionId: CONTROLLER, paneId: 'w1:p1', name: 'controller', parentSessionId: ROOT_SESSION, cwd: '/x', ts: 1 },
+    { id: CHILD1, sessionId: CHILD1, paneId: 'w1:p2', name: 'child-one', parentSessionId: CONTROLLER, cwd: '/x', ts: 2 },
+    { id: GRAND, sessionId: GRAND, paneId: 'w1:p3', name: 'grand-job', parentSessionId: CHILD1, cwd: '/x', ts: 3 },
+  ].map(e => JSON.stringify(e)).join('\n') + '\n');
+  writeFileSync(join(scopeB, 'spawns.jsonl'),
+    JSON.stringify({ id: CHILD2, sessionId: CHILD2, paneId: 'w1:p4', name: 'child-two', parentSessionId: CONTROLLER, cwd: '/y', ts: 4 }) + '\n');
+  const title = 'fix-login-bug '.repeat(4).trim(); // 56 chars -> capped at 40
+  writeFileSync(join(scopeA, 'receipts.jsonl'), JSON.stringify({
+    v: 1, id: CHILD1, status: 'replied', sessionId: CHILD1, ts: 5, principal: 'spawn:a1a1a1a1', title,
+  }) + '\n');
+  writeFileSync(join(scopeB, 'receipts.jsonl'), JSON.stringify({
+    v: 1, id: CHILD2, status: 'failed', sessionId: CHILD2, ts: 6, reason: 'job_timeout',
+  }) + '\n');
+  // One device still waits on child-two's result; child-one's watch intent is long gone.
+  openWatchStore(base).register({ device: 'phone-1', requestId: CHILD2 });
+  return { base, title };
+}
+
+const dagCli = fileURLToPath(new URL('../experiments/pi-spawn/dag.mjs', import.meta.url));
+const runDag = (args: string[]) => execFileSync(process.execPath, [dagCli, ...args], { encoding: 'utf8' });
+
+test('dag view draws the spawn tree with receipt status and the checked column', () => {
+  const { base, title } = dagFixture();
+  const text = runDag(['--base', base]);
+  assert.deepEqual(text.trimEnd().split('\n'), [
+    'controller [c0c0c0c0] no-receipt',
+    `  child-one [a1a1a1a1] replied (spawn:a1a1a1a1) — ${title.slice(0, 40)} ✓`,
+    '    grand-job [d3d3d3d3] no-receipt',
+    '  child-two [b2b2b2b2] failed ○ pending-view',
+  ]);
+  assert.ok(!text.includes(title), 'titles stay one line, capped at 40 chars');
+
+  const tree = JSON.parse(runDag(['--base', base, '--json']));
+  assert.equal(tree.length, 1);
+  assert.equal(tree[0].name, 'controller');
+  assert.equal(tree[0].checked, null, 'the root spawn has no receipt of its own');
+  assert.equal(tree[0].children.length, 2, 'children sort by ts across scopes');
+  const [c1, c2] = tree[0].children;
+  assert.equal(c1.status, 'replied');
+  assert.equal(c1.checked, true, 'settled receipt, no device still watching');
+  assert.equal(c1.title, title.slice(0, 40));
+  assert.equal(c1.children.length, 1);
+  assert.equal(c1.children[0].name, 'grand-job');
+  assert.equal(c1.children[0].status, 'no-receipt');
+  assert.equal(c1.children[0].checked, null);
+  assert.deepEqual(c1.children[0].children, []);
+  assert.equal(c2.status, 'failed');
+  assert.equal(c2.checked, false, 'a device still holds the pending watch intent');
+  assert.deepEqual(c2.children, []);
+});
+
+test('dag view fails closed on a missing base', () => {
+  const missing = join(root(), 'nope');
+  assert.equal(runDag(['--base', missing]), '', 'empty tree, exit 0');
+  assert.deepEqual(JSON.parse(runDag(['--base', missing, '--json'])), []);
 });
 
 test('temporary spawn registries are cleaned up', () => {
