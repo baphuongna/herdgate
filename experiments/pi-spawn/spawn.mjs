@@ -131,6 +131,28 @@ if (command === 'spawn') {
     parent: (e.parentSessionId ?? '').slice(0, 8) || null, ts: e.ts,
   }));
   console.log(JSON.stringify(rows, null, 2));
+} else if (command === 'close') {
+  // The parent owns its children's lifecycle: after a settle is handled and no
+  // further job is planned, close the child — tabs must not accumulate. The
+  // registry record survives (restore reopens the same one-id session), and a
+  // working child is refused: its wake has not arrived yet.
+  if (!arg) fail('usage: close <name-or-id>');
+  const entry = findSpawn(spawnBase(), arg);
+  if (!entry) fail(`no spawn record for ${arg}`);
+  const { panes } = myBinding();
+  const pane = panes.find(p => p.pane_id === entry.paneId);
+  if (!pane) {
+    console.log(JSON.stringify({ id: entry.id, name: entry.name, closed: null, reason: 'already_gone',
+      restore: `node experiments/pi-spawn/spawn.mjs restore ${entry.name}` }));
+    process.exit(0);
+  }
+  const agent = run('agent', 'get', entry.paneId).result.agent;
+  if (agent?.agent_status === 'working') fail(`agent is working — wait for its wake, then close`);
+  const kind = entry.tab && pane.tab_id ? 'tab' : 'pane';
+  const target = kind === 'tab' ? pane.tab_id : entry.paneId;
+  run(kind === 'tab' ? 'tab' : 'pane', 'close', target);
+  console.log(JSON.stringify({ id: entry.id, name: entry.name, closed: target, kind,
+    restore: `node experiments/pi-spawn/spawn.mjs restore ${entry.name}` }));
 } else if (command === 'restore') {
   if (!arg) fail('usage: restore <name-or-id>');
   const entry = findSpawn(spawnBase(), arg);

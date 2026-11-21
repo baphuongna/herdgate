@@ -136,3 +136,15 @@ hoặc văn thường là như không báo (đã xảy ra: user nhìn thẳng pa
 
  KHÔNG chỉ ack rồi kết thúc turn — mỗi lần ack suông là một phần việc chết chờ user nhắc
  (đã xảy ra: 3 wake đến, 0 được xử lý trọn). Cây agent: `node experiments/pi-spawn/dag.mjs`.
+
+## Vòng đời con — dọn ngay, không tích tụ
+
+Parent là chủ vòng đời con mình. Sau khi wake đã xử lý (test/commit xong), nếu KHÔNG còn
+việc kế tiếp đã lên kế hoạch cho con đó → **đóng ngay trong cùng turn**:
+
+```bash
+node experiments/pi-spawn/spawn.mjs close <tên>   # đóng tab/pane con; từ chối nếu đang working
+```
+
+Record spawn vẫn còn nên cần lại chỉ là `spawn.mjs restore <tên>` (đúng session one-id).
+Chỉ giữ con sống khi còn job tiếp theo cho nó. Pane/tab của NGƯỜI DÙNG không bao giờ tự đóng.
