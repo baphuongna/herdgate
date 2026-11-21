@@ -153,11 +153,15 @@ test('arm refuses queued input, a busy agent and an existing intent', async () =
   assert.deepEqual(await w.command('arm'), { id, status: 'not_armed', reason: 'already_armed' });
 });
 
-test('unmarked, inexact and duplicate marked user entries cannot produce a reply', async () => {
-  for (const kind of ['unmarked', 'inexact', 'duplicate']) {
+test('unmarked, glued and duplicate marked user entries cannot produce a reply', async () => {
+  // The boundary rule: the marker owns the start of the message and must be
+  // followed by a newline or exactly one space. Glued text (`[marker]text`),
+  // no marker at all, or a second marked prompt with nothing between are not
+  // requests. (`[marker] text` IS valid — see the single-space test below.)
+  for (const kind of ['unmarked', 'glued', 'duplicate']) {
     const w = await worker();
     const { id, marker } = await w.command('arm');
-    w.user(kind === 'inexact' ? `${marker} trailing text` : kind === 'duplicate' ? marker : 'unmarked');
+    w.user(kind === 'glued' ? `${marker}glued` : kind === 'duplicate' ? marker : 'unmarked');
     if (kind === 'duplicate') w.user(marker);
     w.turn(w.assistant());
     w.settle();
@@ -165,6 +169,18 @@ test('unmarked, inexact and duplicate marked user entries cannot produce a reply
       id, status: 'unknown', reason: kind === 'duplicate' ? 'competing_input' : 'request_not_observed',
     });
   }
+});
+
+test('a marked prompt followed by a single space is observed like a newline', async () => {
+  // Live regression from the 21/11 six-agent wave: prompts typed as
+  // `[marker] Nhiệm vụ…` went request_not_observed under the old boundary.
+  const w = await worker();
+  const { id, marker } = await w.command('arm');
+  const requestEntryId = w.user(`${marker} Nhiệm vụ nhỏ`);
+  const responseEntryId = w.assistant();
+  w.turn(responseEntryId);
+  w.settle();
+  assert.deepEqual(await w.command('receipt', id), { id, status: 'replied', requestEntryId, responseEntryId });
 });
 
 test('one worker settling cannot complete another worker’s intent', async () => {
