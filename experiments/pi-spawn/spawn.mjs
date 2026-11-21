@@ -148,6 +148,10 @@ if (command === 'spawn') {
       : ['pane', 'split', '--current', '--direction', 'down', '--no-focus', '--cwd', dir])).result.pane.pane_id;
   // A transcript file path reopens the exact session (worker children live outside
   // Pi's default storage; a bare --session-id would mint an empty look-alike).
+  // If a self-registered child's transcript is GONE, refuse: an empty look-alike
+  // with the same id is worse than a clear error.
+  if (entry.self && entry.sessionFile && !existsSync(entry.sessionFile))
+    fail(`transcript ${entry.sessionFile} is gone — cannot restore an SDK child without it`);
   const sessionArgs = entry.sessionFile && existsSync(entry.sessionFile)
     ? ['--session', entry.sessionFile] : ['--session-id', entry.sessionId];
   try {
