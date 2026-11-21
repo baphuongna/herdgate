@@ -124,7 +124,10 @@ Muốn đóng agent: `/quit` trong pane đó, đợi shell prompt; đóng pane p
 Publisher bắn wake-frame vào pane cha khi receipt của agent con settle. Frame tự mang
 chỉ thị, nhưng ghi nhớ bền ở đây (sống sót qua context compaction):
 
-**Nhận `[herdgate-wake child=<tên> id=<uuid> status=…]` → làm TRỌN trong đúng turn đó:**
+**Nhận `[herdgate-wake child=<tên> id=<uuid> status=…]` → làm TRỌN trong đúng turn đó.**
+**Reply PHẢI mở đầu bằng banner 1 dòng**: `🔔 WAKE — agent <tên> <status>: <kết quả trong 1 câu>`
+(id receipt nằm ở dòng sau). Turn wake nhanh và dễ bị người dùng bỏ qua — mở đầu bằng id
+hoặc văn thường là như không báo (đã xảy ra: user nhìn thẳng pane vẫn nghĩ chưa có gì đến):
 1. Chạy test mục tiêu của phần việc con vừa làm (`node --test test/<file>.test.ts`).
 2. Review diff (`git diff` + `git status`) — đúng whitelist file đã giao.
 3. Commit nếu đạt (thông điệp ghi rõ agent nào, spawn id).
