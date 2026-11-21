@@ -12,6 +12,7 @@
  */
 import { hostname } from "node:os";
 import { HerdGateAgent, provision } from "../agent/index.ts";
+import { pairingQrPayload, printPairingQr } from "../agent/qr.ts";
 import { HerdrAdapter } from "./herdr.ts";
 import { createSshBridge } from "./ssh.ts";
 import type { AgentAdapter, PairAsk } from "../agent/adapter.ts";
@@ -36,7 +37,19 @@ if (!roomToken) {
   const paired = await provision({
     baseUrl: base,
     name,
-    onCode: (u) => console.error(`herdgate-host: approve this host at ${u} (expires in 10 minutes)`),
+    onCode: (info) => {
+      log(`approve this host at ${info.url} (expires in 10 minutes)`);
+      // The camera path (pairfob lesson): a QR of `https://<gate>/#pair=<code>`
+      // opens the PWA with the code prefilled. ASCII QR only on an interactive
+      // terminal; otherwise the URL line above is the fallback.
+      try {
+        printPairingQr(pairingQrPayload(base, info.code), (line) => console.error(line), {
+          isTTY: process.stderr.isTTY,
+        });
+      } catch {
+        log(`open on your phone: ${base}/#pair=${info.code}`);
+      }
+    },
   });
   roomToken = paired.roomToken;
   console.error(`herdgate-host: paired into room ${paired.roomId}`);

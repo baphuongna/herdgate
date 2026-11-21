@@ -156,7 +156,7 @@ export class HerdGateAgent {
 export async function provision(o: {
   baseUrl: string; // http(s)://host[:port]
   name: string;
-  onCode?: (url: string | { code: string }) => void;
+  onCode?: (info: { url: string; code: string }) => void;
   pollMs?: number;
   timeoutMs?: number;
 }): Promise<{ roomToken: string; roomId: string }> {
@@ -167,7 +167,9 @@ export async function provision(o: {
   });
   if (!res.ok) throw new Error(`agent/code: ${res.status}`);
   const minted = (await res.json()) as { code: string; url: string };
-  (o.onCode ?? ((u) => console.log(`pair this host: ${u}`)))(minted.url);
+  // Both fields go to the caller: the url to click, the code for the pairing QR
+  // (see ../agent/qr.ts — the PWA opens with `#pair=<code>` prefilled).
+  (o.onCode ?? ((i) => console.log(`pair this host: ${i.url}`)))({ url: minted.url, code: minted.code });
   const deadline = Date.now() + (o.timeoutMs ?? 11 * 60_000);
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, o.pollMs ?? 3_000));
