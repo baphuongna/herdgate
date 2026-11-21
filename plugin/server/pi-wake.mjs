@@ -1,9 +1,11 @@
-// Wake-on-settle: when a spawned child's receipt settles, the publisher injects a
-// one-line wake frame into the PARENT agent's pane — the controller never polls,
-// never holds a watch process; the alert arrives as its next input (the same
-// pattern as scheduler wake frames). Spawn registry supplies the parent edge;
-// herdr's agent prompt delivers. Failures (blocked parent, gone pane, herdr down)
-// log and drop — a missed wake is recoverable from the journal, a crash is not.
+// Wake-on-settle: when a spawned child's receipt settles, wake the PARENT
+// agent's pane with a one-line frame — the controller never polls, never holds
+// a watch process; the alert arrives as its next input (the same pattern as
+// scheduler wake frames). Spawn registry supplies the parent edge; herdr pane
+// run delivers. The live path is the herdr [[events]] hook (server/wake-event.mjs):
+// herdr observes the child, so wake survives a child that never arms or dies
+// with its pane. Failures (blocked parent, gone pane, herdr down) log and drop
+// — a missed wake is recoverable from the journal, a crash is not.
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -15,7 +17,14 @@ const SCOPE = /^[0-9a-f]{16}$/;
  *  Final settles (replied/failed/canceled) wake a parent; invalidated/expired
  *  intents (unknown) carry no result to act on, and a vanished child belongs
  *  to the death watch below. */
-const SETTLED = new Set(['replied', 'failed', 'canceled']);
+export const SETTLED = new Set(['replied', 'failed', 'canceled']);
+
+/** The handling directive that rides IN every settle frame, on purpose: the
+ *  protocol must survive context compaction in the parent — a bare status line
+ *  gets a bare ack (observed live); the instruction makes every wake
+ *  self-describing. Shared by the journal-watch frame and the herdr-event
+ *  frame (server/wake-event.mjs) so the wording never forks. */
+export const SETTLE_DIRECTIVE = ' → việc con đã settle. LÀM TRỌN TRONG TURN NÀY: chạy test mục tiêu, review diff, commit nếu đạt, rồi báo user ngắn gọn — không chỉ ack.';
 
 /** Every spawn record across workspace scopes (spawn + self declarations). */
 export function readAllSpawns(base) {
@@ -44,24 +53,21 @@ export function paneForSession(panes, sessionId) {
   return pane?.pane_id ?? null;
 }
 
-/** One terse line: enough for the parent to act, never the reply text.
- *  The directive rides IN the frame on purpose: the handling protocol must
- *  survive context compaction in the parent — a bare status line gets a bare
- *  ack (observed live); the instruction makes every wake self-describing. */
+/** One terse line: enough for the parent to act, never the reply text. */
 export function wakeFrame(entry, spawn) {
   const bits = [`[herdgate-wake child=${spawn.name ?? 'child'}`, `id=${entry.id}`, `status=${entry.status}`];
   if (entry.reason) bits.push(`reason=${entry.reason}`);
   if (entry.title) bits.push(`title="${String(entry.title).replace(/\s+/g, ' ').slice(0, 60)}"`);
   if (entry.usage && Number.isFinite(entry.usage.totalTokens)) bits.push(`tokens=${entry.usage.totalTokens}`);
   bits.push(`ts=${new Date(entry.ts).toISOString()}]`);
-  const directive = ' → việc con đã settle. LÀM TRỌN TRONG TURN NÀY: chạy test mục tiêu, review diff, commit nếu đạt, rồi báo user ngắn gọn — không chỉ ack.';
-  const line = bits.join(' ') + directive;
-  return line.length <= 480 ? line : `${bits.join(' ').slice(0, 300)}…]${directive}`;
+  const line = bits.join(' ') + SETTLE_DIRECTIVE;
+  return line.length <= 480 ? line : `${bits.join(' ').slice(0, 300)}…]${SETTLE_DIRECTIVE}`;
 }
 
 /** Resolve the parent's pane and deliver one frame once the parent is quietly
- *  between turns. Shared by settle wakes and death wakes — the quiet-wait
- *  protocol below is the load-bearing part and must never fork the tree.
+ *  between turns. Shared by settle wakes, death wakes AND the herdr event hook
+ *  (server/wake-event.mjs) — the quiet-wait protocol below is the load-bearing
+ *  part and must never fork the tree.
  *
  *  Delivery waits for the parent to be BETWEEN TURNS, stably. Two live
  *  incidents (wtest2, wfork1) showed why "idle" alone is not enough: herdr
@@ -72,7 +78,7 @@ export function wakeFrame(entry, spawn) {
  *  context ever adopts, and everyone swears nothing arrived. Waiting for the
  *  agent revision to hold steady across two probes proves the turn truly
  *  closed; the injected text then submits against the live leaf. */
-function deliverToParent({ spawn, line, label, run, listPanes, agentState, agentProbe,
+export function deliverToParent({ spawn, line, label, run, listPanes, agentState, agentProbe, onDelivered,
     log = () => {}, retryDelayMs = () => new Promise(r => setTimeout(r, 3000)), settleDelayMs = () => new Promise(r => setTimeout(r, 2000)), maxWaitMs = 15 * 60 * 1000 }) {
   const deliver = (pane, waited) => {
     try {
@@ -83,6 +89,9 @@ function deliverToParent({ spawn, line, label, run, listPanes, agentState, agent
       // incidents, each parented to the previous orphan's leaf).
       run('pane', 'run', pane, line);
       log(`wake: child ${spawn.name} ${label} -> parent pane ${pane}${waited ? ` (waited ${(waited / 1000) | 0}s for a quiet parent)` : ''}`);
+      // Bookkeeping AFTER the frame landed (episode dedupe sidecars etc.) — a
+      // failure here must never undo or retry a delivered wake.
+      try { onDelivered?.(); } catch { /* never fatal */ }
     } catch (error) {
       log(`wake failed: ${error instanceof Error ? error.message : String(error)}`); // agent_blocked etc: never fatal
     }

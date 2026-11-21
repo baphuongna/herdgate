@@ -12,6 +12,23 @@ platforms = ["linux", "macos"]
 [[startup]]
 command = ["node", "server/index.mjs", "serve"]
 
+# Wake-by-event: herdr itself reports pane lifecycle and agent settles. Each
+# hook is a short-lived process (server/wake-event.mjs) that resolves the spawn
+# registry's parent edge and delivers one wake frame — no daemon, no polling,
+# and no cooperation (arm/marker/observer) needed from the child. User panes
+# are not in the registry, so their events exit silently.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["node", "server/wake-event.mjs"]
+
+[[events]]
+on = "pane.exited"
+command = ["node", "server/wake-event.mjs"]
+
+[[events]]
+on = "pane.closed"
+command = ["node", "server/wake-event.mjs"]
+
 [[actions]]
 id = "status"
 title = "herdgate: show pairing status"
