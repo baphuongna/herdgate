@@ -50,3 +50,8 @@ watch push cùng một id.
   fail-closed, không lộ text prompt.
 - Live trên máy nhà: spawn `demo-child` → `bound:true`, parent = session controller; đóng
   pane; `restore demo-child` → cùng session id ở pane mới, `bound:true`.
+- Live Windows (2026-11-21): job `--real` của pi-worker (glm-5.3, NTFS) →
+  `restore job-<id>` từ PowerShell mở **đúng transcript** trong tab riêng qua
+  `--session <file>` (herdr 0.9.4-preview) — prompt + reply hiển thị, counter token
+  thật, `bound:true`. Con `self` restore vào tab riêng `hg-<name>` (không mượn pane
+  caller).

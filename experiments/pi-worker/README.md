@@ -160,7 +160,7 @@ scope bị `requires-act`.
   turn → resume → job hoàn tất với đúng 1 retry, nhưng không phải drop-in (harness
   riêng, transcript khác, đổi semantics fail-closed) — giữ SessionManager cho job,
   pi-durable là ứng viên cho scheduler/daemon quanh worker.
-  Restore-by-file trên Windows chưa chạy end-to-end (thành phần Windows-specific — path, scope, self-register — đã verify riêng).
+  Restore-by-file đã chạy end-to-end trên BOTH: Linux (split-pane) và Windows (tab riêng qua herdr 0.9.4-preview, transcript thật load trong TUI — ↑461 ↓12 $0.001, đúng prompt/reply của job).
 - **Tự khai sinh cha**: mỗi job tạo session với id chính là job id
   (`SessionManager.create(…, {id})` — SDK hỗ trợ sẵn) rồi tự ghi vào registry
   spawn (`experiments/pi-spawn`) với `parentSessionId: 'pi-worker'` kèm đường dẫn

@@ -138,7 +138,10 @@ if (command === 'spawn') {
   const { myPane } = myBinding();
   const dir = entry.cwd ?? process.cwd();
   // A tab-spawned child restores into its own tab again; a split child stacks below.
-  const pane = entry.tab
+  // A self-registered child (worker job) has no pane lineage — its own tab avoids
+  // borrowing any caller's pane.
+  const wantTab = entry.tab || entry.self;
+  const pane = wantTab
     ? run('tab', 'create', '--label', `hg-${entry.name}`, '--no-focus', '--cwd', dir).result.root_pane.pane_id
     : run(...(myPane
       ? ['pane', 'split', '--pane', myPane, '--direction', 'down', '--no-focus', '--cwd', dir]
