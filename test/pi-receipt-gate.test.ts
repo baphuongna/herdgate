@@ -349,7 +349,12 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     assert.equal(restarted.requestEntryId, received.requestEntryId);
     assert.equal(restarted.responseEntryId, replied.responseEntryId);
     const remoteAfterRestart = await ask(first.id);
-    assert.deepEqual(remoteAfterRestart, { op: 'receipt.result', id: first.id, status: 'replied',
+    // Activity counters (spawn 704f30b1) are optional passthroughs — check their
+    // shape separately so the strict op-shape assert below stays exact.
+    if ('turns' in remoteAfterRestart) assert.ok(Number.isInteger(remoteAfterRestart.turns));
+    if ('lastActivityAt' in remoteAfterRestart) assert.ok(Number.isFinite(remoteAfterRestart.lastActivityAt));
+    const { turns: _t, lastActivityAt: _a, ...receiptCore } = remoteAfterRestart;
+    assert.deepEqual(receiptCore, { op: 'receipt.result', id: first.id, status: 'replied',
       requestEntryId: received.requestEntryId, responseEntryId: replied.responseEntryId,
       usage: { totalTokens: 48_585, costUsd: 0.03 } });
     assert.deepEqual(calls(), [1, 2, 3]);
