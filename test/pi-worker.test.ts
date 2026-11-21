@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -252,6 +252,102 @@ test('a schedule routed to a missing workspace is gone for good; a raw prompt sk
   await runScheduler(['--now', String(t0 + 10_800_000), '--raw-prompts']);
   const raw = readJobs(file).get(scheduledRunId('plain', Math.floor((t0 + 10_800_000) / 3_600_000)));
   assert.equal(raw?.prompt, 'Raw synthetic request', 'raw prompts are passed through verbatim');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+/** Same deterministic recap id the scheduler derives: sha256('recap:'+session) forced to v4 shape. */
+function recapIdOf(sessionId: string): string {
+  const digest = createHash('sha256').update(`recap:${sessionId}`).digest('hex');
+  const variant = (parseInt(digest[16], 16) & 0x3) | 0x8;
+  return [digest.slice(0, 8), digest.slice(8, 12), `4${digest.slice(13, 16)}`,
+    `${variant.toString(16)}${digest.slice(17, 20)}`, digest.slice(20, 32)].join('-');
+}
+
+test('the recap pass summarizes cold replied sessions once, gated, capped and transcript-backed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-recap-'));
+  const workerDir = join(dir, 'worker');
+  const receiptsDir = join(dir, 'receipts');
+  const piHome = join(dir, 'pihome');
+  const piSessions = join(piHome, 'agent', 'sessions');
+  const config = join(dir, 'schedule.json');
+  writeFileSync(config, JSON.stringify({ schedules: [] }), { mode: 0o600 });
+  const file = jobsFile(workerDir);
+  const runScheduler = async (now: number, extra: Record<string, string> = {}) => {
+    const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/scheduler.mjs'),
+      '--config', config, '--once', '--now', String(now)],
+      { env: { PATH: process.env.PATH, HOME: dir, HERDGATE_PI_WORKER_DIR: workerDir,
+        HERDGATE_PI_RECEIPT_DIR: receiptsDir, PI_HOME: piHome, ...extra }, stdio: ['ignore', 'ignore', 'pipe'] });
+    const err: string[] = [];
+    child.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
+    const code = await new Promise<number | null>(resolve => child.once('exit', resolve));
+    assert.equal(code, 0, err.join(''));
+    return err.join('');
+  };
+  const scope = join(receiptsDir, '0123456789abcdef');
+  const addReceipt = (n: number, entry: Record<string, unknown>) => {
+    mkdirSync(scope, { recursive: true });
+    appendFileSync(join(scope, 'receipts.jsonl'), `${JSON.stringify({ v: 1, id: `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`, ...entry })}\n`, { mode: 0o600 });
+  };
+  const addTranscript = (sessionId: string) => {
+    const slug = join(piSessions, 'proj-slug'); // Pi storage slug layout: <root>/<slug>/<ts>_<id>.jsonl
+    mkdirSync(slug, { recursive: true });
+    const path = join(slug, `1700000000000_${sessionId}.jsonl`);
+    writeFileSync(path, '', { mode: 0o600 });
+    return path;
+  };
+  const sessionOf = (n: number) => `${String(n).padStart(8, '0')}-2222-4333-8444-555555555555`;
+  const t0 = 1_700_000_000_000;
+  const cold = t0 - 20 * 60_000; // older than the 10-minute recap horizon
+  const sessionA = sessionOf(1);
+  const transcriptA = addTranscript(sessionA);
+  addReceipt(1, { status: 'replied', sessionId: sessionA, ts: cold });
+  const sessionHot = sessionOf(2); // replied but still warm -> ignored
+  addTranscript(sessionHot);
+  addReceipt(2, { status: 'replied', sessionId: sessionHot, ts: t0 - 60_000 });
+  const sessionFailed = sessionOf(3); // settled badly -> no recap
+  addTranscript(sessionFailed);
+  addReceipt(3, { status: 'failed', sessionId: sessionFailed, ts: cold });
+  const sessionNoFile = sessionOf(4); // cold but the transcript is gone -> nothing to read
+  addReceipt(4, { status: 'replied', sessionId: sessionNoFile, ts: cold });
+
+  // Gate off: an old replied session enqueues nothing, quietly.
+  const gateOff = await runScheduler(t0);
+  assert.equal(readJobs(file).size, 0, 'gate off: no recap job is enqueued');
+  assert.ok(!gateOff.includes('recap:'), 'gate off: no recap noise in the log');
+
+  // Gate on: exactly one deterministic recap job for the one eligible session.
+  const gateOn = await runScheduler(t0, { HERDGATE_PI_RECAP: '1' });
+  const expected = recapIdOf(sessionA);
+  assert.match(expected, JOB_ID, 'the derived recap id is a valid job id');
+  const jobs = readJobs(file);
+  assert.deepEqual([...jobs.keys()], [expected], 'only the cold replied session with a transcript is recap’d');
+  const recap = jobs.get(expected);
+  assert.equal(recap?.principal, `recap:${sessionA}`, 'the recap carries its session as principal');
+  assert.equal(recap?.state, 'queued');
+  assert.equal(recap?.ts, t0);
+  assert.equal(recap?.workspace, undefined, 'recaps run in the default workspace');
+  assert.ok(recap?.prompt.startsWith(`[herdgate-recap session=${sessionA} file=${transcriptA}]\n\n`),
+    'the recap frame names the session and transcript file');
+  assert.ok(recap.prompt.includes(`không sửa): ${transcriptA}.`), 'the prompt points at the transcript path');
+  assert.match(gateOn, /recap: enqueued 1 \(1 considered\)/);
+
+  // Idempotent: a second tick adds nothing — one recap per session, ever.
+  await runScheduler(t0 + 60_000, { HERDGATE_PI_RECAP: '1' });
+  assert.equal(readJobs(file).size, 1, 'a second tick must not duplicate the recap');
+
+  // Cap: five more eligible sessions, RECAP_MAX defaults to 3 per tick.
+  const t1 = t0 + 30_000; // the hot session is still inside the horizon
+  for (let n = 5; n <= 9; n++) {
+    addTranscript(sessionOf(n));
+    addReceipt(n, { status: 'replied', sessionId: sessionOf(n), ts: cold });
+  }
+  const capped = await runScheduler(t1, { HERDGATE_PI_RECAP: '1' });
+  const after = readJobs(file);
+  assert.equal([...after.values()].filter(job => job.principal?.startsWith('recap:')).length, 4,
+    'the first recap plus the three the cap allows');
+  assert.match(capped, /recap: enqueued 3 \(5 considered\)/);
+  assert.ok(after.has(recapIdOf(sessionOf(5))) && after.has(recapIdOf(sessionOf(6))) && after.has(recapIdOf(sessionOf(7))),
+    'the first three eligible sessions in scan order are the ones recap’d');
   rmSync(dir, { recursive: true, force: true });
 });
 
