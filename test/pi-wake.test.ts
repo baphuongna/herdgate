@@ -56,11 +56,13 @@ test('wakeFrame is one terse line with the essentials, never the reply text', ()
   assert.ok(frame.includes('status=replied'));
   assert.ok(frame.includes('title="chạy echo ok cho worker"'));
   assert.ok(frame.includes('tokens=12'));
-  assert.ok(frame.endsWith(']'));
+  // the self-describing directive keeps wake handling durable across compaction
+  assert.ok(frame.includes('LÀM TRỌN TRONG TURN NÀY'));
   assert.ok(!frame.includes('\n'));
   assert.ok(wakeFrame(entry({ status: 'failed', reason: 'job_timeout' }), spawn).includes('reason=job_timeout'));
   const long = wakeFrame(entry({ title: 'x'.repeat(500) }), spawn);
-  assert.ok(long.length <= 401);
+  assert.ok(long.length <= 481);
+  assert.ok(long.includes('không chỉ ack'));
 });
 
 test('wakeParentOnSettle prompts the parent pane and survives every failure', () => {

@@ -118,3 +118,18 @@ nó mở menu chọn tương tác và agent sẽ không ràng buộc session. **
 để khởi chạy/khôi phục agent**: phản hồi của `pane run` chỉ là "input đã xếp", không chờ readiness,
 không ràng buộc agent — agent sẽ hiện không có session và controller không quản lý được.
 Muốn đóng agent: `/quit` trong pane đó, đợi shell prompt; đóng pane phải do người dùng quyết định.
+
+## Wake protocol — khi nhận `[herdgate-wake …]`
+
+Publisher bắn wake-frame vào pane cha khi receipt của agent con settle. Frame tự mang
+chỉ thị, nhưng ghi nhớ bền ở đây (sống sót qua context compaction):
+
+**Nhận `[herdgate-wake child=<tên> id=<uuid> status=…]` → làm TRỌN trong đúng turn đó:**
+1. Chạy test mục tiêu của phần việc con vừa làm (`node --test test/<file>.test.ts`).
+2. Review diff (`git diff` + `git status`) — đúng whitelist file đã giao.
+3. Commit nếu đạt (thông điệp ghi rõ agent nào, spawn id).
+4. Báo user ngắn gọn ngay trong reply (agent nào xong, commit gì, test bao nhiêu pass).
+5. Cần report đầy đủ: `node experiments/pi-receipt/query.mjs --gate <gate> --device <d> --secret <s> --id <uuid> --body`.
+
+ KHÔNG chỉ ack rồi kết thúc turn — mỗi lần ack suông là một phần việc chết chờ user nhắc
+ (đã xảy ra: 3 wake đến, 0 được xử lý trọn). Cây agent: `node experiments/pi-spawn/dag.mjs`.

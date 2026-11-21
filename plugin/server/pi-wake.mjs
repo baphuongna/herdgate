@@ -38,15 +38,19 @@ export function paneForSession(panes, sessionId) {
   return pane?.pane_id ?? null;
 }
 
-/** One terse line: enough for the parent to act, never the reply text. */
+/** One terse line: enough for the parent to act, never the reply text.
+ *  The directive rides IN the frame on purpose: the handling protocol must
+ *  survive context compaction in the parent — a bare status line gets a bare
+ *  ack (observed live); the instruction makes every wake self-describing. */
 export function wakeFrame(entry, spawn) {
   const bits = [`[herdgate-wake child=${spawn.name ?? 'child'}`, `id=${entry.id}`, `status=${entry.status}`];
   if (entry.reason) bits.push(`reason=${entry.reason}`);
-  if (entry.title) bits.push(`title="${String(entry.title).replace(/\s+/g, ' ').slice(0, 80)}"`);
+  if (entry.title) bits.push(`title="${String(entry.title).replace(/\s+/g, ' ').slice(0, 60)}"`);
   if (entry.usage && Number.isFinite(entry.usage.totalTokens)) bits.push(`tokens=${entry.usage.totalTokens}`);
   bits.push(`ts=${new Date(entry.ts).toISOString()}]`);
-  const line = bits.join(' ');
-  return line.length <= 400 ? line : `${line.slice(0, 397)}…]`;
+  const directive = ' → việc con đã settle. LÀM TRỌN TRONG TURN NÀY: chạy test mục tiêu, review diff, commit nếu đạt, rồi báo user ngắn gọn — không chỉ ack.';
+  const line = bits.join(' ') + directive;
+  return line.length <= 480 ? line : `${bits.join(' ').slice(0, 300)}…]${directive}`;
 }
 
 /** Build the onSettle callback for watchReceipts. */
