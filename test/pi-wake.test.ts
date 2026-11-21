@@ -1,9 +1,16 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFile as execFileCb } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { paneForSession, parentOf, readAllSpawns, wakeFrame, wakeParentOnSettle } from '../plugin/server/pi-wake.mjs';
+import { deathFrame, paneForSession, parentOf, readAllSpawns, scanSpawnDeaths, wakeFrame, wakeParentOnSettle, watchSpawnDeaths } from '../plugin/server/pi-wake.mjs';
+import { readSpawns } from '../experiments/pi-spawn/registry.mjs';
+import { scopeFor, watchReceipts } from '../plugin/server/pi-receipts.mjs';
+
+const execFile = promisify(execFileCb);
 
 const roots: string[] = [];
 const root = () => { const r = mkdtempSync(join(tmpdir(), 'hg-wake-')); roots.push(r); return r; };
@@ -220,4 +227,258 @@ test('idle is not enough: the revision must hold steady across the settle delay'
   assert.equal(delivered.length, 1, 'delivered once the revision held steady');
   assert.ok(round >= 3, `re-probed through the race (rounds: ${round})`);
   assert.match(logs.at(-1)!, /quiet parent/);
+});
+
+// ── observe/wake fixes (live incident 21/11) + death wake (herdr-pings lesson) ──
+
+const KID = '44444444-4444-4444-8444-444444444444';
+const KID2 = '55555555-5555-4555-8555-555555555555';
+
+/** A minimal fake Pi runtime driving the REAL observer (experiments/pi-receipt),
+ *  the same harness shape as test/pi-receipt.test.ts — receipts land in `base`,
+ *  so watchReceipts + wakeParentOnSettle see exactly what production sees. */
+async function piWorker(options: { base: string; sessionId: string }) {
+  const cwd = join(options.base, 'work');
+  mkdirSync(cwd, { recursive: true });
+  const commands = new Map<string, Function>();
+  const hooks = new Map<string, Function>();
+  const prior = process.env.HERDGATE_PI_RECEIPT_DIR;
+  process.env.HERDGATE_PI_RECEIPT_DIR = options.base; // captured when the factory runs
+  const { default: activate } = await import(new URL('../experiments/pi-receipt/observer.js', import.meta.url).href);
+  activate({
+    registerCommand: (name: string, command: { handler: Function }) => commands.set(name, command.handler),
+    on: (event: string, handler: Function) => hooks.set(event, handler),
+  });
+  process.env.HERDGATE_PI_RECEIPT_DIR = prior;
+  const entries = new Map<string, { id: string; type: string; parentId: string | null; message?: Record<string, unknown> }>();
+  let leaf: string | null = null;
+  const notifications: string[] = [];
+  const ctx = {
+    mode: 'tui',
+    cwd,
+    ui: { notify: (text: string) => notifications.push(text) },
+    isIdle: () => true,
+    hasPendingMessages: () => false,
+    sessionManager: {
+      getSessionId: () => options.sessionId,
+      getLeafId: () => leaf,
+      getEntry: (id: string) => entries.get(id),
+    },
+  };
+  const emit = (name: string, event: Record<string, unknown> = {}) => hooks.get(name)?.({ type: name, ...event }, ctx);
+  const command = async (name: string, args = '') => {
+    await commands.get(`herdgate-${name}`)!(args, ctx);
+    return JSON.parse(notifications.at(-1)!);
+  };
+  const append = (type: string, fields: Record<string, unknown> = {}) => {
+    const id = String(entries.size + 1);
+    entries.set(id, { id, parentId: leaf, type, ...fields });
+    leaf = id;
+    return id;
+  };
+  const user = (text: string) => append('message', { message: { role: 'user', content: [{ type: 'text', text }] } });
+  const assistant = () => append('message', { message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'done' }] } });
+  emit('session_start');
+  return {
+    command, user, assistant, cwd,
+    turn: (messageEntryId: string) => emit('turn_end', { messageEntryId }),
+    settle: (aborted = false) => emit('agent_settled', { aborted }),
+  };
+}
+
+const until = async (ok: () => boolean, what: string, ms = 4_000) => {
+  const deadline = Date.now() + ms;
+  while (!ok()) {
+    if (Date.now() > deadline) throw new Error(what);
+    await new Promise(r => setTimeout(r, 25));
+  }
+};
+
+/** Registry + parent-pane fixtures shared by the observe/wake tests. */
+function wakeFixture(kid = KID, kid2 = KID2) {
+  const base = root();
+  mkdirSync(join(base, 'aaaaaaaaaaaaaaaa'), { recursive: true });
+  const spawnFile = join(base, 'aaaaaaaaaaaaaaaa', 'spawns.jsonl');
+  const line = (id: string, name: string, paneId: string, over: Record<string, unknown> = {}) =>
+    JSON.stringify({ id, sessionId: id, parentSessionId: PARENT, parentPaneId: 'w9:p0', name, paneId, ts: 1, ...over });
+  const panes = [
+    { pane_id: 'w9:p0', agent_session: { value: `/x/a_${PARENT}.jsonl` } },
+    { pane_id: 'w9:pC' },
+  ];
+  const frames: string[][] = [];
+  const wake = wakeParentOnSettle({
+    spawnBase: base,
+    run: (...args: string[]) => { frames.push(args); return {}; },
+    listPanes: () => panes,
+    agentProbe: () => ({ status: 'idle', revision: 7 }),
+    log: () => {},
+    retryDelayMs: () => new Promise(r => setTimeout(r, 2)),
+    settleDelayMs: () => new Promise(r => setTimeout(r, 2)),
+    maxWaitMs: 5_000,
+  });
+  return { base, spawnFile, line, panes, frames, wake };
+}
+
+test('a settle with no user input does not kill the arm — the marker prompt still wakes', async () => {
+  const { base, spawnFile, line, frames, wake } = wakeFixture();
+  writeFileSync(spawnFile, line(KID, 'wakekid', 'w9:pC') + '\n');
+  const stop = watchReceipts(base, wake, { intervalMs: 60 });
+  const w = await piWorker({ base, sessionId: KID });
+  const armed = await w.command('arm', `--id ${KID}`);
+  assert.equal(armed.status, 'armed');
+  // The live 21/11 incident: session-start settle with NOTHING after the
+  // baseline used to finalize request_not_observed and kill the arm.
+  w.settle();
+  assert.equal((await w.command('receipt', KID)).status, 'armed', 'the arm survives a settle with no user input');
+  w.user(`${armed.marker}\nviệc một`);
+  w.turn(w.assistant());
+  w.settle(false);
+  assert.equal((await w.command('receipt', KID)).status, 'replied');
+  await until(() => frames.length === 1, 'the final settle never woke the parent');
+  assert.equal(frames[0][2], 'w9:p0');
+  assert.match(frames[0][3], /^\[herdgate-wake child=wakekid /);
+  stop();
+});
+
+test('re-prompted markers: newest wins per round and both settles wake the parent', async () => {
+  const { base, spawnFile, line, frames, wake } = wakeFixture();
+  writeFileSync(spawnFile, line(KID, 'wakekid', 'w9:pC') + '\n');
+  const stop = watchReceipts(base, wake, { intervalMs: 60 });
+  const w = await piWorker({ base, sessionId: KID });
+  // Round one carries TWO marker prompts (a re-prompt queued behind the first
+  // turn): the newest is the request, the old turn is history — not a foul.
+  const armed = await w.command('arm', `--id ${KID}`);
+  w.user(`${armed.marker}\njob one`);
+  w.turn(w.assistant());
+  w.user(`${armed.marker}\njob one RETRY`);
+  w.turn(w.assistant());
+  w.settle(false);
+  assert.equal((await w.command('receipt', KID)).status, 'replied');
+  const journal = readFileSync(join(base, scopeFor(w.cwd), 'receipts.jsonl'), 'utf8');
+  assert.ok(journal.includes('"title":"job one RETRY"'), 'the newest marker owns the tracked prompt');
+  await until(() => frames.length === 1, 'the first settle never woke the parent');
+  // Round two: a fresh arm on the same child session settles and wakes again.
+  const second = await w.command('arm', `--id ${KID2}`);
+  w.user(`${second.marker}\njob two`);
+  w.turn(w.assistant());
+  w.settle(false);
+  assert.equal((await w.command('receipt', KID2)).status, 'replied');
+  await until(() => frames.length === 2, 'the second settle never woke the parent');
+  assert.deepEqual(frames.map(f => f[2]), ['w9:p0', 'w9:p0']);
+  assert.ok(frames[0][3].includes(`id=${KID}`) && frames[1][3].includes(`id=${KID2}`));
+  stop();
+});
+
+test('unmarked human input after a marked prompt invalidates the arm — no wake', async () => {
+  const { base, spawnFile, line, frames, wake } = wakeFixture();
+  writeFileSync(spawnFile, line(KID, 'wakekid', 'w9:pC') + '\n');
+  const stop = watchReceipts(base, wake, { intervalMs: 60 });
+  const w = await piWorker({ base, sessionId: KID });
+  const armed = await w.command('arm', `--id ${KID}`);
+  w.user(`${armed.marker}\nviệc`);
+  w.turn(w.assistant());
+  w.user('plain human typing'); // competing input AFTER the marked request
+  w.turn(w.assistant());
+  w.settle(false);
+  const receipt = await w.command('receipt', KID);
+  assert.equal(receipt.status, 'unknown');
+  assert.equal(receipt.reason, 'competing_input');
+  assert.equal(receipt.requestEntryId, '1', 'the marked request had been adopted before the foul');
+  await new Promise(r => setTimeout(r, 250));
+  assert.equal(frames.length, 0, 'an invalidated intent is not a final settle — it wakes nobody');
+  stop();
+});
+
+test('a vanished pane without a final settle wakes the parent once, marked died in the registry', async () => {
+  const base = root();
+  mkdirSync(join(base, 'aaaaaaaaaaaaaaaa'), { recursive: true });
+  const spawnFile = join(base, 'aaaaaaaaaaaaaaaa', 'spawns.jsonl');
+  writeFileSync(spawnFile, JSON.stringify({ id: KID, sessionId: KID, parentSessionId: PARENT,
+    parentPaneId: 'w9:p0', name: 'wakekid', paneId: 'w9:pC', ts: 1 }) + '\n');
+  const frames: string[][] = [];
+  const stop = watchSpawnDeaths({
+    spawnBase: base,
+    run: (...args: string[]) => { frames.push(args); return {}; },
+    listPanes: () => [{ pane_id: 'w9:p0', agent_session: { value: `/x/a_${PARENT}.jsonl` } }], // w9:pC is GONE
+    agentProbe: () => ({ status: 'idle', revision: 3 }),
+    log: () => {},
+    intervalMs: 25,
+    retryDelayMs: () => new Promise(r => setTimeout(r, 2)),
+    settleDelayMs: () => new Promise(r => setTimeout(r, 2)),
+  });
+  await until(() => frames.length === 1, 'the death watch never woke the parent');
+  assert.equal(frames[0][2], 'w9:p0', 'the DIED banner goes to the recorded parent pane');
+  assert.equal(frames[0][3], deathFrame({ name: 'wakekid' }));
+  assert.equal(frames[0][3], `🔔 WAKE — agent wakekid DIED: pane biến mất chưa kịp settle — kiểm tra registry, restore nếu cần`);
+  const stored = readSpawns(spawnFile).find(s => s.id === KID)!;
+  assert.equal(stored.died, true, 'the registry record is marked died');
+  assert.ok(Number.isFinite(stored.diedAt));
+  await new Promise(r => setTimeout(r, 120));
+  assert.equal(frames.length, 1, 'one DIED per child — the sweep never spams');
+  stop();
+});
+
+test('a parent-closed child and an already-settled child never report DIED', async () => {
+  const base = root();
+  mkdirSync(join(base, 'aaaaaaaaaaaaaaaa'), { recursive: true });
+  const spawnFile = join(base, 'aaaaaaaaaaaaaaaa', 'spawns.jsonl');
+  writeFileSync(spawnFile, [
+    JSON.stringify({ id: KID, sessionId: KID, parentSessionId: PARENT, parentPaneId: 'w9:p0', name: 'closedkid', paneId: 'w9:pX', closedBy: 'parent', ts: 1 }),
+    JSON.stringify({ id: KID2, sessionId: KID2, parentSessionId: PARENT, parentPaneId: 'w9:p0', name: 'donekid', paneId: 'w9:pY', ts: 2 }),
+  ].join('\n') + '\n');
+  writeFileSync(join(base, 'aaaaaaaaaaaaaaaa', 'receipts.jsonl'),
+    JSON.stringify({ v: 1, id: KID2, status: 'replied', sessionId: KID2, ts: 3 }) + '\n');
+  const frames: string[][] = [];
+  const stop = watchSpawnDeaths({
+    spawnBase: base,
+    run: (...args: string[]) => { frames.push(args); return {}; },
+    listPanes: () => [{ pane_id: 'w9:p0', agent_session: { value: `/x/a_${PARENT}.jsonl` } }], // pX and pY gone
+    agentProbe: () => ({ status: 'idle', revision: 3 }),
+    log: () => {},
+    intervalMs: 20,
+  });
+  await new Promise(r => setTimeout(r, 120));
+  assert.equal(frames.length, 0, 'an intentional close and a settled child are not deaths');
+  assert.ok(!readFileSync(spawnFile, 'utf8').includes('"died"'), 'no died marks are invented');
+  stop();
+  // The scan itself stays silent for herdr being unreachable: no pane list, no verdicts.
+  assert.deepEqual(scanSpawnDeaths({ spawnBase: base, listPanes: () => [] }), []);
+  assert.deepEqual(scanSpawnDeaths({ spawnBase: base, listPanes: () => { throw new Error('herdr down'); } }), []);
+});
+
+test('arm waits for the child ack file — and fails closed without it', async () => {
+  const base = root();
+  const ctrl = join(base, 'ctrl');
+  mkdirSync(ctrl, { recursive: true });
+  mkdirSync(join(base, scopeFor(ctrl)), { recursive: true });
+  writeFileSync(join(base, scopeFor(ctrl), 'spawns.jsonl'),
+    JSON.stringify({ id: KID, sessionId: KID, paneId: 'w9:pC', parentSessionId: PARENT,
+      parentPaneId: 'w9:p0', name: 'ackkid', cwd: ctrl, ts: 1 }) + '\n');
+  // A fake herdr: pane list / agent get answer JSON; the typed /herdgate-arm
+  // (pane run) returns at once — the CHILD's activation ack lands on a timer,
+  // so the only thing that can satisfy arm is polling the ack file.
+  const fakeHerdr = join(base, 'fake-herdr.mjs');
+  writeFileSync(fakeHerdr, `#!/usr/bin/env node
+const [cmd, sub] = process.argv.slice(2);
+if (cmd === 'pane' && sub === 'list') console.log(JSON.stringify({ result: { panes: [{ pane_id: 'w9:p0' }, { pane_id: 'w9:pC' }] } }));
+else if (cmd === 'agent' && sub === 'get') console.log(JSON.stringify({ result: { agent: { agent_status: 'idle' } } }));
+`);
+  chmodSync(fakeHerdr, 0o755);
+  const spawnCli = fileURLToPath(new URL('../experiments/pi-spawn/spawn.mjs', import.meta.url));
+  const env = { ...process.env, HERDR_BIN_PATH: fakeHerdr, HERDGATE_PI_RECEIPT_DIR: base };
+  const started = Date.now();
+  const armJob = execFile(process.execPath, [spawnCli, 'arm', 'ackkid'], { cwd: ctrl, env });
+  setTimeout(() => writeFileSync(join(base, `${KID}.armed.json`), `${JSON.stringify({ id: KID, at: Date.now() })}\n`), 300);
+  const out = JSON.parse((await armJob).stdout);
+  assert.equal(out.status, 'armed');
+  assert.equal(out.id, KID);
+  assert.ok(Date.now() - started >= 250, 'arm returned only after the ack file appeared');
+  // The stale ack from round one must not fake the next handshake: arm unlinks
+  // it, no new ack ever comes, and the short test timeout ends in exit 1.
+  const t0 = Date.now();
+  await assert.rejects(
+    execFile(process.execPath, [spawnCli, 'arm', 'ackkid'], { cwd: ctrl, env: { ...env, HERDGATE_ARM_ACK_TIMEOUT_MS: '300' } }),
+    (error: NodeJS.ErrnoException & { stderr?: string }) => error.code === 1 && /no arm ack/i.test(error.stderr ?? ''),
+    'a missing ack must fail loudly');
+  assert.ok(Date.now() - t0 < 5_000, 'the test timeout flag is honored');
 });

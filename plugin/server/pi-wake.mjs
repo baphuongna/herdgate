@@ -5,11 +5,17 @@
 // herdr's agent prompt delivers. Failures (blocked parent, gone pane, herdr down)
 // log and drop — a missed wake is recoverable from the journal, a crash is not.
 import { execFileSync } from 'node:child_process';
-import { readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { readSpawns } from '../../experiments/pi-spawn/registry.mjs';
+import { findReceipt } from './pi-receipts.mjs';
 
 const SCOPE = /^[0-9a-f]{16}$/;
+/** A receipt that proves the child finished speaking — anything else is silence.
+ *  Final settles (replied/failed/canceled) wake a parent; invalidated/expired
+ *  intents (unknown) carry no result to act on, and a vanished child belongs
+ *  to the death watch below. */
+const SETTLED = new Set(['replied', 'failed', 'canceled']);
 
 /** Every spawn record across workspace scopes (spawn + self declarations). */
 export function readAllSpawns(base) {
@@ -53,7 +59,9 @@ export function wakeFrame(entry, spawn) {
   return line.length <= 480 ? line : `${bits.join(' ').slice(0, 300)}…]${directive}`;
 }
 
-/** Build the onSettle callback for watchReceipts.
+/** Resolve the parent's pane and deliver one frame once the parent is quietly
+ *  between turns. Shared by settle wakes and death wakes — the quiet-wait
+ *  protocol below is the load-bearing part and must never fork the tree.
  *
  *  Delivery waits for the parent to be BETWEEN TURNS, stably. Two live
  *  incidents (wtest2, wfork1) showed why "idle" alone is not enough: herdr
@@ -64,82 +72,183 @@ export function wakeFrame(entry, spawn) {
  *  context ever adopts, and everyone swears nothing arrived. Waiting for the
  *  agent revision to hold steady across two probes proves the turn truly
  *  closed; the injected text then submits against the live leaf. */
-export function wakeParentOnSettle({ spawnBase, run, listPanes, agentState, agentProbe, log = () => {}, retryDelayMs = () => new Promise(r => setTimeout(r, 3000)), settleDelayMs = () => new Promise(r => setTimeout(r, 2000)), maxWaitMs = 15 * 60 * 1000 }) {
-  return (entry) => {
+function deliverToParent({ spawn, line, label, run, listPanes, agentState, agentProbe,
+    log = () => {}, retryDelayMs = () => new Promise(r => setTimeout(r, 3000)), settleDelayMs = () => new Promise(r => setTimeout(r, 2000)), maxWaitMs = 15 * 60 * 1000 }) {
+  const deliver = (pane, waited) => {
     try {
-      if (!entry?.sessionId || !entry?.id) return;
-      const spawn = parentOf(readAllSpawns(spawnBase), entry.sessionId);
-      if (!spawn) return;                       // not a spawned child: nothing to wake
-      const deliver = (pane, waited) => {
-        try {
-          // pane run TYPES into the parent's terminal — the same live-branch path
-          // as /herdgate-arm markers. herdr agent prompt submits through the
-          // agent/RPC handle whose leaf pointer stagnates after one fork: every
-          // wake then extends an orphan branch no one ever sees (three live
-          // incidents, each parented to the previous orphan's leaf).
-          run('pane', 'run', pane, wakeFrame(entry, spawn));
-          log(`wake: child ${spawn.name} ${entry.status} -> parent pane ${pane}${waited ? ` (waited ${(waited / 1000) | 0}s for a quiet parent)` : ''}`);
-        } catch (error) {
-          log(`wake failed: ${error instanceof Error ? error.message : String(error)}`); // agent_blocked etc: never fatal
-        }
-      };
-      const panes = listPanes();
-      // The parent's REAL pane, recorded at spawn time. Session-file lookup alone
-      // is ambiguous: a second pi bound to the same session (a restore leftover)
-      // makes every wake land in the ghost — observed live, four times.
-      let pane = spawn.parentPaneId && panes.some(p => p?.pane_id === spawn.parentPaneId)
-        ? spawn.parentPaneId
-        : paneForSession(panes, spawn.parentSessionId);
-      if (!pane) {
-        log(`wake: parent ${String(spawn.parentSessionId).slice(0, 8)} pane gone — child ${spawn.name} ${entry.status}`);
-        return;
-      }
-      if (!agentProbe) {
-        // Legacy single-state probe: idle means deliver (kept for callers
-        // without a revision; the rich probe above is the safe path).
-        if (!agentState) return deliver(pane, 0);
-        const started = Date.now();
-        const attemptState = () => {
-          let state = 'unknown';
-          try { state = agentState(pane) ?? 'unknown'; }
-          catch { state = 'unknown'; }
-          if (state === 'idle') return deliver(pane, Date.now() - started);
-          if (Date.now() - started >= maxWaitMs) {
-            return log(`wake: parent pane ${pane} stayed ${state} for ${(maxWaitMs / 60000) | 0}min — dropped wake for ${spawn.name} (journal keeps the settle)`);
-          }
-          void retryDelayMs().then(attemptState);
-        };
-        return attemptState();
-      }
-      const started = Date.now();
-      const attempt = () => {
-        let probe = null;
-        try { probe = agentProbe(pane); } catch { probe = null; }
-        const state = probe?.status ?? 'unknown';
-        if (state === 'working' || state === 'blocked' || !probe) {
-          if (Date.now() - started >= maxWaitMs) {
-            return log(`wake: parent pane ${pane} stayed ${state} for ${(maxWaitMs / 60000) | 0}min — dropped wake for ${spawn.name} (journal keeps the settle)`);
-          }
-          return void retryDelayMs().then(attempt);
-        }
-        // Idle-ish: prove the turn CLOSED — the revision must hold across a settle delay.
-        void settleDelayMs().then(() => {
-          let again = null;
-          try { again = agentProbe(pane); } catch { again = null; }
-          if (again && again.status !== 'working' && again.status !== 'blocked' && again.revision === probe.revision) {
-            return deliver(pane, Date.now() - started);
-          }
-          if (Date.now() - started >= maxWaitMs) {
-            return log(`wake: parent pane ${pane} never quieted (${state}→${again?.status ?? '?'}, rev ${probe.revision}→${again?.revision ?? '?'}) — dropped wake for ${spawn.name}`);
-          }
-          void retryDelayMs().then(attempt);
-        });
-      };
-      attempt();
+      // pane run TYPES into the parent's terminal — the same live-branch path
+      // as /herdgate-arm markers. herdr agent prompt submits through the
+      // agent/RPC handle whose leaf pointer stagnates after one fork: every
+      // wake then extends an orphan branch no one ever sees (three live
+      // incidents, each parented to the previous orphan's leaf).
+      run('pane', 'run', pane, line);
+      log(`wake: child ${spawn.name} ${label} -> parent pane ${pane}${waited ? ` (waited ${(waited / 1000) | 0}s for a quiet parent)` : ''}`);
     } catch (error) {
       log(`wake failed: ${error instanceof Error ? error.message : String(error)}`); // agent_blocked etc: never fatal
     }
   };
+  const panes = listPanes();
+  // The parent's REAL pane, recorded at spawn time. Session-file lookup alone
+  // is ambiguous: a second pi bound to the same session (a restore leftover)
+  // makes every wake land in the ghost — observed live, four times.
+  let pane = spawn.parentPaneId && panes.some(p => p?.pane_id === spawn.parentPaneId)
+    ? spawn.parentPaneId
+    : paneForSession(panes, spawn.parentSessionId);
+  if (!pane) {
+    log(`wake: parent ${String(spawn.parentSessionId).slice(0, 8)} pane gone — child ${spawn.name} ${label}`);
+    return;
+  }
+  if (!agentProbe) {
+    // Legacy single-state probe: idle means deliver (kept for callers
+    // without a revision; the rich probe above is the safe path).
+    if (!agentState) return deliver(pane, 0);
+    const started = Date.now();
+    const attemptState = () => {
+      let state = 'unknown';
+      try { state = agentState(pane) ?? 'unknown'; }
+      catch { state = 'unknown'; }
+      if (state === 'idle') return deliver(pane, Date.now() - started);
+      if (Date.now() - started >= maxWaitMs) {
+        return log(`wake: parent pane ${pane} stayed ${state} for ${(maxWaitMs / 60000) | 0}min — dropped wake for ${spawn.name} (journal keeps the settle)`);
+      }
+      void retryDelayMs().then(attemptState);
+    };
+    return attemptState();
+  }
+  const started = Date.now();
+  const attempt = () => {
+    let probe = null;
+    try { probe = agentProbe(pane); } catch { probe = null; }
+    const state = probe?.status ?? 'unknown';
+    if (state === 'working' || state === 'blocked' || !probe) {
+      if (Date.now() - started >= maxWaitMs) {
+        return log(`wake: parent pane ${pane} stayed ${state} for ${(maxWaitMs / 60000) | 0}min — dropped wake for ${spawn.name} (journal keeps the settle)`);
+      }
+      return void retryDelayMs().then(attempt);
+    }
+    // Idle-ish: prove the turn CLOSED — the revision must hold across a settle delay.
+    void settleDelayMs().then(() => {
+      let again = null;
+      try { again = agentProbe(pane); } catch { again = null; }
+      if (again && again.status !== 'working' && again.status !== 'blocked' && again.revision === probe.revision) {
+        return deliver(pane, Date.now() - started);
+      }
+      if (Date.now() - started >= maxWaitMs) {
+        return log(`wake: parent pane ${pane} never quieted (${state}→${again?.status ?? '?'}, rev ${probe.revision}→${again?.revision ?? '?'}) — dropped wake for ${spawn.name}`);
+      }
+      void retryDelayMs().then(attempt);
+    });
+  };
+  attempt();
+}
+
+/** Build the onSettle callback for watchReceipts. */
+export function wakeParentOnSettle({ spawnBase, run, listPanes, agentState, agentProbe, log = () => {}, retryDelayMs, settleDelayMs, maxWaitMs }) {
+  return (entry) => {
+    try {
+      if (!entry?.sessionId || !entry?.id) return;
+      if (!SETTLED.has(entry.status)) {
+        return log(`wake: ${entry.id} settled ${entry.status} — not a final settle, no parent wake`);
+      }
+      const spawn = parentOf(readAllSpawns(spawnBase), entry.sessionId);
+      if (!spawn) return;                       // not a spawned child: nothing to wake
+      deliverToParent({ spawn, line: wakeFrame(entry, spawn), label: entry.status,
+        run, listPanes, agentState, agentProbe, log, retryDelayMs, settleDelayMs, maxWaitMs });
+    } catch (error) {
+      log(`wake failed: ${error instanceof Error ? error.message : String(error)}`); // agent_blocked etc: never fatal
+    }
+  };
+}
+
+/** The herdr-pings lesson: a child that dies with its pane (bridge crash) never
+ *  settles, so no journal event can ever fire a wake — the silence IS the
+ *  failure. The banner follows the wake-skill format so the parent's handling
+ *  protocol recognizes the frame and acts inside its turn. */
+export function deathFrame(spawn) {
+  return `🔔 WAKE — agent ${spawn?.name ?? 'child'} DIED: pane biến mất chưa kịp settle — kiểm tra registry, restore nếu cần`;
+}
+
+/** Wake a parent about a lost child (pane vanished before any final settle). */
+export function wakeParentOnDeath({ run, listPanes, agentState, agentProbe, log = () => {}, retryDelayMs, settleDelayMs, maxWaitMs }) {
+  return (spawn) => {
+    try {
+      if (!spawn?.parentSessionId) return;
+      deliverToParent({ spawn, line: deathFrame(spawn), label: 'DIED',
+        run, listPanes, agentState, agentProbe, log, retryDelayMs, settleDelayMs, maxWaitMs });
+    } catch (error) {
+      log(`wake failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+}
+
+/** Patch one spawn record inside the scope file that actually holds it. The
+ *  registry's own updateSpawn patches only the caller's cwd scope — the
+ *  publisher daemon sits elsewhere, so deaths are marked wherever the record
+ *  lives. Returns the updated record, or null when no scope holds the id. */
+export function patchSpawn(base, id, patch) {
+  let scopes = [];
+  try { scopes = readdirSync(base).filter(name => SCOPE.test(name)); }
+  catch { return null; }
+  for (const scope of scopes) {
+    const file = join(base, scope, 'spawns.jsonl');
+    const entries = readSpawns(file);
+    if (!entries.some(entry => entry.id === id)) continue;
+    let updated = null;
+    const next = entries.map(entry => entry.id === id ? (updated = { ...entry, ...patch }) : entry);
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+    const tmp = `${file}.tmp`;
+    writeFileSync(tmp, next.map(entry => JSON.stringify(entry)).join('\n') + '\n', { mode: 0o600 });
+    rmSync(file, { force: true });
+    renameSync(tmp, file);
+    return updated;
+  }
+  return null;
+}
+
+/** Children whose pane vanished before any final settle — the death-watch
+ *  candidates. ONLY records with a parent-pane edge qualify: human panes and
+ *  self-declared worker sessions are never watched. An empty pane list means
+ *  herdr itself is unreachable/restarting — that is not six deaths, it is zero
+ *  answers; fail silent instead of spamming DIED frames. */
+export function scanSpawnDeaths({ spawnBase, listPanes }) {
+  let panes = [];
+  try { panes = listPanes() ?? []; }
+  catch { return []; }
+  if (!panes.length) return [];
+  const alive = new Set(panes.map(p => p?.pane_id).filter(Boolean));
+  const dead = [];
+  for (const spawn of readAllSpawns(spawnBase)) {
+    if (!spawn.parentPaneId || !spawn.paneId) continue;               // no parent edge: not ours to watch
+    if (spawn.died === true || spawn.closedBy === 'parent') continue; // already reported / closed on purpose
+    if (alive.has(spawn.paneId)) continue;                            // pane still there
+    const receipt = findReceipt(spawnBase, spawn.id);
+    if (receipt && SETTLED.has(receipt.status)) continue;             // settled in time; the close was earned
+    dead.push(spawn);
+  }
+  return dead;
+}
+
+/** The publisher's 30s death watch (a script poll, never the journal watcher):
+ *  scan → mark died:true in the registry FIRST (one DIED per child, never a
+ *  spam loop) → wake the parent through the same quiet-delivery path. */
+export function watchSpawnDeaths({ spawnBase, run, listPanes, agentState, agentProbe, log = () => {}, intervalMs = 30_000, retryDelayMs, settleDelayMs, maxWatchMs }) {
+  const wakeOne = wakeParentOnDeath({ run, listPanes, agentState, agentProbe, log, retryDelayMs, settleDelayMs, maxWaitMs: maxWatchMs });
+  const tick = () => {
+    let dead = [];
+    try { dead = scanSpawnDeaths({ spawnBase, listPanes }); }
+    catch (error) {
+      return log(`death scan failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    for (const spawn of dead) {
+      const marked = patchSpawn(spawnBase, spawn.id, { died: true, diedAt: Date.now() });
+      if (!marked) continue; // record vanished mid-scan: nothing to wake about
+      log(`death: child ${spawn.name} pane ${spawn.paneId} vanished before settling — waking the parent`);
+      wakeOne(marked);
+    }
+  };
+  const timer = setInterval(tick, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
 }
 
 /** Default herdr runner for the publisher process (tolerates plain-text output). */

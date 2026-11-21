@@ -20,9 +20,11 @@
 // -- --thinking low for fast turns.
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { findSpawn, recordSelf, recordSpawn, readSpawns, spawnBase, spawnsFile, updateSpawn } from './registry.mjs';
 import { findReceipt } from '../../plugin/server/pi-receipts.mjs';
+import { patchSpawn } from '../../plugin/server/pi-wake.mjs';
 
 const herdr = () => process.env.HERDR_BIN_PATH || 'herdr';
 const run = (...args) => JSON.parse(execFileSync(herdr(), args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }));
@@ -98,29 +100,26 @@ if (command === 'spawn') {
   const wantBody = process.argv.includes('--body');
   const agent = run('agent', 'get', entry.paneId).result.agent;
   if (agent?.agent_status !== 'idle') fail(`agent is ${agent?.agent_status ?? 'unknown'} — arm when idle`);
+  // Handshake, not hope: the arm is REAL only when the child's observer writes
+  // its ack file — polled here (timeout 15s / 250ms interval) instead of racing
+  // pane text, so the marked prompt can never land before the armed baseline
+  // exists (the live spawn→arm→prompt race that killed six observers).
+  const ackFile = join(spawnBase(), `${entry.id}.armed.json`);
+  try { rmSync(ackFile, { force: true }); } catch { /* best effort: a stale ack must not fake this handshake */ }
   execFileSync(herdr(), ['pane', 'run', entry.paneId, `/herdgate-arm --id ${entry.id} --principal spawn:${entry.id}${wantBody ? ' --body' : ''}`], { stdio: 'ignore' });
-  // Notifications wrap in narrow panes; match on whitespace-stripped text instead of line regexes.
-  const readPane = () => {
-    try {
-      return execFileSync(herdr(), ['pane', 'read', entry.paneId, '--source', 'recent-unwrapped', '--lines', '30', '--format', 'text', '--raw'],
-        { encoding: 'utf8' }).replace(/\u001b\[[0-9;]*[A-Za-z]/g, '').replace(/\s+/g, '');
-    } catch { return ''; }
-  };
-  const deadline = Date.now() + 10_000;
-  let confirmed = false;
+  const timeoutMs = Number(process.env.HERDGATE_ARM_ACK_TIMEOUT_MS) > 0
+    ? Number(process.env.HERDGATE_ARM_ACK_TIMEOUT_MS) : 15_000;
+  const deadline = Date.now() + timeoutMs;
+  let ack = null;
   while (Date.now() < deadline) {
-    const flat = readPane();
-    if (flat.includes('"status":"not_armed"')) {
-      // Arming the same spawn id twice is idempotent: the first intent is still ours.
-      if (flat.includes('"reason":"duplicate_id"') && flat.includes(`"id":"${entry.id}"`)) { confirmed = true; break; }
-      fail(`arm refused: ${flat.slice(-160)}`);
-    }
-    if (flat.includes(`herdr-request:${entry.id}`) && flat.includes('"status":"armed"')) { confirmed = true; break; }
-    if (flat.includes(`"id":"${entry.id}","status":"armed"`)) { confirmed = true; break; }
-    await new Promise(r => setTimeout(r, 300));
+    try {
+      const parsed = JSON.parse(readFileSync(ackFile, 'utf8'));
+      if (parsed?.id === entry.id) { ack = parsed; break; }
+    } catch { /* not acknowledged yet */ }
+    await new Promise(r => setTimeout(r, 250));
   }
-  if (!confirmed) fail('the pane did not confirm the armed marker in time');
-  console.log(JSON.stringify({ id: entry.id, status: 'armed', pane: entry.paneId,
+  if (!ack) fail(`no arm ack within ${Math.round(timeoutMs / 1000)}s — the child never confirmed activation of ${entry.id}; check its pane before prompting`);
+  console.log(JSON.stringify({ id: entry.id, status: 'armed', pane: entry.paneId, ackAt: ack.at,
     marker: `[herdr-request:${entry.id}]`, retainBody: wantBody }));
 } else if (command === 'list') {
   const { panes } = myBinding();
@@ -150,8 +149,12 @@ if (command === 'spawn') {
   if (agent?.agent_status === 'working') fail(`agent is working — wait for its wake, then close`);
   const kind = entry.tab && pane.tab_id ? 'tab' : 'pane';
   const target = kind === 'tab' ? pane.tab_id : entry.paneId;
+  // Mark BEFORE the pane closes: an intentional close must never read as a
+  // death — the publisher's death watch skips records closedBy their parent.
+  const marked = patchSpawn(spawnBase(), entry.id, { closedBy: 'parent', closedAt: Date.now() });
   run(kind === 'tab' ? 'tab' : 'pane', 'close', target);
   console.log(JSON.stringify({ id: entry.id, name: entry.name, closed: target, kind,
+    closedBy: marked ? 'parent' : null,
     restore: `node experiments/pi-spawn/spawn.mjs restore ${entry.name}` }));
 } else if (command === 'restore') {
   if (!arg) fail('usage: restore <name-or-id>');

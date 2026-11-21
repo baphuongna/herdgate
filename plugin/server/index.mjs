@@ -18,7 +18,7 @@ import { createSshBridge } from "./ssh.mjs";
 import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
 import { searchReceipts, sessionRoots as piSessionRoots } from "./pi-receipt-search.mjs";
 import { usageRollup } from "./pi-usage.mjs";
-import { herdrRunner, wakeParentOnSettle } from "./pi-wake.mjs";
+import { herdrRunner, wakeParentOnSettle, watchSpawnDeaths } from "./pi-wake.mjs";
 import { openWatchStore } from "./pi-receipt-watch.mjs";
 import { JOB_ID, MAX_PENDING, MAX_PROMPT, WORKSPACE_NAME, appendJob, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, workerBase } from "./pi-worker.mjs";
 import { registerPublisher } from "./publisher-tui-lifecycle.mjs";
@@ -330,6 +330,7 @@ async function publisherLoop() {
    *  subscriber, survives publisher restarts, and only an ack retires the
    *  intent. No broadcast to the whole room. */
   let receiptWatch = null;
+  let deathWatch = null;
   let watchStore = null;
   const receiptsEnabled = () => process.env.HERDGATE_PI_RECEIPTS === "1";
   const receiptBodyEnabled = () => receiptsEnabled() && process.env.HERDGATE_PI_RECEIPT_BODY === "1";
@@ -428,14 +429,16 @@ async function publisherLoop() {
           // Settles push to subscribed devices AND wake the parent pane of spawned
           // children — the controller never holds a watch; alerts arrive as input.
           const runHerdr = herdrRunner();
+          const listPanes = () => { try { return runHerdr("pane", "list").result.panes ?? []; } catch { return []; } };
+          const agentProbe = pane => {
+            const agent = runHerdr("agent", "get", pane).result.agent;
+            return { status: agent?.agent_status, revision: agent?.revision ?? null };
+          };
           const wakeParent = wakeParentOnSettle({
             spawnBase: receiptJournalBase(),
             run: runHerdr,
-            listPanes: () => { try { return runHerdr("pane", "list").result.panes ?? []; } catch { return []; } },
-            agentProbe: pane => {
-              const agent = runHerdr("agent", "get", pane).result.agent;
-              return { status: agent?.agent_status, revision: agent?.revision ?? null };
-            },
+            listPanes,
+            agentProbe,
             log,
           });
           receiptWatch = watchReceipts(receiptJournalBase(), (entry) => {
@@ -443,6 +446,18 @@ async function publisherLoop() {
             wakeParent(entry);
           });
           log(`receipts: journal push enabled (${receiptJournalBase()}) + parent wake`);
+          // Death wake (the herdr-pings crash lesson): a spawned child whose pane
+          // vanishes before settling never emits a receipt, so the journal stays
+          // silent — a 30s script poll (never the journal watcher) compares live
+          // panes against the spawn registry and wakes each lost child's parent
+          // exactly once through the same quiet-delivery path.
+          deathWatch = watchSpawnDeaths({
+            spawnBase: receiptJournalBase(),
+            run: runHerdr,
+            listPanes,
+            agentProbe,
+            log,
+          });
         }
         for (const d of devices) flushWatches(d.id);
         void publish(ws);

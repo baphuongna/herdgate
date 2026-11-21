@@ -4,7 +4,7 @@
 // Journal format/readers are shared with the publisher (plugin/server/pi-receipts.mjs);
 // the journal writer is shared with the worker experiment (experiments/pi-receipt/journal.mjs).
 import { randomUUID } from 'node:crypto';
-import { closeSync, constants, openSync, readSync } from 'node:fs';
+import { closeSync, constants, mkdirSync, openSync, readSync, writeFileSync } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 import { join } from 'node:path';
 import { deriveTitle, journalBase, PRINCIPAL } from '../../plugin/server/pi-receipts.mjs';
@@ -46,6 +46,19 @@ function promptAfterMarker(content, marker) {
   const text = typeof content === 'string' ? content : content?.[0]?.type === 'text' ? content[0].text : undefined;
   if (typeof text !== 'string' || !text.startsWith(marker)) return undefined;
   return text.slice(marker.length).replace(/^\r?\n/, '');
+}
+
+// The arm→prompt handshake (spawn.mjs arm): a controller-typed arm is only REAL
+// once this runtime writes its ack file — the controller polls the file instead
+// of racing pane text, so the marked prompt can never land before the armed
+// baseline exists. Only explicit controller ids ack (a human arm has no waiter).
+function armAck(base, id) {
+  try {
+    mkdirSync(base, { recursive: true, mode: 0o700 });
+    writeFileSync(join(base, `${id}.armed.json`), `${JSON.stringify({ id, at: Date.now() })}\n`, { mode: 0o600 });
+  } catch (error) {
+    console.error(`herdgate-receipt: arm ack failed (${error.code ?? 'unknown'})`);
+  }
 }
 
 const SESSION_CHUNK = 64 * 1024; // transcript scan buffer; files grow unbounded
@@ -208,6 +221,9 @@ export default function observer(pi) {
       if (explicitId !== null) {
         if (!UUID.test(explicitId)) return notify(ctx, { status: 'not_armed', reason: 'usage' });
         if (active?.id === explicitId || receipts.has(explicitId)) {
+          // A still-armed duplicate keeps the handshake alive: the intent is
+          // real, so re-ack it; an already-settled id does NOT (nothing armed).
+          if (active?.id === explicitId) armAck(base, explicitId);
           return notify(ctx, { status: 'not_armed', reason: 'duplicate_id', id: explicitId });
         }
       }
@@ -223,6 +239,7 @@ export default function observer(pi) {
       const marker = `[herdr-request:${id}]`;
       const sessionFile = ctx.sessionManager.getSessionFile?.() ?? null; // captured with the armed session
       active = { id, marker, sessionId, baseline: ctx.sessionManager.getLeafId(), deadline: performance.now() + TTL_MS, cwd: ctx.cwd, retainBody, sessionFile, ...(principal ? { principal } : {}) };
+      if (explicitId !== null) armAck(base, id);
       notify(ctx, { id, status: 'armed', marker, expiresInSeconds: TTL_MS / 1000, ...(retainBody ? { retainBody } : {}), ...(principal ? { principal } : {}) });
     },
   });
@@ -259,16 +276,47 @@ export default function observer(pi) {
     const { entries, reason } = readSuffix(manager, active.baseline);
     if (!entries) return invalidate(reason);
     const users = entries.filter(entry => entry.type === 'message' && entry.message?.role === 'user');
-    if (users.length !== 1 || !hasMarker(users[0].message.content, active.marker)) {
+    const marked = users.filter(entry => hasMarker(entry.message.content, active.marker));
+    if (marked.length === 0) {
+      // Live incident (6-agent spawn): the FIRST settle after arming carried no
+      // user input at all — session-start noise — and killed the arm as
+      // request_not_observed before the marker prompt ever landed, so the final
+      // settle produced no receipt and no wake. A settle that observes NOTHING
+      // (no user input, no other conversation activity after the baseline) keeps
+      // the intent armed and waiting; only the TTL retires it. Untracked chatter
+      // (an assistant turn, a tool result, unmarked input) still invalidates.
+      if (users.length === 0 && !entries.some(entry => entry.type === 'message')) return;
       return invalidate(users.length > 1 ? 'competing_input' : 'request_not_observed');
     }
-    const request = users[0];
+    // The NEWEST marked prompt is the current request; earlier marker turns are
+    // history (a re-prompt while the arm survived), not violations.
+    const request = marked[marked.length - 1];
     const requestIndex = entries.indexOf(request);
-    if (entries.slice(0, requestIndex).some(entry => entry.type === 'message' &&
+    if (users.some(entry => !hasMarker(entry.message.content, active.marker) && entries.indexOf(entry) > requestIndex)) {
+      return invalidate('competing_input');
+    }
+    for (let i = 0; i + 1 < marked.length; i++) {
+      // A re-prompt is legitimate only after the previous request was answered:
+      // two markers with NO assistant/toolResult activity between them are a
+      // queued double-submit (the pending-queue fork hazard), not a retry.
+      const from = entries.indexOf(marked[i]);
+      const to = entries.indexOf(marked[i + 1]);
+      if (!entries.slice(from + 1, to).some(entry => entry.type === 'message' &&
+          (entry.message?.role === 'assistant' || entry.message?.role === 'toolResult'))) {
+        return invalidate('competing_input');
+      }
+    }
+    if (entries.slice(0, entries.indexOf(marked[0])).some(entry => entry.type === 'message' &&
         (entry.message?.role === 'assistant' || entry.message?.role === 'toolResult'))) {
       return invalidate('competing_input');
     }
-    if (active.requestEntryId && active.requestEntryId !== request.id) return invalidate('branch_changed');
+    // (Re-)adopting a different marked prompt resets the per-request tracking;
+    // the newest marker owns requestEntryId, lastTurnEntryId and promptText.
+    if (active.requestEntryId && active.requestEntryId !== request.id) {
+      active.requestEntryId = undefined;
+      active.lastTurnEntryId = undefined;
+      active.promptText = undefined;
+    }
     active.requestEntryId = request.id;
     active.promptText = promptAfterMarker(request.message.content, active.marker);
     if (!settled) {
