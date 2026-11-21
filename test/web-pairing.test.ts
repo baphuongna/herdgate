@@ -93,7 +93,7 @@ test("web: the worker panel submits, tracks the settle push, fetches the report,
 
     // The host side of this test answers worker ops directly on the relay.
     const reply = (payload: object) => agent.send({ t: "frame", device: grant.device.id, payload });
-    const saw = { ack: false };
+    const saw = { ack: false, search: "" };
     let submits = 0;
     let stopDrain = false;
     const draining = (async () => {
@@ -115,6 +115,12 @@ test("web: the worker panel submits, tracks the settle push, fetches the report,
           saw.ack = true;
         } else if (op === "receipt.body") {
           reply({ op: "receipt.body.result", id: message.payload!.id, text: "Báo cáo: xong.", bytes: 15, truncated: false });
+        } else if (op === "receipt.search") {
+          saw.search = String(message.payload!.query);
+          reply({ op: "receipt.search.result", hits: [
+            { id: "99999999-8888-4999-8999-999999999999", score: 3.21, status: "replied", principal: "schedule:nightly-build", usage: { totalTokens: 435, costUsd: 0.0006 } },
+            { id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", score: 1.1, status: "canceled", reason: "pi_aborted" },
+          ] });
         }
       }
     })();
@@ -157,6 +163,20 @@ test("web: the worker panel submits, tracks the settle push, fetches the report,
     await until(() => /queue is full/.test(String(workerBox.children.find((node) => node.className === "error small")?.textContent)), "the panel should show the refusal");
     assert.equal($("room-name").textContent, "WorkerHost", "a worker error must not blank the room view");
     assert.ok(view.children.length > 0, "the room view stays rendered");
+
+    // Receipt search: metadata hits render with their principal; a hit's retained
+    // report reuses the gated receipt.body fetch — never a snippet from the host.
+    const searchBox = workerBox.children.find((node) => node.className === "receipt-search")!;
+    const searchForm = searchBox.children.find((node) => node instanceof Element && node.handlers.has("submit"))!;
+    searchForm.children[1].value = "nightly build";
+    searchForm.fire("submit");
+    const searchList = searchBox.children.find((node) => node.className === "list")!;
+    await until(() => searchList.children.some((r) => /schedule:nightly-build/.test(r.children[0]?.textContent ?? "")), "search hits should render with their principal");
+    assert.ok(searchList.children.some((r) => /canceled \(pi_aborted\)/.test(r.children[0]?.textContent ?? "")), "the canceled hit keeps its verdict");
+    assert.equal(saw.search, "nightly build");
+    const hitRow = searchList.children.find((r) => /replied/.test(r.children[0]?.textContent ?? ""))!;
+    hitRow.children.find((n) => n instanceof Element && n.handlers.has("click"))!.fire("click");
+    await until(() => searchList.children.some((r) => r.children.some((n) => n.textContent === "Báo cáo: xong.")), "a search hit's report should render after the gated fetch");
   } finally {
     stopDrainRef.stop();
     for (const socket of sockets) socket.close();

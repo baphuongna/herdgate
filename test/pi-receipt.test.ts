@@ -96,6 +96,31 @@ test('a marked round trip reports received after append and replied only after s
   assert.doesNotMatch(w.rendered(), /private (brief|reply|error)/);
 });
 
+test('the arm command threads a validated principal onto the receipt (herdr-sched §3.1)', async () => {
+  const w = await worker();
+  // A malformed actor name is refused up front — nothing is armed.
+  assert.deepEqual(await w.command('arm', '--principal bogus'), { status: 'not_armed', reason: 'bad_principal' });
+  const armed = await w.command('arm', '--principal device:d_12345678');
+  assert.equal(armed.principal, 'device:d_12345678');
+  w.emit('message_end', { message: { role: 'user', content: armed.marker } });
+  const requestEntryId = w.user(`${armed.marker}\r\nwho started this`);
+  const responseEntryId = w.assistant();
+  w.turn(responseEntryId);
+  w.emit('agent_end');
+  w.settle();
+  assert.equal((await w.command('receipt', armed.id)).principal, 'device:d_12345678');
+  // No principal given: nothing is invented — a human typed it locally.
+  const bare = await w.command('arm');
+  assert.ok(!('principal' in bare));
+  w.emit('message_end', { message: { role: 'user', content: bare.marker } });
+  const rid = w.user(`${bare.marker}\r\nlocal work`);
+  const aid = w.assistant();
+  w.turn(aid);
+  w.emit('agent_end');
+  w.settle();
+  assert.ok(!('principal' in (await w.command('receipt', bare.id))));
+});
+
 test('a new turn without a finalized entry cannot settle using a previous reply', async () => {
   const w = await worker();
   const { id, marker } = await w.command('arm');

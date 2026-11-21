@@ -57,13 +57,17 @@ test('the worker queue format is bounded, newest-wins and never leaks prompts', 
   assert.match(workerBase({}), /herdgate.*pi-worker$/);
   assert.equal(validJob({ v: 1, id: 'nope', prompt: 'x', ts: 1, state: 'queued' }), null);
   assert.equal(validJob({ v: 1, id, prompt: 'x', ts: 1, state: 'sideways' }), null);
-  appendJob(file, { v: 1, id, prompt: 'first', ts: 1, state: 'queued' });
-  appendJob(file, { v: 1, id, prompt: 'first', ts: 1, state: 'running', sessionId: 's1' });
+  // Principal contract (herdr-sched §3.1): the actor rides the job to its receipt.
+  assert.equal(validJob({ v: 1, id, prompt: 'x', ts: 1, state: 'queued', principal: 'schedule:nightly-build' })?.principal, 'schedule:nightly-build');
+  assert.equal(validJob({ v: 1, id, prompt: 'x', ts: 1, state: 'queued', principal: 'bogus' }), null);
+  assert.equal(validJob({ v: 1, id, prompt: 'x', ts: 1, state: 'queued', principal: 'device:d_12345678' })?.principal, 'device:d_12345678');
+  appendJob(file, { v: 1, id, prompt: 'first', ts: 1, state: 'queued', principal: 'device:d_12345678' });
+  appendJob(file, { v: 1, id, prompt: 'first', ts: 1, state: 'running', sessionId: 's1', principal: 'device:d_12345678' });
   writeFileSync(file, '{corrupt\n' + readFileSync(file, 'utf8'), { mode: 0o600 });
   const jobs = readJobs(file);
   assert.equal(jobs.size, 1);
   assert.equal(jobs.get(id)?.state, 'running');
-  assert.deepEqual(publicJob(jobs.get(id) ?? null), { id, ts: 1, state: 'running', sessionId: 's1' });
+  assert.deepEqual(publicJob(jobs.get(id) ?? null), { id, ts: 1, state: 'running', sessionId: 's1', principal: 'device:d_12345678' });
   assert.deepEqual(publicJob(null), { state: 'unknown', reason: 'not_admitted' });
   assert.throws(() => appendJob(file, { v: 1, id: '00000000-0000-4000-8000-00000000000b', prompt: 'x'.repeat(16 * 1024 + 1), ts: 1, state: 'queued' }));
   rmSync(dir, { recursive: true, force: true });
@@ -134,6 +138,7 @@ test('the scheduler admits one deterministic run per bucket and heartbeats', asy
   let jobs = readJobs(file);
   assert.deepEqual([...jobs.keys()], [expected], 'only the valid schedule is admitted');
   const framed = jobs.get(expected)?.prompt ?? '';
+  assert.equal(jobs.get(expected)?.principal, 'schedule:synthetic-hourly', 'the job carries its schedule as principal');
   assert.ok(framed.startsWith(`[herdgate-schedule id="synthetic-hourly" run="${expected}" bucket=${bucket0} fired=`),
     'the wake frame names the schedule and run before the prompt');
   assert.ok(framed.endsWith('\n\nScheduled synthetic request'), 'the original prompt follows the frame');

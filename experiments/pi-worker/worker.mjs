@@ -273,7 +273,7 @@ for (const job of initialJobs.values()) {
     continue;
   }
   const route = resolveWorkspace(job, initialAllowlist);
-  writeReceipt(route.path, job.id, 'unknown', job.sessionId || 'pi-worker', { reason: 'worker_restarted' });
+  writeReceipt(route.path, job.id, 'unknown', job.sessionId || 'pi-worker', { reason: 'worker_restarted', ...(job.principal ? { principal: job.principal } : {}) });
   appendJob(file, { ...job, state: 'unknown', reason: 'worker_restarted' });
   log(`job ${job.id} was running when the previous worker died -> unknown/worker_restarted`);
 }
@@ -290,7 +290,7 @@ async function runJob(job, allowlist) {
   if (route.error) {
     // Unknown routing key: fail closed in the default scope. Never run, never resend.
     const verdict = { status: 'failed', reason: route.error };
-    writeReceipt(workspace, job.id, verdict.status, 'pi-worker', { reason: verdict.reason });
+    writeReceipt(workspace, job.id, verdict.status, 'pi-worker', { reason: verdict.reason, ...(job.principal ? { principal: job.principal } : {}) });
     appendJob(file, { ...job, state: verdict.status, reason: verdict.reason });
     counters.verdicts.failed = (counters.verdicts.failed ?? 0) + 1;
     log(`job ${job.id} -> failed/${route.error} (workspace "${route.name}" not allowlisted)`);
@@ -381,7 +381,10 @@ async function runJob(job, allowlist) {
     { ...('reason' in verdict ? { reason: verdict.reason } : {}),
       ...('requestEntryId' in verdict ? { requestEntryId: verdict.requestEntryId } : {}),
       ...('responseEntryId' in verdict ? { responseEntryId: verdict.responseEntryId } : {}),
-      ...('usage' in verdict ? { usage: verdict.usage } : {}) });
+      ...('usage' in verdict ? { usage: verdict.usage } : {}),
+      // The actor that caused this job stays on its receipt (herdr-sched §3.1):
+      // schedule:<id> for scheduler-fired runs, device:<id> for remote submits.
+      ...(job.principal ? { principal: job.principal } : {}) });
   appendJob(file, { ...job, state: verdict.status, sessionId,
     ...('reason' in verdict ? { reason: verdict.reason } : {}),
     ...('requestEntryId' in verdict ? { requestEntryId: verdict.requestEntryId } : {}),

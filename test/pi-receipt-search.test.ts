@@ -86,6 +86,22 @@ test('collectDocs merges journal, body archive and transcript by sessionId', () 
   rmSync(root, { recursive: true, force: true });
 });
 
+test('collectDocs also indexes the worker session root (flat layout)', () => {
+  const { base } = fixture();
+  const workerRoot = join(mkRoot(), 'worker-sessions');
+  const id = '77777777-7777-4777-8777-777777777777';
+  mkdirSync(workerRoot, { recursive: true });
+  writeFileSync(join(workerRoot, `2026-11-21T06-00-00-000Z_${id}.jsonl`),
+    sessionLine('user', 'job wake frame scheduler bucket term') + '\n');
+  writeFileSync(join(base, 'aaaaaaaaaaaaaaaa', 'receipts.jsonl'),
+    JSON.stringify(entry({ id, sessionId: id, principal: 'schedule:nightly-build' })) + '\n');
+  const docs = collectDocs({ base, sessionsRoot: ['/nonexistent', workerRoot] });
+  assert.equal(docs.length, 1);
+  assert.ok(docs[0].text.includes('wake frame scheduler'), 'the worker transcript is searched');
+  assert.ok(docs[0].text.includes('schedule:nightly-build'), 'principal tokens are searchable');
+  assert.equal(docs[0].sessionFile, join(workerRoot, `2026-11-21T06-00-00-000Z_${id}.jsonl`));
+});
+
 test('cli: json shape, id mode, no-match exit, and session dedupe', () => {
   const { base, sessions } = fixture();
   const sA = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';

@@ -3,6 +3,14 @@
 Đã thử với Pi **1.5.2**. Extension nằm ngoài thư mục tự nạp và ngoài gói npm/ZIP;
 không có lệnh cài, không bật integration hoặc mở API. Chỉ dùng ở **pane thử**.
 
+## Principal contract (herdr-sched §3.1)
+
+Mỗi receipt mang tùy chọn `principal` — tên actor gây ra request, đi theo nó trên
+mọi event trail: `schedule:<id>` (job do scheduler bắn), `device:<d_…>` (submit từ
+thiết bị pair), `spawn:<id>` (pane do spawn registry sinh), thiếu = người gõ tay
+local. Chuẩn hoá bởi `PRINCIPAL` (dùng chung receipt + job record), lộ qua
+`publicReceipt`/`publicJob`/search hits.
+
 ## Thử trong một phiên mới
 
 Mỗi nhiệm vụ một **agent mới + ID mới**: mở pane riêng, khởi chạy agentfresh cho task

@@ -98,7 +98,7 @@ if (command === 'spawn') {
   const wantBody = process.argv.includes('--body');
   const agent = run('agent', 'get', entry.paneId).result.agent;
   if (agent?.agent_status !== 'idle') fail(`agent is ${agent?.agent_status ?? 'unknown'} — arm when idle`);
-  execFileSync(herdr(), ['pane', 'run', entry.paneId, `/herdgate-arm --id ${entry.id}${wantBody ? ' --body' : ''}`], { stdio: 'ignore' });
+  execFileSync(herdr(), ['pane', 'run', entry.paneId, `/herdgate-arm --id ${entry.id} --principal spawn:${entry.id}${wantBody ? ' --body' : ''}`], { stdio: 'ignore' });
   // Notifications wrap in narrow panes; match on whitespace-stripped text instead of line regexes.
   const readPane = () => {
     try {

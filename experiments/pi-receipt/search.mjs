@@ -9,7 +9,7 @@
 //   node experiments/pi-receipt/search.mjs "noise rekey" [--base DIR] [--sessions DIR]
 //     [--limit 10] [--json] [--id] [--all] [--no-transcript] [--snippet N]
 
-import { buildIndex, collectDocs, searchIndex, snippet } from '../../plugin/server/pi-receipt-search.mjs';
+import { buildIndex, collectDocs, searchIndex, sessionRoots, snippet } from '../../plugin/server/pi-receipt-search.mjs';
 
 const arg = (name, fallback) => {
   const i = process.argv.indexOf(`--${name}`);
@@ -25,7 +25,8 @@ if (!query) {
   process.exit(2);
 }
 const base = arg('base') ?? `${process.env.XDG_STATE_HOME ?? `${process.env.HOME}/.local/state`}/herdgate/pi-receipts`;
-const sessions = arg('sessions') ?? `${process.env.PI_HOME ?? process.env.HOME}/.pi/agent/sessions`;
+const explicitSessions = arg('sessions');
+const sessions = explicitSessions ? [explicitSessions] : sessionRoots();
 const limit = Number(arg('limit', '10'));
 const width = Number(arg('snippet', '160'));
 const docs = collectDocs({ base, sessionsRoot: opt('no-transcript') ? null : sessions });

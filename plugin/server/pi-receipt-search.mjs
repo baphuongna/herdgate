@@ -9,6 +9,7 @@ import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } fr
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { publicReceipt } from './pi-receipts.mjs';
+import { workerBase } from './pi-worker.mjs';
 
 const K1 = 1.2;
 const B = 0.75;
@@ -117,30 +118,47 @@ function transcriptText(file) {
   return parts.join('\n');
 }
 
-/** Match a Pi session transcript by its id: <sessions>/<slug>/<ts>_<sessionId>.jsonl */
-export function findSessionFile(sessionsDir, sessionId) {
-  if (!sessionsDir || !sessionId) return null;
-  try {
-    const suffix = `_${sessionId}.jsonl`;
-    for (const slug of readdirSync(sessionsDir)) {
-      const dir = join(sessionsDir, slug);
-      let names;
-      try { names = readdirSync(dir); } catch { continue; }
-      for (const name of names) {
-        if (name.endsWith(suffix)) return join(dir, name);
+/** Match a Pi session transcript by its id: <root>/<slug>/<ts>_<sessionId>.jsonl.
+ *  Two roots hold transcripts: Pi's default storage for TUI sessions, and the
+ *  worker base for SDK-created job sessions (they live outside Pi's storage —
+ *  the same reason restore-by-file insists on --session <file>). */
+export function sessionRoots(env = process.env) {
+  return [
+    join(env.PI_HOME ?? join(homedir(), '.pi'), 'agent', 'sessions'),
+    join(workerBase(env), 'sessions'),
+  ];
+}
+
+export function findSessionFile(sessionsRoots, sessionId) {
+  if (!sessionId) return null;
+  const roots = sessionsRoots === null || sessionsRoots === undefined ? []
+    : Array.isArray(sessionsRoots) ? sessionsRoots : [sessionsRoots];
+  for (const sessionsDir of roots) {
+    try {
+      const suffix = `_${sessionId}.jsonl`;
+      for (const name of readdirSync(sessionsDir)) {
+        // Two layouts: Pi's <root>/<cwd-slug>/<ts>_<id>.jsonl and the worker's
+        // flat <root>/<ts>_<id>.jsonl (SDK sessions carry no cwd slug).
+        if (name.endsWith(suffix)) return join(sessionsDir, name);
+        const dir = join(sessionsDir, name);
+        let names;
+        try { names = readdirSync(dir); } catch { continue; }
+        for (const inner of names) {
+          if (inner.endsWith(suffix)) return join(dir, inner);
+        }
       }
-    }
-  } catch { /* no sessions dir: fine */ }
+    } catch { /* root missing: fine */ }
+  }
   return null;
 }
 
 /** Where Pi stores session transcripts on this host (PI_HOME wins, like the CLI). */
 export function sessionsDir(env = process.env) {
-  return join(env.PI_HOME ?? join(homedir(), '.pi'), 'agent', 'sessions');
+  return sessionRoots(env)[0];
 }
 
 function metaLine(meta) {
-  const bits = [meta.status, meta.reason, meta.paneId];
+  const bits = [meta.status, meta.reason, meta.paneId, meta.principal];
   if (meta.usage) bits.push(`${meta.usage.totalTokens ?? 0} tokens`, `$${meta.usage.costUsd ?? 0}`);
   return bits.filter(Boolean).join(' ');
 }
@@ -158,11 +176,12 @@ export function collectDocs({ base, sessionsRoot, withTranscripts = true } = {})
       const meta = {
         id: entry.id, sessionId: entry.sessionId, ts: entry.ts ?? 0,
         status: entry.status, reason: entry.reason, paneId: entry.paneId, usage: entry.usage,
+        ...(entry.principal ? { principal: entry.principal } : {}),
       };
       let text = metaLine(meta);
       let sessionFile = null;
       if (withTranscripts) {
-        sessionFile = findSessionFile(sessionsRoot, entry.sessionId);
+        sessionFile = findSessionFile(sessionsRoot ?? sessionRoots(), entry.sessionId);
         if (sessionFile) text += '\n' + transcriptText(sessionFile);
       }
       try { text += '\n' + readFileSync(join(dir, 'responses', `${entry.id}.md`), 'utf8').slice(0, BODY_CAP); }

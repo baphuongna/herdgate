@@ -73,9 +73,9 @@ function tick(now) {
     const framed = rawPrompts ? schedule.prompt
       : `[herdgate-schedule id="${schedule.id}" run="${id}" bucket=${bucket} fired=${new Date(now).toISOString()}]\n\n${schedule.prompt}`;
     if (framed.length > MAX_PROMPT) { invalid += 1; log(`skipped ${schedule.id}: framed prompt exceeds ${MAX_PROMPT}`); continue; }
-    appendJob(file, { v: 1, id, prompt: framed, ts: now, state: 'queued',
+    appendJob(file, { v: 1, id, prompt: framed, ts: now, state: 'queued', principal: `schedule:${schedule.id}`,
       ...(schedule.workspace ? { workspace: schedule.workspace } : {}) });
-    jobs.set(id, { v: 1, id, prompt: framed, ts: now, state: 'queued' });
+    jobs.set(id, { v: 1, id, prompt: framed, ts: now, state: 'queued', principal: `schedule:${schedule.id}` });
     enqueued += 1;
     log(`schedule ${schedule.id} bucket ${bucket} -> job ${id}`);
   }

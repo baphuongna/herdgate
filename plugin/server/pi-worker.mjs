@@ -6,6 +6,9 @@ import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
+// Same contract as receipts: the actor that caused this job (schedule:<id>,
+// device:<id>…) rides along to the journal when the worker settles it.
+import { PRINCIPAL } from './pi-receipts.mjs';
 
 export const JOB_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export const MAX_PROMPT = 16 * 1024; // admission bound for one prompt
@@ -80,6 +83,7 @@ function validJobShape(job) {
     && typeof job.prompt === 'string' && job.prompt.length <= MAX_PROMPT
     && typeof job.ts === 'number'
     && (job.workspace === undefined || WORKSPACE_NAME.test(job.workspace))
+    && (job.principal === undefined || PRINCIPAL.test(job.principal))
     && ['sessionId', 'reason', 'requestEntryId', 'responseEntryId'].every(key =>
       job[key] === undefined || typeof job[key] === 'string'));
 }

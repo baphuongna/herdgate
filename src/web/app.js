@@ -159,7 +159,7 @@ const state = {
   termBody: null,
   termPre: null,
   retry: 0,
-  worker: { health: null, jobs: new Map(), error: null },
+  worker: { health: null, jobs: new Map(), error: null, search: null },
 };
 
 /** The cloud base: an explicit setting, else this page's origin (same-origin deployment). */
@@ -402,7 +402,28 @@ function renderWorkerBox(box) {
   form.append(promptLabel, prompt, wsLabel, workspace, submit, formError);
   const jobs = document.createElement("ul");
   jobs.className = "list";
-  details.append(summary, health, refresh, form, formError, jobs);
+  // Receipt search: BM25 over the host journal (receipt.search op). Metadata
+  // hits only — the device fetches a retained reply per-hit through receipt.body,
+  // exactly like the job rows above.
+  const search = document.createElement("details");
+  search.className = "receipt-search";
+  const searchSummary = document.createElement("summary");
+  searchSummary.textContent = "Search receipts";
+  const searchForm = document.createElement("form");
+  const searchLabel = document.createElement("label");
+  searchLabel.textContent = "Find previous work by content";
+  const searchInput = document.createElement("input");
+  searchInput.type = "search";
+  searchInput.placeholder = "noise rekey, cron bucket, …";
+  searchInput.maxLength = 200;
+  const searchButton = document.createElement("button");
+  searchButton.type = "submit";
+  searchButton.textContent = "Search";
+  searchForm.append(searchLabel, searchInput, searchButton);
+  const searchHits = document.createElement("ul");
+  searchHits.className = "list";
+  search.append(searchSummary, searchForm, searchHits);
+  details.append(summary, health, refresh, form, formError, search, jobs);
   box.append(details);
 
   const askHealth = () => sendPayload({ op: "worker.health" });
@@ -416,11 +437,18 @@ function renderWorkerBox(box) {
     sendPayload({ op: "worker.submit", prompt: text, ...(workspace.value.trim() ? { workspace: workspace.value.trim() } : {}) });
     prompt.value = "";
   });
+  searchForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const query = searchInput.value.trim();
+    if (!query) return;
+    sendPayload({ op: "receipt.search", query, limit: 8 });
+  });
 
   const ui = { details, health, jobs, formError, asked: false };
   const update = (online) => {
     const w = state.worker;
     form.hidden = !online;
+    search.hidden = !online;
     if (online && details.open && !ui.asked) { ui.asked = true; askHealth(); }
     const h = w.health;
     if (!online) {
@@ -435,6 +463,50 @@ function renderWorkerBox(box) {
     }
     formError.hidden = !w.error;
     formError.textContent = w.error ?? "";
+    searchHits.replaceChildren();
+    const s = w.search;
+    if (s) {
+      if (Array.isArray(s.hits) && s.hits.length) {
+        for (const hit of s.hits) {
+          const row = document.createElement("li");
+          row.className = "row";
+          const head = document.createElement("span");
+          head.textContent = `${hit.id.slice(0, 8)} · ${hit.status}${hit.reason ? ` (${hit.reason})` : ""}`
+            + `${hit.principal ? ` · ${hit.principal}` : ""} · score ${hit.score}`;
+          row.append(head);
+          if (hit.status === "replied") {
+            const view = document.createElement("button");
+            view.type = "button";
+            view.className = "link";
+            view.textContent = hit.body === undefined ? "view report" : "hide report";
+            view.addEventListener("click", () => {
+              if (hit.body === undefined) sendPayload({ op: "receipt.body", id: hit.id });
+              else hit.body = undefined;
+              update(online);
+            });
+            row.append(" ", view);
+            if (typeof hit.body === "string") {
+              const pre = document.createElement("pre");
+              pre.textContent = hit.body;
+              row.append(pre);
+            } else if (hit.body && typeof hit.body === "object") {
+              const why = document.createElement("span");
+              why.className = "muted small";
+              why.textContent = `report not available (${hit.body.reason ?? "unavailable"})`;
+              row.append(why);
+            }
+          }
+          searchHits.append(row);
+        }
+      } else {
+        const none = document.createElement("li");
+        none.className = "muted small";
+        none.textContent = s.reason === "pi_receipts_disabled"
+          ? "receipt search disabled on this host (HERDGATE_PI_RECEIPTS)"
+          : s.hits && s.hits.length === 0 ? "no receipts match" : "search failed";
+        searchHits.append(none);
+      }
+    }
     jobs.replaceChildren();
     for (const job of [...w.jobs.values()].slice(-12).reverse()) {
       const row = document.createElement("li");
@@ -1203,10 +1275,23 @@ function applyPayload(payload) {
     workerJobTouched(payload.id, { status: payload.status, ...(payload.reason ? { reason: payload.reason } : {}), hasBody: payload.hasBody === true });
     sendPayload({ op: "receipt.ack", id: payload.id }); // displayed — retire the intent
     return;
+  } else if (payload && typeof payload === "object" && payload.op === "receipt.search.result") {
+    // Metadata hits (id/score/status/reason/usage/principal); snippets and session
+    // files are host-local privileges the channel never carries.
+    state.worker.search = { hits: Array.isArray(payload.hits) ? payload.hits : [], reason: payload.reason ?? null };
+    state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
+    return;
   } else if (payload && typeof payload === "object" && payload.op === "receipt.body.result") {
     workerJobTouched(payload.id, payload.text !== undefined
       ? { body: payload.text }
       : { body: { reason: payload.reason ?? "unavailable" } });
+    // A search hit that was never a tracked job still gets its fetched report.
+    const s = state.worker.search;
+    const hit = Array.isArray(s?.hits) ? s.hits.find((h) => h.id === payload.id) : null;
+    if (hit) {
+      hit.body = payload.text !== undefined ? payload.text : { reason: payload.reason ?? "unavailable" };
+      state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
+    }
     return;
   } else if (payload && typeof payload === "object" && payload.op === "error" && payload.code === "busy") {
     return; // our poll raced the host's 1/s throttle — the next tick catches up

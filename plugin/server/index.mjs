@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead } from "./common.mjs";
 import { createSshBridge } from "./ssh.mjs";
 import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
-import { searchReceipts, sessionsDir as piSessionsDir } from "./pi-receipt-search.mjs";
+import { searchReceipts, sessionRoots as piSessionRoots } from "./pi-receipt-search.mjs";
 import { openWatchStore } from "./pi-receipt-watch.mjs";
 import { JOB_ID, MAX_PENDING, MAX_PROMPT, WORKSPACE_NAME, appendJob, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, workerBase } from "./pi-worker.mjs";
 import { registerPublisher } from "./publisher-tui-lifecycle.mjs";
@@ -459,7 +459,7 @@ async function publisherLoop() {
           const query = typeof payload.query === "string" ? payload.query.slice(0, 200) : "";
           const limit = Number(payload.limit);
           const hits = enabled && query.trim()
-            ? searchReceipts({ base: receiptJournalBase(), sessionsRoot: piSessionsDir(), query,
+            ? searchReceipts({ base: receiptJournalBase(), sessionsRoot: piSessionRoots(), query,
                 limit: Number.isFinite(limit) ? limit : 10, all: payload.all === true })
             : [];
           log(`receipts: ${m.device} search ${JSON.stringify(query)} -> ${hits.length} hit(s)`);
@@ -572,7 +572,7 @@ async function publisherLoop() {
             return void replyTo({ op: "error", code: "queue-full", message: `worker queue is full (${MAX_PENDING} pending)` });
           }
           const jobId = id || randomUUID();
-          try { appendJob(file, { v: 1, id: jobId, prompt, ts: Date.now(), state: "queued",
+          try { appendJob(file, { v: 1, id: jobId, prompt, ts: Date.now(), state: "queued", principal: `device:${m.device}`,
             ...(workspaceName !== undefined ? { workspace: workspaceName } : {}) }); }
           catch (e) {
             return void replyTo({ op: "error", code: "worker-queue", message: `queue append failed: ${e instanceof Error ? e.message : String(e)}` });

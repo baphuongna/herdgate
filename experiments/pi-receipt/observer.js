@@ -5,7 +5,7 @@
 // the journal writer is shared with the worker experiment (experiments/pi-receipt/journal.mjs).
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { journalBase } from '../../plugin/server/pi-receipts.mjs';
+import { journalBase, PRINCIPAL } from '../../plugin/server/pi-receipts.mjs';
 import { MAX_JOURNAL, appendReceipt, compact as compactJournal, loadJournal, openScope, writeBody } from './journal.mjs';
 
 const TTL_MS = 10 * 60 * 1000;
@@ -78,12 +78,12 @@ export default function observer(pi) {
     catch (error) { receipts.set(entry.id, entry); warn(error.message); }
   }
   function finish(status, fields = {}) {
-    const { id, requestEntryId, sessionId: session, cwd, retainBody, bodyText } = active;
+    const { id, requestEntryId, sessionId: session, cwd, retainBody, bodyText, principal } = active;
     if (status === 'replied' && retainBody && bodyText) {
       try { writeBody(base, cwd, id, bodyText); }
       catch (error) { console.error(`herdgate-receipt: body archive failed (${error.code ?? 'unknown'})`); }
     }
-    const entry = { v: 1, id, status, ...(requestEntryId ? { requestEntryId } : {}), sessionId: session, ts: Date.now(), ...(paneId ? { paneId } : {}), ...fields };
+    const entry = { v: 1, id, status, ...(requestEntryId ? { requestEntryId } : {}), sessionId: session, ts: Date.now(), ...(paneId ? { paneId } : {}), ...(principal ? { principal } : {}), ...fields };
     const receipt = { id, status, ...(requestEntryId ? { requestEntryId } : {}), ...fields };
     active = undefined;
     record(entry);
@@ -118,11 +118,14 @@ export default function observer(pi) {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       let retainBody = false;
       let explicitId = null;
+      let principal = null;
       for (let i = 0; i < parts.length; i++) {
         if (parts[i] === '--body') retainBody = true;
         else if (parts[i] === '--id' && i + 1 < parts.length) explicitId = parts[++i];
+        else if (parts[i] === '--principal' && i + 1 < parts.length) principal = parts[++i];
         else return notify(ctx, { status: 'not_armed', reason: 'usage' });
       }
+      if (principal !== null && !PRINCIPAL.test(principal)) return notify(ctx, { status: 'not_armed', reason: 'bad_principal' });
       if (explicitId !== null) {
         if (!UUID.test(explicitId)) return notify(ctx, { status: 'not_armed', reason: 'usage' });
         if (active?.id === explicitId || receipts.has(explicitId)) {
@@ -139,8 +142,8 @@ export default function observer(pi) {
       if (active) return notify(ctx, { id: active.id, status: 'not_armed', reason: 'already_armed' });
       const id = explicitId ?? randomUUID();
       const marker = `[herdr-request:${id}]`;
-      active = { id, marker, sessionId, baseline: ctx.sessionManager.getLeafId(), deadline: performance.now() + TTL_MS, cwd: ctx.cwd, retainBody };
-      notify(ctx, { id, status: 'armed', marker, expiresInSeconds: TTL_MS / 1000, ...(retainBody ? { retainBody } : {}) });
+      active = { id, marker, sessionId, baseline: ctx.sessionManager.getLeafId(), deadline: performance.now() + TTL_MS, cwd: ctx.cwd, retainBody, ...(principal ? { principal } : {}) };
+      notify(ctx, { id, status: 'armed', marker, expiresInSeconds: TTL_MS / 1000, ...(retainBody ? { retainBody } : {}), ...(principal ? { principal } : {}) });
     },
   });
   pi.registerCommand('herdgate-receipt', {

@@ -32,6 +32,11 @@ export function scopeFor(cwd) {
   return createHash('sha256').update(real).digest('hex').slice(0, 16);
 }
 
+// The actor behind a request, on every event trail it touches (herdr-sched §3.1):
+// schedule:<id> | job:<id> | device:<id> | human:<free-tag> — absent means a
+// human typed it locally in a pane and nothing programmatic claims the request.
+export const PRINCIPAL = /^[a-z][a-z0-9-]{0,15}:[A-Za-z0-9._-]{1,64}$/;
+
 export function validEntry(entry) {
   return validEntryShape(entry) ? entry : null;
 }
@@ -44,7 +49,8 @@ function validEntryShape(entry) {
     && (entry.usage === undefined || (typeof entry.usage === 'object' && entry.usage !== null
       && Object.keys(entry.usage).length > 0
       && Object.keys(entry.usage).every(key => ['totalTokens', 'costUsd', 'durationMs'].includes(key))
-      && Object.values(entry.usage).every(value => Number.isFinite(value)))));
+      && Object.values(entry.usage).every(value => Number.isFinite(value)))
+    && (entry.principal === undefined || PRINCIPAL.test(entry.principal))));
 }
 
 /** Parse a journal file; tolerate a torn tail and skip corrupt lines. */
