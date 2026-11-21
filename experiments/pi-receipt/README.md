@@ -1,5 +1,15 @@
 # Pi request receipt — thử nghiệm local
 
+## Tool index
+
+| Tool | Lệnh | Mô tả |
+|---|---|---|
+| `search.mjs` | `node experiments/pi-receipt/search.mjs "noise rekey"` | Tìm kiếm BM25 toàn bộ journal — host-local, kèm snippet + restore path. |
+| `query.mjs` | `node experiments/pi-receipt/query.mjs --gate ... --device d --secret s --id <uuid> --wait` | Nhận receipt / body qua Gate từ xa (`--wait` chờ push, `--search` tìm BM25). |
+| `usage.mjs` | `node experiments/pi-receipt/usage.mjs --days 7` | Tổng hợp usage theo ngày/principal. |
+| `dag.mjs` | `node experiments/pi-spawn/dag.mjs` | Cây agent + trạng thái checked. |
+| `spawn.mjs` | `node experiments/pi-spawn/spawn.mjs spawn reviewer` | Spawn/arm/restore agent one-id (`list`, `restore <name-or-id>`). |
+
 Đã thử với Pi **1.5.2**. Extension nằm ngoài thư mục tự nạp và ngoài gói npm/ZIP;
 không có lệnh cài, không bật integration hoặc mở API. Chỉ dùng ở **pane thử**.
 
