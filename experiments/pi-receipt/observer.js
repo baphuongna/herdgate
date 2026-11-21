@@ -35,7 +35,11 @@ function hasMarker(content, marker) {
   const text = typeof content === 'string' ? content : content?.[0]?.type === 'text' ? content[0].text : undefined;
   if (typeof text !== 'string' || !text.startsWith(marker)) return false;
   const tail = text.slice(marker.length, marker.length + 2);
-  return tail === '' || tail.startsWith('\n') || tail === '\r\n';
+  // The marker owns the START of the message; the body may follow after a
+  // newline OR a single space — `[marker] Nhiệm vụ…` burned a whole six-agent
+  // wave as request_not_observed before this was relaxed. Anything else (a
+  // marker buried mid-sentence, no boundary) still does not count.
+  return tail === '' || tail.startsWith('\n') || tail === '\r\n' || tail.startsWith(' ');
 }
 
 // The prompt body following the marker line (undefined when unmarked). The
@@ -45,7 +49,7 @@ function hasMarker(content, marker) {
 function promptAfterMarker(content, marker) {
   const text = typeof content === 'string' ? content : content?.[0]?.type === 'text' ? content[0].text : undefined;
   if (typeof text !== 'string' || !text.startsWith(marker)) return undefined;
-  return text.slice(marker.length).replace(/^\r?\n/, '');
+  return text.slice(marker.length).replace(/^(\r?\n| )/, '');
 }
 
 // The arm→prompt handshake (spawn.mjs arm): a controller-typed arm is only REAL
