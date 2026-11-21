@@ -53,20 +53,46 @@ export function wakeFrame(entry, spawn) {
   return line.length <= 480 ? line : `${bits.join(' ').slice(0, 300)}…]${directive}`;
 }
 
-/** Build the onSettle callback for watchReceipts. */
-export function wakeParentOnSettle({ spawnBase, run, listPanes, log = () => {} }) {
+/** Build the onSettle callback for watchReceipts.
+ *
+ *  Delivery waits for the parent to be IDLE. Observed live (wtest2): a wake
+ *  injected while the parent's turn is still writing parents itself to a stale
+ *  leaf and forks the session tree — the handling turn then runs completely on
+ *  an orphan branch that neither the human's view nor the parent's context ever
+ *  adopts, and everyone swears nothing arrived. Injecting only between turns
+ *  keeps the wake on the live branch. */
+export function wakeParentOnSettle({ spawnBase, run, listPanes, agentState, log = () => {}, retryDelayMs = () => new Promise(r => setTimeout(r, 3000)), maxWaitMs = 15 * 60 * 1000 }) {
   return (entry) => {
     try {
       if (!entry?.sessionId || !entry?.id) return;
       const spawn = parentOf(readAllSpawns(spawnBase), entry.sessionId);
       if (!spawn) return;                       // not a spawned child: nothing to wake
+      const deliver = (pane, waited) => {
+        try {
+          run('agent', 'prompt', pane, wakeFrame(entry, spawn));
+          log(`wake: child ${spawn.name} ${entry.status} -> parent pane ${pane}${waited ? ` (waited ${(waited / 1000) | 0}s for idle)` : ''}`);
+        } catch (error) {
+          log(`wake failed: ${error instanceof Error ? error.message : String(error)}`); // agent_blocked etc: never fatal
+        }
+      };
       const pane = paneForSession(listPanes(), spawn.parentSessionId);
       if (!pane) {
         log(`wake: parent ${String(spawn.parentSessionId).slice(0, 8)} pane gone — child ${spawn.name} ${entry.status}`);
         return;
       }
-      run('agent', 'prompt', pane, wakeFrame(entry, spawn));
-      log(`wake: child ${spawn.name} ${entry.status} -> parent pane ${pane}`);
+      if (!agentState) return deliver(pane, 0); // no probe available: deliver as before
+      const started = Date.now();
+      const attempt = () => {
+        let state = 'unknown';
+        try { state = agentState(pane) ?? 'unknown'; }
+        catch { state = 'unknown'; }
+        if (state === 'idle') return deliver(pane, Date.now() - started);
+        if (Date.now() - started >= maxWaitMs) {
+          return log(`wake: parent pane ${pane} stayed ${state} for ${(maxWaitMs / 60000) | 0}min — dropped wake for ${spawn.name} (journal keeps the settle)`);
+        }
+        void retryDelayMs().then(attempt);
+      };
+      attempt();
     } catch (error) {
       log(`wake failed: ${error instanceof Error ? error.message : String(error)}`); // agent_blocked etc: never fatal
     }

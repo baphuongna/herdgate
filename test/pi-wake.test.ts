@@ -106,3 +106,43 @@ test('wakeParentOnSettle prompts the parent pane and survives every failure', ()
   wake(entry({ id: '66666666-6666-4666-8666-666666666666', sessionId: '77777777-7777-4777-8777-777777777777' }));
   assert.equal(calls.filter(c => !c.error).length, before);
 });
+
+test('delivery waits for the parent to go idle — never forks the session tree', async () => {
+  const base = spawnFixture();
+  const delivered: string[][] = [];
+  const logs: string[] = [];
+  const states = ['working', 'working', 'blocked', 'idle'];
+  let probes = 0;
+  const panes = [{ pane_id: 'w9:p0', agent_session: { value: `/x/a_${PARENT}.jsonl` } }];
+  const wake = wakeParentOnSettle({
+    spawnBase: base,
+    run: (...args: string[]) => { delivered.push(args); return {}; },
+    listPanes: () => panes,
+    agentState: () => states[Math.min(probes++, states.length - 1)],
+    log: (m: string) => logs.push(m),
+    retryDelayMs: () => new Promise(r => setTimeout(r, 5)),
+    maxWaitMs: 10_000,
+  });
+  wake(entry());
+  await new Promise(r => setTimeout(r, 60));
+  assert.equal(delivered.length, 1, 'delivered exactly once, after idle');
+  assert.equal(probes, 4, 'probed until the parent was idle');
+  assert.match(logs.at(-1)!, /waited \d+s for idle/);
+
+  // a parent that never goes idle: the wake is dropped, never injected mid-turn
+  delivered.length = 0;
+  probes = 0;
+  const stuck = wakeParentOnSettle({
+    spawnBase: base,
+    run: (...args: string[]) => { delivered.push(args); return {}; },
+    listPanes: () => panes,
+    agentState: () => 'working',
+    log: (m: string) => logs.push(m),
+    retryDelayMs: () => new Promise(r => setTimeout(r, 5)),
+    maxWaitMs: 30,
+  });
+  stuck(entry());
+  await new Promise(r => setTimeout(r, 80));
+  assert.equal(delivered.length, 0, 'never injected into a busy parent');
+  assert.match(logs.at(-1)!, /stayed working/);
+});
