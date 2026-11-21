@@ -95,6 +95,7 @@ test("web: the worker panel submits, tracks the settle push, fetches the report,
     const reply = (payload: object) => agent.send({ t: "frame", device: grant.device.id, payload });
     const saw = { ack: false, search: "" };
     let submits = 0;
+    let usageCalls = 0;
     let stopDrain = false;
     const draining = (async () => {
       while (!stopDrain) {
@@ -121,6 +122,21 @@ test("web: the worker panel submits, tracks the settle push, fetches the report,
             { id: "99999999-8888-4999-8999-999999999999", score: 3.21, status: "replied", principal: "schedule:nightly-build", usage: { totalTokens: 435, costUsd: 0.0006 } },
             { id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", score: 1.1, status: "canceled", reason: "pi_aborted" },
           ] });
+        } else if (op === "usage.rollup") {
+          usageCalls += 1;
+          if (usageCalls === 1) reply({ op: "error", code: "usage-unavailable", message: "the usage roll-up is not wired on this host" });
+          else reply({
+            op: "usage.rollup.result", generatedAt: 1_750_000_000_000,
+            total: { requests: 5, replied: 3, failed: 1, canceled: 1, unknown: 0, tokens: 2100, costUsd: 0.0081 },
+            days: [
+              { date: "2025-06-01", requests: 3, replied: 2, failed: 1, tokens: 1234, costUsd: 0.0056 },
+              { date: "2025-05-31", requests: 2, replied: 1, failed: 0, tokens: 866, costUsd: 0.0025 },
+            ],
+            byPrincipal: [
+              { principal: "schedule:nightly-build", requests: 2, replied: 1, failed: 1, tokens: 900, costUsd: 0.005, lastTs: 1_750_000_000_000 },
+              { principal: "(human)", requests: 1, replied: 1, failed: 0, tokens: 334, costUsd: 0.0006, lastTs: 1_749_999_640_000 },
+            ],
+          });
         }
       }
     })();
@@ -177,6 +193,39 @@ test("web: the worker panel submits, tracks the settle push, fetches the report,
     const hitRow = searchList.children.find((r) => /replied/.test(r.children[0]?.textContent ?? ""))!;
     hitRow.children.find((n) => n instanceof Element && n.handlers.has("click"))!.fire("click");
     await until(() => searchList.children.some((r) => r.children.some((n) => n.textContent === "Báo cáo: xong.")), "a search hit's report should render after the gated fetch");
+
+    // Recap tab: jobs regrouped by whose turn it is — an unopened reply waits on you.
+    const second = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    reply({ op: "worker.submitted", id: second, state: "queued", duplicate: false });
+    await until(() => workerBox.children.at(-1)!.children.some((r) => /bbbbbbbb · pending/.test(r.children[0]?.textContent ?? "")), "the second job's watch settles as pending");
+    reply({ op: "receipt.push", id: second, status: "replied", hasBody: true });
+    await until(() => workerBox.children.at(-1)!.children.some((r) => /bbbbbbbb · replied/.test(r.children[0]?.textContent ?? "")), "the second job settles as replied");
+    workerBox.find((node) => node.textContent === "Recap")!.fire("click");
+    const recapView = workerBox.children.find((node) => node.className === "recap-view")!;
+    assert.ok(recapView.find((node) => node.textContent === "Needs you (1)"), "an unopened reply lands in Needs you");
+    assert.ok(recapView.find((node) => node.textContent === "bbbbbbbb · replied"), "the recap row names the job");
+    assert.ok(recapView.find((node) => node.textContent === "Done (1)"), "the report opened earlier is Done");
+    assert.equal(recapView.find((node) => /^Working/.test(node.textContent)), undefined, "no in-flight jobs — the Working group hides");
+
+    // Usage tab: an unwired host refuses the roll-up without breaking the room…
+    workerBox.find((node) => node.textContent === "Usage")!.fire("click");
+    const usageView = workerBox.children.find((node) => node.className === "usage-view")!;
+    usageView.find((node) => node.textContent === "Fetch usage")!.fire("click");
+    await until(() => Boolean(usageView.find((node) => node.textContent === "usage unavailable on this host")), "a refused roll-up is scoped to the Usage tab");
+    assert.equal($("room-name").textContent, "WorkerHost", "a usage error must not blank the room view");
+    // …a wired host renders the daily and per-principal tables.
+    usageView.find((node) => node.textContent === "Fetch usage")!.fire("click");
+    await until(() => Boolean(usageView.find((node) => node.textContent === "$0.0056")), "the days table should render with costs");
+    assert.ok(usageView.find((node) => node.textContent === "2025-06-01"), "today's bucket shows its date");
+    const pad2 = (n: number) => String(n).padStart(2, "0");
+    const clock = (ts: number) => `${pad2(new Date(ts).getHours())}:${pad2(new Date(ts).getMinutes())}`;
+    assert.ok(usageView.find((node) => node.textContent === "schedule:nightly-build"), "the principal table names its rows");
+    assert.ok(usageView.find((node) => node.textContent === clock(1_750_000_000_000)), "the principal's last activity renders as local HH:MM");
+
+    // Back to Recap: today's usage leaks into the recap footer once fetched.
+    workerBox.find((node) => node.textContent === "Recap")!.fire("click");
+    await until(() => Boolean(recapView.find((node) => /hôm nay: 3 requests/.test(node.textContent))), "the recap footer summarizes today's usage");
+    assert.match(recapView.find((node) => /hôm nay:/.test(node.textContent))!.textContent, /1234 tokens, \$0\.0056/);
   } finally {
     stopDrainRef.stop();
     for (const socket of sockets) socket.close();

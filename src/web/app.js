@@ -159,7 +159,7 @@ const state = {
   termBody: null,
   termPre: null,
   retry: 0,
-  worker: { health: null, jobs: new Map(), error: null, search: null },
+  worker: { health: null, jobs: new Map(), error: null, search: null, tab: "jobs", usage: null },
 };
 
 /** The cloud base: an explicit setting, else this page's origin (same-origin deployment). */
@@ -366,6 +366,123 @@ const WORKER_ERROR_CODES = new Set([
   "receipt.watch", "pi_receipts_disabled", "pi_receipt_body_disabled",
 ]);
 
+// Recap answers "đến lượt ai?" — whose move it is — for every tracked job; Usage
+// rolls the host's receipt journal into daily and per-principal tables.
+const RECAP_GROUPS = [
+  { key: "working", title: "Working" },
+  { key: "needs-you", title: "Needs you" },
+  { key: "fixing", title: "Needs fixing" },
+  { key: "done", title: "Done" },
+];
+
+function recapBucket(job) {
+  const opened = typeof job.body === "string"; // the report was opened on this device
+  if (job.status === "queued" || job.status === "running" || job.status === "pending") return "working";
+  if (job.status === "failed") return "fixing";
+  if (job.status === "replied") return opened || job.duplicate ? "done" : "needs-you";
+  return "done"; // canceled or unknown verdicts — nothing waits on us
+}
+
+const usageUsd = (value) => `$${(Number.isFinite(value) ? value : 0).toFixed(4)}`;
+const usageClock = (ts) => {
+  const at = new Date(ts);
+  return Number.isFinite(at.getTime())
+    ? `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`
+    : "";
+};
+
+function renderWorkerRecap(box, w) {
+  box.replaceChildren();
+  const buckets = new Map(RECAP_GROUPS.map((group) => [group.key, []]));
+  for (const job of w.jobs.values()) {
+    buckets.get(recapBucket(job))?.push(job);
+  }
+  let shown = 0;
+  for (const group of RECAP_GROUPS) {
+    const items = buckets.get(group.key);
+    if (!items || items.length === 0) continue; // empty groups stay hidden
+    shown += items.length;
+    const head = document.createElement("p");
+    head.textContent = `${group.title} (${items.length})`;
+    const list = document.createElement("ul");
+    list.className = "list";
+    for (const job of items) {
+      const row = document.createElement("li");
+      row.className = "row";
+      const span = document.createElement("span");
+      span.textContent = `${job.id.slice(0, 8)} · ${job.status}${job.reason ? ` (${job.reason})` : ""}`;
+      row.append(span);
+      list.append(row);
+    }
+    box.append(head, list);
+  }
+  if (shown === 0) {
+    const empty = document.createElement("p");
+    empty.className = "muted small";
+    empty.textContent = "no jobs yet — submit one from the Jobs tab";
+    box.append(empty);
+    return;
+  }
+  const u = w.usage;
+  const today = !u || u.unavailable ? null : (Array.isArray(u.days) ? u.days[0] : null);
+  if (today && (today.requests ?? 0) > 0) {
+    const line = document.createElement("p");
+    line.className = "muted small";
+    line.textContent = `hôm nay: ${today.requests ?? 0} requests, ${today.tokens ?? 0} tokens, ${usageUsd(today.costUsd)}`;
+    box.append(line);
+  }
+}
+
+function renderWorkerUsage(box, w, online) {
+  box.replaceChildren();
+  const fetchUsage = document.createElement("button");
+  fetchUsage.type = "button";
+  fetchUsage.textContent = "Fetch usage";
+  fetchUsage.addEventListener("click", () => sendPayload({ op: "usage.rollup", days: 7 }));
+  box.append(fetchUsage);
+  const line = (text) => {
+    const p = document.createElement("p");
+    p.className = "muted small";
+    p.textContent = text;
+    box.append(p);
+  };
+  if (!online) {
+    line("host offline");
+    return;
+  }
+  const u = w.usage;
+  if (!u) {
+    line("7-day roll-up over the host's receipt journal.");
+    return;
+  }
+  if (u.unavailable) {
+    line("usage unavailable on this host");
+    return;
+  }
+  const rowOf = (tag, cells) => {
+    const tr = document.createElement("tr");
+    for (const value of cells) {
+      const cell = document.createElement(tag);
+      cell.textContent = String(value);
+      tr.append(cell);
+    }
+    return tr;
+  };
+  const days = document.createElement("table");
+  days.className = "usage-days";
+  days.append(rowOf("th", ["date", "req", "replied", "failed", "tokens", "$"]));
+  for (const day of Array.isArray(u.days) ? u.days : []) {
+    days.append(rowOf("td", [day.date, day.requests ?? 0, day.replied ?? 0, day.failed ?? 0, day.tokens ?? 0, usageUsd(day.costUsd)]));
+  }
+  const byPrincipal = document.createElement("table");
+  byPrincipal.className = "usage-principals";
+  byPrincipal.append(rowOf("th", ["principal", "req", "tokens", "$", "last"]));
+  for (const p of Array.isArray(u.byPrincipal) ? u.byPrincipal : []) {
+    byPrincipal.append(rowOf("td", [p.principal, p.requests ?? 0, p.tokens ?? 0, usageUsd(p.costUsd), usageClock(p.lastTs)]));
+  }
+  box.append(days, byPrincipal);
+}
+
 function renderWorkerBox(box) {
   const details = document.createElement("details");
   details.className = "worker";
@@ -377,6 +494,19 @@ function renderWorkerBox(box) {
   refresh.type = "button";
   refresh.className = "link";
   refresh.textContent = "refresh";
+  // Activity bar: Jobs / Search / Recap / Usage share one surface; the chosen tab
+  // lives in state.worker.tab. Jobs keeps its old DOM slots — submit form first,
+  // jobs list last — so long-standing expectations keep matching.
+  const bar = document.createElement("div");
+  bar.className = "activity-bar";
+  const tabButtons = new Map();
+  for (const [key, label] of [["jobs", "Jobs"], ["search", "Search"], ["recap", "Recap"], ["usage", "Usage"]]) {
+    const tab = document.createElement("button");
+    tab.type = "button";
+    tab.textContent = label;
+    bar.append(tab);
+    tabButtons.set(key, tab);
+  }
   const form = document.createElement("form");
   form.autocomplete = "off";
   const promptLabel = document.createElement("label");
@@ -404,11 +534,9 @@ function renderWorkerBox(box) {
   jobs.className = "list";
   // Receipt search: BM25 over the host journal (receipt.search op). Metadata
   // hits only — the device fetches a retained reply per-hit through receipt.body,
-  // exactly like the job rows above.
-  const search = document.createElement("details");
+  // exactly like the job rows above. A plain tab view now, not a nested disclosure.
+  const search = document.createElement("div");
   search.className = "receipt-search";
-  const searchSummary = document.createElement("summary");
-  searchSummary.textContent = "Search receipts";
   const searchForm = document.createElement("form");
   const searchLabel = document.createElement("label");
   searchLabel.textContent = "Find previous work by content";
@@ -422,8 +550,14 @@ function renderWorkerBox(box) {
   searchForm.append(searchLabel, searchInput, searchButton);
   const searchHits = document.createElement("ul");
   searchHits.className = "list";
-  search.append(searchSummary, searchForm, searchHits);
-  details.append(summary, health, refresh, form, formError, search, jobs);
+  search.append(searchForm, searchHits);
+  const recap = document.createElement("div");
+  recap.className = "recap-view";
+  recap.hidden = true;
+  const usageView = document.createElement("div");
+  usageView.className = "usage-view";
+  usageView.hidden = true;
+  details.append(summary, health, refresh, bar, form, formError, search, recap, usageView, jobs);
   box.append(details);
 
   const askHealth = () => sendPayload({ op: "worker.health" });
@@ -445,10 +579,22 @@ function renderWorkerBox(box) {
   });
 
   const ui = { details, health, jobs, formError, asked: false };
+  let liveOnline = false;
+  for (const [key, tab] of tabButtons) {
+    tab.addEventListener("click", () => { state.worker.tab = key; update(liveOnline); });
+  }
   const update = (online) => {
+    liveOnline = online;
     const w = state.worker;
-    form.hidden = !online;
-    search.hidden = !online;
+    const tab = ["search", "recap", "usage"].includes(w.tab) ? w.tab : "jobs";
+    const working = [...w.jobs.values()].filter((job) => ["queued", "running", "pending"].includes(job.status)).length;
+    tabButtons.get("jobs").textContent = `Jobs (${working})`;
+    for (const [key, button] of tabButtons) button.className = key === tab ? "active" : "";
+    form.hidden = !online || tab !== "jobs";
+    search.hidden = !online || tab !== "search";
+    recap.hidden = tab !== "recap";
+    usageView.hidden = tab !== "usage";
+    jobs.hidden = tab !== "jobs";
     if (online && details.open && !ui.asked) { ui.asked = true; askHealth(); }
     const h = w.health;
     if (!online) {
@@ -538,6 +684,8 @@ function renderWorkerBox(box) {
       }
       jobs.append(row);
     }
+    renderWorkerRecap(recap, w);
+    renderWorkerUsage(usageView, w, online);
   };
   return update;
 }
@@ -1292,6 +1440,16 @@ function applyPayload(payload) {
       hit.body = payload.text !== undefined ? payload.text : { reason: payload.reason ?? "unavailable" };
       state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
     }
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "usage.rollup.result") {
+    state.worker.usage = payload;
+    state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "error"
+    && (payload.code === "usage-unavailable" || payload.reason === "usage-unavailable" || payload.code === "usage.rollup")) {
+    // Older hosts have no usage roll-up wired: scoped to the Usage tab, never the room.
+    state.worker.usage = { unavailable: true };
+    state.roomUi?.updateWorker?.(true);
     return;
   } else if (payload && typeof payload === "object" && payload.op === "error" && payload.code === "busy") {
     return; // our poll raced the host's 1/s throttle — the next tick catches up

@@ -354,3 +354,41 @@ dialog::backdrop {
   overflow-wrap: anywhere;
   margin: 4px 0;
 }
+
+/* Worker activity bar: one row of tab buttons over the shared worker surface. */
+.activity-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.2rem 0 0.5rem;
+}
+.activity-bar button.active {
+  font-weight: 700;
+  border-color: currentColor;
+}
+.recap-view > p:first-of-type {
+  margin-top: 0.4rem;
+}
+#view .worker .recap-view > p,
+#view .worker .usage-view > p {
+  font-weight: 600;
+  margin: 0.5rem 0 0.15rem;
+}
+#view .worker .recap-view > p.muted,
+#view .worker .usage-view > p.muted {
+  font-weight: 400;
+}
+#view .worker table {
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85em;
+  margin: 0.25rem 0 0.6rem;
+}
+#view .worker th,
+#view .worker td {
+  padding: 0.1rem 0.5rem 0.1rem 0;
+  text-align: left;
+}
+#view .worker th {
+  font-weight: 600;
+}
