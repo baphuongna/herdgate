@@ -148,3 +148,26 @@ node experiments/pi-spawn/spawn.mjs close <tên>   # đóng tab/pane con; từ c
 
 Record spawn vẫn còn nên cần lại chỉ là `spawn.mjs restore <tên>` (đúng session one-id).
 Chỉ giữ con sống khi còn job tiếp theo cho nó. Pane/tab của NGƯỜI DÙNG không bao giờ tự đóng.
+
+## Nhánh chính hay worktree? — tránh xung đột trước khi spawn
+
+**Làm trực tiếp nhánh chính (checkout đang mở)** khi thỏa CẢ HAI:
+- Chỉ MỘT người viết tại một thời điểm (controller đơn mình, hoặc các agent có
+  whitelist file RỜI nhau hoàn toàn — ghi rõ whitelist trong prompt giao việc), VÀ
+- Việc nhỏ/vừa, user đang theo dõi và cần commit ngay.
+
+**BẮT BUỘC worktree riêng** khi:
+- ≥2 subagent song song đụng CÙNG module/file (whitelist không tách nổi), HOẶC
+- Việc dài/lớn trong lúc user có thể tự gõ lên repo chính, HOẶC thử nghiệm chưa chắc giữ.
+
+```bash
+herdr worktree create --cwd <repo> --branch hg-<task>          # tạo + mở workspace worktree
+node experiments/pi-spawn/spawn.mjs spawn <tên> --cwd <repo>/../<worktree-dir> --tab
+# con làm + test TRONG worktree (receipt scope theo cwd nên tự tách khỏi journal chính)
+# wake về → controller verify trong worktree → về repo chính: git merge, rồi:
+herdr worktree remove                                            # dọn worktree sau khi merge
+```
+
+Nguyên tắc: whitelist file là lớp 1; worktree là lớp 2 khi lớp 1 không đủ. Không bao giờ
+để hai agent cùng ghi một file ở hai nơi rồi tự hòa giải — merge là việc của controller,
+trên repo chính, sau khi từng con đã settle.
