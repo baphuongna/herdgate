@@ -16,6 +16,7 @@ import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, su
 import { createSshBridge } from "./ssh.mjs";
 import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
 import { searchReceipts, sessionRoots as piSessionRoots } from "./pi-receipt-search.mjs";
+import { herdrRunner, wakeParentOnSettle } from "./pi-wake.mjs";
 import { openWatchStore } from "./pi-receipt-watch.mjs";
 import { JOB_ID, MAX_PENDING, MAX_PROMPT, WORKSPACE_NAME, appendJob, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, workerBase } from "./pi-worker.mjs";
 import { registerPublisher } from "./publisher-tui-lifecycle.mjs";
@@ -398,8 +399,20 @@ async function publisherLoop() {
         lifecycle?.setConnected(true);
         log(`connected to ${url}${loopbackPort ? ` via loopback 127.0.0.1:${loopbackPort}` : ""} (room ${m.roomId}, ${devices.length} device(s))`);
         if (process.env.HERDGATE_PI_RECEIPTS === "1" && !receiptWatch) {
-          receiptWatch = watchReceipts(receiptJournalBase(), pushReceipt);
-          log(`receipts: journal push enabled (${receiptJournalBase()})`);
+          // Settles push to subscribed devices AND wake the parent pane of spawned
+          // children — the controller never holds a watch; alerts arrive as input.
+          const runHerdr = herdrRunner();
+          const wakeParent = wakeParentOnSettle({
+            spawnBase: receiptJournalBase(),
+            run: runHerdr,
+            listPanes: () => { try { return runHerdr("pane", "list").result.panes ?? []; } catch { return []; } },
+            log,
+          });
+          receiptWatch = watchReceipts(receiptJournalBase(), (entry) => {
+            pushReceipt(entry);
+            wakeParent(entry);
+          });
+          log(`receipts: journal push enabled (${receiptJournalBase()}) + parent wake`);
         }
         for (const d of devices) flushWatches(d.id);
         void publish(ws);
