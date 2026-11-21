@@ -44,6 +44,26 @@ thiết bị ──receipt.get──▶ publisher ──▶ receipts.jsonl (như
   scheduler, không listener mạng) và **rpc** (daemon JSONL trên stdio cho chủ host —
   xem dưới). Người chủ tự chạy nó (service/test/SSH) khi muốn.
 
+## Định tuyến nhiều workspace (allowlist, fail-closed)
+
+Mặc định mọi job chạy trong `--workspace` của worker. Chủ host có thể đặt bảng định
+vọng **`workspaces.json`** (0600) trong worker dir:
+
+```json
+{ "v": 1, "workspaces": { "other": "/home/me/source/other-project" } }
+```
+
+Device gửi `worker.submit` kèm `workspace: "other"` (remote.mjs: `--workspace other`)
+— chỉ TÊN, không bao giờ đường dẫn thô. Worker nạp lại allowlist mỗi pass (sửa live
+được): tên hợp lệ → job chạy + ghi receipt trong scope workspace đó; tên lạ →
+`failed/unknown_workspace` chốt ngay ở scope mặc định, không chạy, không gửi lại.
+
+## Chạy daemon như service
+
+`herdgate-pi-worker.service` (cùng thư mục) là template local cho chế độ rpc:
+SIGTERM đi qua graceful path (abort job đang chạy thành receipt `canceled`),
+`--idle-exit 3600` tự thoát khi hết việc.
+
 ## Chế độ rpc (daemon JSONL, bài học jsonl-rpc của Paseo)
 
 ```sh
@@ -74,7 +94,7 @@ daemon: `--idle-exit <giây>` thoát graceful khi hết việc.
 ```sh
 # phía host: publisher đã chạy với HERDGATE_PI_WORKER=1, HERDGATE_PI_WORKER_DIR=...
 node experiments/pi-worker/remote.mjs --gate https://gate.example.com \
-  --device d_act --secret <secret> --submit "brief" [--id <uuid>]
+  --device d_act --secret <secret> --submit "brief" [--id <uuid>] [--workspace <tên>]
 
 # host chạy worker (fixture):
 node experiments/pi-worker/worker.mjs --workspace /path/to/ws --fixture-dir /tmp/fx

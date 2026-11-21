@@ -5,13 +5,16 @@
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 
 export const JOB_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export const MAX_PROMPT = 16 * 1024; // admission bound for one prompt
 export const MAX_PENDING = 100;      // queued + running jobs admitted at once
 export const JOB_STATES = new Set(['queued', 'running', 'replied', 'failed', 'canceled', 'unknown']);
+/** Routing key a device may reference — resolved against the host's allowlist. */
+export const WORKSPACE_NAME = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const JOBS = 'jobs.jsonl';
+const WORKSPACES = 'workspaces.json';
 
 /** Oldest Pi release the experiments are verified against. Newer Pi releases run
  *  without code changes; only a Pi older than this is refused. */
@@ -43,6 +46,30 @@ export function jobsFile(base) {
   return join(base, JOBS);
 }
 
+export function workspacesFile(base) {
+  return join(base, WORKSPACES);
+}
+
+/** Owner-curated routing table: name -> absolute workspace path, 0600, optional.
+ *  A device references a name; the worker resolves it here. No raw paths cross
+ *  the wire, and a name missing from this file fails closed (never runs). */
+export function readWorkspaces(base) {
+  let raw;
+  try { raw = readFileSync(workspacesFile(base), 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT') return new Map(); throw error; }
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch { return new Map(); } // corrupt allowlist routes nothing new
+  const table = parsed?.v === 1 && parsed.workspaces && typeof parsed.workspaces === 'object'
+    ? parsed.workspaces : null;
+  if (!table) return new Map();
+  const out = new Map();
+  for (const [name, path] of Object.entries(table)) {
+    if (WORKSPACE_NAME.test(name) && typeof path === 'string' && isAbsolute(path)) out.set(name, path);
+  }
+  return out;
+}
+
 export function validJob(job) {
   return validJobShape(job) ? job : null;
 }
@@ -52,6 +79,7 @@ function validJobShape(job) {
     && JOB_STATES.has(job.state)
     && typeof job.prompt === 'string' && job.prompt.length <= MAX_PROMPT
     && typeof job.ts === 'number'
+    && (job.workspace === undefined || WORKSPACE_NAME.test(job.workspace))
     && ['sessionId', 'reason', 'requestEntryId', 'responseEntryId'].every(key =>
       job[key] === undefined || typeof job[key] === 'string'));
 }

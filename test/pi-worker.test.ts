@@ -6,7 +6,7 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
-import { appendJob, heartbeatPath, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, scheduledRunId, validJob, versionAtLeast, writeHeartbeat, workerBase, JOB_ID, MIN_PI_VERSION } from '../plugin/server/pi-worker.mjs';
+import { appendJob, heartbeatPath, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, readWorkspaces, scheduledRunId, validJob, versionAtLeast, workspacesFile, writeHeartbeat, workerBase, JOB_ID, MIN_PI_VERSION } from '../plugin/server/pi-worker.mjs';
 import { findReceipt, journalBase, scopeFor } from '../plugin/server/pi-receipts.mjs';
 
 const root = join(import.meta.dirname, '..');
@@ -467,6 +467,76 @@ test('rpc mode: steer injects input into the held turn and the receipt still set
   send({ id: 'x1', op: 'shutdown' });
   const code = await new Promise<number | null>(resolve => child.once('exit', resolve));
   assert.equal(code, 0);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('workspace routing: allowlist names route jobs per-scope, unknown names fail closed', {
+  skip: (!piBin || process.platform !== 'linux') && 'requires TEST_PI_BIN on Linux',
+  timeout: 90_000,
+}, async () => {
+  const pkg = piPackage();
+  assert.ok(pkg, 'resolvable Pi package');
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-ws-'));
+  const defaultWs = join(dir, 'ws-default');
+  const otherWs = join(dir, 'ws-other');
+  const workerDir = join(dir, 'worker');
+  const receiptsDir = join(dir, 'receipts');
+  const fixtureDir = join(dir, 'fixture');
+  mkdirSync(defaultWs, { recursive: true });
+  mkdirSync(otherWs, { recursive: true });
+  mkdirSync(workerDir, { recursive: true });
+  // Owner-curated allowlist: a name a device may reference -> absolute path.
+  writeFileSync(join(workerDir, 'workspaces.json'), JSON.stringify({ v: 1, workspaces: {
+    other: otherWs, 'not-a-name!': '/ignored', dup: '/relative/path' } }), { mode: 0o600 });
+  const file = jobsFile(workerDir);
+  const plain = '00000000-0000-4000-8000-000000000071';
+  const routed = '00000000-0000-4000-8000-000000000072';
+  const stranger = '00000000-0000-4000-8000-000000000073';
+  appendJob(file, { v: 1, id: plain, prompt: 'Default scope request', ts: 1, state: 'queued' });
+  appendJob(file, { v: 1, id: routed, prompt: 'Routed scope request', ts: 2, state: 'queued', workspace: 'other' });
+  appendJob(file, { v: 1, id: stranger, prompt: 'Unroutable request', ts: 3, state: 'queued', workspace: 'nope' });
+
+  const child = spawn(process.execPath, [join(root, 'experiments/pi-worker/worker.mjs'),
+    '--workspace', defaultWs, '--pi', pkg, '--fixture-dir', fixtureDir],
+    { env: { PATH: process.env.PATH, HOME: dir, HERDGATE_PI_WORKER_DIR: workerDir, HERDGATE_PI_RECEIPT_DIR: receiptsDir, PI_TELEMETRY: '0' }, stdio: ['ignore', 'ignore', 'pipe'] });
+  const err: string[] = [];
+  child.stderr?.setEncoding('utf8').on('data', chunk => err.push(chunk));
+  const code = await new Promise<number | null>(resolve => child.once('exit', resolve));
+  assert.equal(code, 0, err.join(''));
+
+  // Each routable job settles in ITS workspace scope; the stranger fails closed
+  // in the default scope without ever reaching the fixture.
+  assert.equal(findReceipt(receiptsDir, plain)?.status, 'replied');
+  assert.equal(findReceipt(receiptsDir, routed)?.status, 'replied');
+  assert.equal(findReceipt(receiptsDir, stranger)?.status, 'failed');
+  assert.equal(findReceipt(receiptsDir, stranger)?.reason, 'unknown_workspace');
+  assert.ok(existsSync(join(receiptsDir, scopeFor(defaultWs), 'receipts.jsonl')));
+  assert.ok(existsSync(join(receiptsDir, scopeFor(otherWs), 'receipts.jsonl')));
+  const raw = readFileSync(join(receiptsDir, scopeFor(otherWs), 'receipts.jsonl'), 'utf8');
+  assert.ok(raw.includes(routed) && !raw.includes(plain), 'the routed scope holds only its own job');
+  const jobs = readJobs(file);
+  assert.equal(jobs.get(plain)?.state, 'replied');
+  assert.equal(jobs.get(routed)?.state, 'replied');
+  assert.equal(jobs.get(stranger)?.state, 'failed');
+  assert.equal(jobs.get(stranger)?.reason, 'unknown_workspace');
+  assert.equal(events(fixtureDir).filter(e => e.event === 'call').length, 2, 'the unroutable job never ran');
+  assert.ok(!raw.includes('Routed scope request') && !raw.includes('Unroutable'), 'receipts stay prompt-free');
+
+  // Shape rules: only allowlisted-style names pass validJob; the reader skips junk rows.
+  assert.equal(validJob({ v: 1, id: plain, prompt: 'x', ts: 1, state: 'queued', workspace: 'Other' }), null);
+  assert.equal(validJob({ v: 1, id: plain, prompt: 'x', ts: 1, state: 'queued', workspace: 'a'.repeat(65) }), null);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('readWorkspaces: corrupt or missing allowlist files route nothing new', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pi-wsfmt-'));
+  assert.equal(readWorkspaces(dir).size, 0, 'no file -> empty map');
+  writeFileSync(workspacesFile(dir), '{corrupt', { mode: 0o600 });
+  assert.equal(readWorkspaces(dir).size, 0, 'corrupt -> empty map');
+  writeFileSync(workspacesFile(dir), JSON.stringify({ v: 1, workspaces: { good: '/abs', 'bad name': '/abs', rel: 'nope' } }), { mode: 0o600 });
+  const table = readWorkspaces(dir);
+  assert.equal(table.size, 1);
+  assert.equal(table.get('good'), '/abs');
   rmSync(dir, { recursive: true, force: true });
 });
 

@@ -16,7 +16,7 @@ import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, su
 import { createSshBridge } from "./ssh.mjs";
 import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
 import { openWatchStore } from "./pi-receipt-watch.mjs";
-import { JOB_ID, MAX_PENDING, MAX_PROMPT, appendJob, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, workerBase } from "./pi-worker.mjs";
+import { JOB_ID, MAX_PENDING, MAX_PROMPT, WORKSPACE_NAME, appendJob, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, workerBase } from "./pi-worker.mjs";
 import { registerPublisher } from "./publisher-tui-lifecycle.mjs";
 import { HostChannel, b64d, b64e, fingerprint, generateKeyPair } from "./e2e.mjs";
 
@@ -523,6 +523,12 @@ async function publisherLoop() {
           if (!prompt.trim() || prompt.length > MAX_PROMPT) {
             return void replyTo({ op: "error", code: "bad-prompt", message: `worker.submit needs a prompt of 1..${MAX_PROMPT} chars` });
           }
+          // Optional routing key: a NAME from the host's workspaces.json allowlist —
+          // never a raw path. Unknown names fail closed on the worker side.
+          const workspaceName = payload.workspace;
+          if (workspaceName !== undefined && (typeof workspaceName !== "string" || !WORKSPACE_NAME.test(workspaceName))) {
+            return void replyTo({ op: "error", code: "bad-workspace", message: "worker.submit workspace must be a short lowercase name" });
+          }
           let jobs;
           try { jobs = readJobs(file); }
           catch (e) {
@@ -540,11 +546,12 @@ async function publisherLoop() {
             return void replyTo({ op: "error", code: "queue-full", message: `worker queue is full (${MAX_PENDING} pending)` });
           }
           const jobId = id || randomUUID();
-          try { appendJob(file, { v: 1, id: jobId, prompt, ts: Date.now(), state: "queued" }); }
+          try { appendJob(file, { v: 1, id: jobId, prompt, ts: Date.now(), state: "queued",
+            ...(workspaceName !== undefined ? { workspace: workspaceName } : {}) }); }
           catch (e) {
             return void replyTo({ op: "error", code: "worker-queue", message: `queue append failed: ${e instanceof Error ? e.message : String(e)}` });
           }
-          log(`worker: ${m.device} submitted ${jobId} (${prompt.length} chars)`);
+          log(`worker: ${m.device} submitted ${jobId} (${prompt.length} chars${workspaceName ? `, ws ${workspaceName}` : ""})`);
           return void replyTo({ op: "worker.submitted", id: jobId, state: "queued", duplicate: false });
         }
         if (op === "view") {

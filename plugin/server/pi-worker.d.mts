@@ -6,6 +6,8 @@ export interface JobRecord {
   prompt: string;
   ts: number;
   state: JobState;
+  /** Routing key resolved against the host's workspaces.json allowlist. */
+  workspace?: string;
   sessionId?: string;
   reason?: string;
   requestEntryId?: string;
@@ -30,6 +32,11 @@ export const MIN_PI_VERSION: string;
 export function versionAtLeast(version: string, min?: string): boolean;
 export function workerBase(env?: Record<string, string | undefined>): string;
 export function jobsFile(base: string): string;
+/** Routing key a device may reference; paths never cross the wire. */
+export const WORKSPACE_NAME: RegExp;
+export function workspacesFile(base: string): string;
+/** Owner-curated name -> absolute workspace path. Missing/corrupt -> empty map. */
+export function readWorkspaces(base: string): Map<string, string>;
 export function validJob(job: unknown): JobRecord | null;
 export function readJobs(file: string): Map<string, JobRecord>;
 export function appendJob(file: string, job: JobRecord): void;

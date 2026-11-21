@@ -75,7 +75,7 @@ if (check) {
 
 const { journalBase, scopeFor, findReceipt } = await import('../../plugin/server/pi-receipts.mjs');
 const { appendReceipt, loadJournal, openScope, writeBody } = await import('../pi-receipt/journal.mjs');
-const { appendJob, jobsFile, readJobs, workerBase } = await import('../../plugin/server/pi-worker.mjs');
+const { appendJob, jobsFile, readJobs, readWorkspaces, workerBase } = await import('../../plugin/server/pi-worker.mjs');
 
 const base = workerBase();
 const file = jobsFile(base);
@@ -119,7 +119,7 @@ function message(model, text) {
   };
 }
 
-async function makeSession() {
+async function makeSession(wsPath) {
   const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false } }, { projectTrusted: false });
   settingsManager.setEnableInstallTelemetry(false);
   const modelRuntime = await ModelRuntime.create({
@@ -165,31 +165,51 @@ async function makeSession() {
   });
   const sessionsDir = join(base, 'sessions');
   mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
-  const sessionManager = SessionManager.create(workspace, sessionsDir);
+  const sessionManager = SessionManager.create(wsPath, sessionsDir);
   const resourceLoader = new DefaultResourceLoader({
-    cwd: workspace, agentDir, settingsManager, noSkills: true, noContextFiles: true,
+    cwd: wsPath, agentDir, settingsManager, noSkills: true, noContextFiles: true,
     noThemes: true, noPromptTemplates: true, noExtensions: true,
   });
   await resourceLoader.reload();
   assert.deepEqual(resourceLoader.getExtensions().errors, []);
   const { session } = await createAgentSession({
-    cwd: workspace, agentDir, settingsManager, modelRuntime,
+    cwd: wsPath, agentDir, settingsManager, modelRuntime,
     model: modelRuntime.getModel('herdgate-worker-fixture', 'fixture'),
     sessionManager, resourceLoader, noTools: 'all',
   });
   return { session, sessionManager };
 }
 
-const receiptsFile = openScope(receiptsBase, workspace);
-let receipts = loadJournal(receiptsFile).receipts;
-function writeReceipt(id, status, sessionId, fields = {}) {
-  receipts = appendReceipt(receiptsFile, receipts,
+// Receipt journals are per-workspace scopes; the default workspace is where jobs
+// without a routing key (and unknown-workspace failures) are journaled.
+const journals = new Map();
+function journalFor(wsPath) {
+  let entry = journals.get(wsPath);
+  if (!entry) {
+    const file = openScope(receiptsBase, wsPath);
+    entry = { file, receipts: loadJournal(file).receipts };
+    journals.set(wsPath, entry);
+  }
+  return entry;
+}
+function writeReceipt(wsPath, id, status, sessionId, fields = {}) {
+  const entry = journalFor(wsPath);
+  entry.receipts = appendReceipt(entry.file, entry.receipts,
     { v: 1, id, status, sessionId, ts: Date.now(), ...fields });
+}
+
+/** Resolve a job's routing key: a name from the host allowlist, else the default.
+ *  A name that is not allowlisted fails closed — the job never runs. */
+function resolveWorkspace(job, allowlist) {
+  if (job.workspace === undefined) return { path: workspace };
+  const path = allowlist.get(job.workspace);
+  return path ? { path } : { error: 'unknown_workspace', name: job.workspace };
 }
 
 // Resume pass: a job left `running` by a dead worker fails closed. It is never resent;
 // if a receipt was journaled before the crash, that verdict stands.
 const initialJobs = readJobs(file);
+const initialAllowlist = readWorkspaces(base);
 for (const job of initialJobs.values()) {
   if (job.state !== 'running') continue;
   const settled = findReceipt(receiptsBase, job.id);
@@ -201,7 +221,8 @@ for (const job of initialJobs.values()) {
     log(`job ${job.id} resumed from journal: ${settled.status}`);
     continue;
   }
-  writeReceipt(job.id, 'unknown', job.sessionId || 'pi-worker', { reason: 'worker_restarted' });
+  const route = resolveWorkspace(job, initialAllowlist);
+  writeReceipt(route.path, job.id, 'unknown', job.sessionId || 'pi-worker', { reason: 'worker_restarted' });
   appendJob(file, { ...job, state: 'unknown', reason: 'worker_restarted' });
   log(`job ${job.id} was running when the previous worker died -> unknown/worker_restarted`);
 }
@@ -213,8 +234,19 @@ let shuttingDown = false; // set by the rpc shutdown paths; stops new jobs mid-p
 const counters = { started: 0, verdicts: { replied: 0, unknown: 0, failed: 0, canceled: 0 } };
 const startedAt = Date.now();
 
-async function runJob(job) {
-  const { session, sessionManager } = await makeSession();
+async function runJob(job, allowlist) {
+  const route = resolveWorkspace(job, allowlist);
+  if (route.error) {
+    // Unknown routing key: fail closed in the default scope. Never run, never resend.
+    const verdict = { status: 'failed', reason: route.error };
+    writeReceipt(workspace, job.id, verdict.status, 'pi-worker', { reason: verdict.reason });
+    appendJob(file, { ...job, state: verdict.status, reason: verdict.reason });
+    counters.verdicts.failed = (counters.verdicts.failed ?? 0) + 1;
+    log(`job ${job.id} -> failed/${route.error} (workspace "${route.name}" not allowlisted)`);
+    return verdict;
+  }
+  const wsPath = route.path;
+  const { session, sessionManager } = await makeSession(wsPath);
   const sessionId = sessionManager.getSessionId();
   appendJob(file, { ...job, state: 'running', sessionId });
   let verdict = { status: 'failed', reason: 'worker_error' };
@@ -265,9 +297,9 @@ async function runJob(job) {
     running = null;
   }
   if (verdict.status === 'replied' && verdict.bodyText && process.env.HERDGATE_PI_RECEIPT_BODY === '1') {
-    try { writeBody(receiptsBase, workspace, job.id, verdict.bodyText); } catch (error) { log(`body archive failed: ${error.message}`); }
+    try { writeBody(receiptsBase, wsPath, job.id, verdict.bodyText); } catch (error) { log(`body archive failed: ${error.message}`); }
   }
-  writeReceipt(job.id, verdict.status, sessionId,
+  writeReceipt(wsPath, job.id, verdict.status, sessionId,
     { ...('reason' in verdict ? { reason: verdict.reason } : {}),
       ...('requestEntryId' in verdict ? { requestEntryId: verdict.requestEntryId } : {}),
       ...('responseEntryId' in verdict ? { responseEntryId: verdict.responseEntryId } : {}),
@@ -287,10 +319,11 @@ async function drainPass() {
   let ran = 0;
   try {
     const jobs = readJobs(file);
+    const allowlist = readWorkspaces(base); // fresh each pass: owner edits route live
     const queued = [...jobs.values()].filter(job => job.state === 'queued').sort((a, b) => a.ts - b.ts);
     for (const job of queued) {
       if (shuttingDown) break; // a shutdown mid-pass must not start the next job
-      await runJob(job); ran += 1;
+      await runJob(job, allowlist); ran += 1;
     }
   } finally {
     passActive = false;
@@ -354,7 +387,7 @@ const ops = {
     return { pid: process.pid, uptimeMs: Date.now() - startedAt, queued,
       running: running?.job.id ?? null, runningSinceMs: running ? Date.now() - startedAt : null,
       busy: passActive, started: counters.started, verdicts: { ...counters.verdicts },
-      scope: scopeFor(workspace), rpc: RPC_VERSION };
+      scope: scopeFor(workspace), workspaces: readWorkspaces(base).size, rpc: RPC_VERSION };
   },
   async drain({ wait } = {}) {
     if (passActive || passPromise) return { started: false, busy: true, current: running?.job.id ?? null };

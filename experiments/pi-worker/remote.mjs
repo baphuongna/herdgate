@@ -20,8 +20,16 @@ const arg = name => {
 const gate = arg('gate').replace(/\/$/, '').replace(/^http/, 'ws');
 const submit = arg('submit');
 const status = arg('status');
+const workspaceFlag = process.argv.indexOf('--workspace');
+const workspaceName = workspaceFlag > 0 ? process.argv[workspaceFlag + 1] : undefined;
+if (workspaceName !== undefined && !/^[a-z0-9][a-z0-9-]{0,63}$/.test(workspaceName)) {
+  console.error('--workspace must be a short lowercase name from the host allowlist');
+  process.exit(2);
+}
 const payload = submit !== undefined
-  ? { op: 'worker.submit', prompt: submit, ...(process.argv.includes('--id') ? { id: arg('id') } : {}) }
+  ? { op: 'worker.submit', prompt: submit,
+      ...(process.argv.includes('--id') ? { id: arg('id') } : {}),
+      ...(workspaceName !== undefined ? { workspace: workspaceName } : {}) }
   : { op: 'worker.status', id: status };
 const ws = new WebSocket(`${gate}/v1/device/ws`, { handshakeTimeout: 8_000 });
 const timer = setTimeout(() => { console.error('remote worker call timed out'); ws.terminate(); process.exit(1); }, 15_000);
