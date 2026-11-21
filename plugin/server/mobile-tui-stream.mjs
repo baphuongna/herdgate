@@ -1,10 +1,12 @@
-// Native Herdr terminal controller. Never grants takeover and never interprets a shell command.
+// Native Herdr terminal controller. Never interprets a shell command. --takeover makes the
+// latest viewer own the stream: Herdr allows one controller per terminal, and this way a
+// reconnect or a second viewer (phone, desktop) replaces the old one instead of failing.
 import { spawn } from "node:child_process";
 
 const maxLine = 1024 * 1024;
 
 export async function openTerminal(bin, id, cols, rows) {
-  const child = spawn(bin, ["terminal", "session", "control", id, "--cols", String(cols), "--rows", String(rows)], {
+  const child = spawn(bin, ["terminal", "session", "control", id, "--takeover", "--cols", String(cols), "--rows", String(rows)], {
     stdio: ["pipe", "pipe", "ignore"], windowsHide: true, shell: false,
   });
   child.on("error", () => child.stdout.destroy());

@@ -27,6 +27,7 @@ case "$1/$2/$3" in
 pane/list/) printf '%s\\n' '{"result":{"panes":[{"pane_id":"w1:p1","terminal_title":"one"},{"pane_id":"w1:p2","terminal_title":"two"}]}}';;
 pane/read/w1:p1) cat "$SCREEN";;
 pane/read/w1:p2) printf 'pane two';;
+pane/get/*) printf '%s\n' '{"result":{"pane":{}}}';;
 *) touch "$WRITES"; exit 9;;
 esac
 `, { mode: 0o700 });
@@ -111,7 +112,7 @@ test("only an interactive adapter delivers Core Send and keys to the selected pa
     writeFileSync(herdr, `#!/bin/sh
 case "$1/$2" in
 pane/list) printf '%s\\n' '{"result":{"panes":[{"pane_id":"w1:p3","terminal_title":"three"},{"pane_id":"w1:p4","terminal_title":"four"}]}}';;
-pane/run|pane/send-keys|pane/send-text) printf '%s|%s|%s|%s\\n' "$2" "$3" "$4" "$#" >> "$INPUT_LOG"; [ "$4" != rejected ]; exit $?;;
+pane/run|pane/send-keys|pane/send-text|pane/close|pane/split) printf '%s|%s|%s|%s\\n' "$2" "$3" "$4" "$#" >> "$INPUT_LOG"; [ "$4" != rejected ]; exit $?;;
 *) exit 9;;
 esac
 `, { mode: 0o700 });
@@ -137,7 +138,10 @@ esac
     assert.equal(missing.error.data.kind, "not_found");
     assert.equal(conditional.error.data.kind, "usage");
     assert.equal(alien.error.data.kind, "forbidden");
-    assert.equal(readFileSync(log, "utf8"), "run|w1:p4|- một tin nhắn|4\nsend-keys|w1:p4|up|4\nsend-keys|w1:p4|ctrl+c|4\nrun|w1:p4|rejected|4\n");
+    // Closing a pane and starting one both reach Herdr; a read-only pairing may do neither.
+    assert.equal(run(false, rpc(10, "terminal.kill", { terminal: address }))[0].error.data.kind, "forbidden");
+    assert.deepEqual(run(true, rpc(10, "terminal.kill", { terminal: address }))[0].result, {});
+    assert.equal(readFileSync(log, "utf8"), "run|w1:p4|- một tin nhắn|4\nsend-keys|w1:p4|up|4\nsend-keys|w1:p4|ctrl+c|4\nrun|w1:p4|rejected|4\nclose|w1:p4||3\n");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -204,8 +208,13 @@ test("desktop layout: the herdr-app doc mirrors TUI workspaces and seats every p
     const herdr = join(dir, "herdr");
     writeFileSync(herdr, `#!/bin/sh
 case "$1/$2" in
-pane/list) printf '%s\\n' '{"result":{"panes":[{"pane_id":"w2:p1","workspace_id":"w2","tab_id":"w2:t1","cwd":"/home/x/app","terminal_title":"app one"},{"pane_id":"w2:p2","workspace_id":"w2","tab_id":"w2:t1","cwd":"/home/x/app","terminal_title":"app two"},{"pane_id":"w3:p9","workspace_id":"w3","tab_id":"w3:t2","cwd":"/home/x/db","terminal_title":"db"},{"pane_id":"w9:pX"}]}}';;
+pane/list) printf '%s\\n' '{"result":{"panes":[{"pane_id":"w2:p1","workspace_id":"w2","tab_id":"w2:t1","cwd":"/home/x/app","terminal_title":"app one"},{"pane_id":"w2:p2","workspace_id":"w2","tab_id":"w2:t1","cwd":"/home/x/app","terminal_title":"app two"},{"pane_id":"w3:p9","workspace_id":"w3","tab_id":"w3:t2","cwd":"/home/x/db","terminal_title":"db"},{"pane_id":"w3:p10","workspace_id":"w3","tab_id":"w3:t2","cwd":"/home/x/db","terminal_title":"db log"},{"pane_id":"w9:pX"}]}}';;
 workspace/list) printf '%s\\n' '{"result":{"workspaces":[{"workspace_id":"w2","label":"app"},{"workspace_id":"w3","label":"database"}]}}';;
+pane/layout) case "$4" in
+  w2:p1) printf '%s\\n' '{"result":{"layout":{"panes":[{"pane_id":"w2:p1","rect":{"x":0,"y":0,"width":60,"height":40}},{"pane_id":"w2:p2","rect":{"x":60,"y":0,"width":40,"height":40}}]}}}';;
+  w3:p9) printf '%s\\n' '{"result":{"layout":{"panes":[{"pane_id":"w3:p9","rect":{"x":0,"y":0,"width":100,"height":24}},{"pane_id":"w3:p10","rect":{"x":0,"y":24,"width":100,"height":16}}]}}}';;
+  *) exit 11;;
+esac;;
 pane/read) printf 'screen\\n';;
 *) exit 9;;
 esac
@@ -222,8 +231,11 @@ esac
       rpc(4, "doc.get", { name: "scratch" }),
       rpc(5, "doc.get", {}),
     );
-    const [one, two, three, loose] = list.result.terminals;
-    assert.equal(list.result.terminals.length, 4);
+    const [one, two, three, ten, loose] = list.result.terminals;
+    assert.equal(list.result.terminals.length, 5);
+    // Pane geometry from `pane layout` reaches the app as real cols/rows.
+    assert.equal(one.cols, 60);
+    assert.equal(one.rows, 40);
     // Seating labels exist only for panes inside a workspace, in the app's id shape.
     assert.match(one.labels["herdr.space"], /^sp[0-9a-f]{30}$/);
     assert.match(one.labels["herdr.tab"], /^tb[0-9a-f]{30}$/);
@@ -238,8 +250,14 @@ esac
     assert.equal(appSpace.id, one.labels["herdr.space"]);
     assert.equal(appSpace.tabs[0].id, one.labels["herdr.tab"]);
     assert.equal(appSpace.tabs[0].root.id, appSpace.tabs[0].id);
+    // The split structure is rebuilt from the panes' rectangles: side-by-side -> row with weights.
+    assert.equal(appSpace.tabs[0].root.type, "row");
     assert.deepEqual(appSpace.tabs[0].root.children.map((c: { content: { terminal: string } }) => c.content.terminal), [one.address, two.address]);
-    assert.deepEqual(dbSpace.tabs[0].root.children.map((c: { content: { terminal: string } }) => c.content.terminal), [three.address]);
+    assert.deepEqual(appSpace.tabs[0].root.children.map((c: { size: { weight: number } }) => c.size.weight), [0.6, 0.4]);
+    // Stacked panes -> column with heights as weights.
+    assert.equal(dbSpace.tabs[0].root.type, "column");
+    assert.deepEqual(dbSpace.tabs[0].root.children.map((c: { content: { terminal: string } }) => c.content.terminal), [three.address, ten.address]);
+    assert.deepEqual(dbSpace.tabs[0].root.children.map((c: { size: { weight: number } }) => c.size.weight), [0.6, 0.4]);
     // Stable across calls, and only herdr-app is served; a nameless doc.get is a usage error.
     assert.deepEqual(again.result.value, value);
     assert.equal(again.result.version, doc.result.version);
