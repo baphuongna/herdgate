@@ -115,6 +115,26 @@ CLI truy vấn ban đầu một lần rồi nghe push, tải text và lưu vào 
 `--wait` để lấy body cho receipt đã chốt. MCP có `herdgate_receipt_body`.
 Nếu chưa có body, trả lý do rõ ràng, không tự đọc pane, transcript hoặc gửi lại.
 
+### Tìm kiếm BM25 toàn bộ journal (`search.mjs`)
+
+Tìm việc cũ theo nội dung — học memex: gõ vài từ khoá (tiếng Việt OK), nhận về receipt id,
+verdict, snippet và đường dẫn session file để restore. Chạy local trên host, đọc đúng
+những file user đã đọc được (journal + body archive + transcript Pi); không gửi đi đâu,
+không mở op mới trên device channel:
+
+```sh
+node experiments/pi-receipt/search.mjs "noise rekey"            # bảng điểm + snippet + restore:
+node experiments/pi-receipt/search.mjs "lỗi nginx" --json --limit 5
+node experiments/pi-receipt/search.mjs "cron bucket" --id        # chỉ in receipt id
+```
+
+Mỗi receipt là một document BM25 (Okapi k1=1.2 b=0.75) ghép từ: body archive
+(`responses/<id>.md`) nếu có → transcript session (user prompt + reply cuối, match
+theo `sessionId`) → token metadata (status/reason/pane/tokens/cost). Kết quả mặc định
+dedupe theo session (một transcript dài không tràn cả trang); `--all` tắt. Tokenizer
+chuẩn hoá NFC nên `khóa`/`khoá` NFD gõ tay vẫn khớp. Test: `node --test
+ test/pi-receipt-search.test.ts` (5 test, gồm CLI e2e).
+
 ### Truy vấn qua Gate (thử nghiệm)
 
 Publisher trả lời frame JSON `receipt.get` từ **thiết bị đã pair** — không cần mở TUI,
