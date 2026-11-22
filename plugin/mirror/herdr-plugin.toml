@@ -1,0 +1,24 @@
+id = "dev.herdgate.mirror"
+name = "herdgate-mirror"
+version = "0.9.41"
+min_herdr_version = "0.9.0"
+description = "Mirror a herdgate room's fleet into this Herdr: a sidebar panel of agents, and per-pane terminal mirrors (typing needs an act grant)."
+platforms = ["linux", "macos", "windows"]
+
+# One pane command per surface — no daemon, no startup hook. The panel and the
+# stream panes are plain processes: q closes, and nothing outlives the pane.
+[[actions]]
+id = "status"
+title = "herdgate-mirror: pairing status"
+command = ["node", "server/index.mjs", "status"]
+
+[[actions]]
+id = "pair"
+title = "herdgate-mirror: pair this Herdr to a room"
+command = ["node", "server/index.mjs", "pair"]
+
+[[panes]]
+id = "fleet"
+title = "herdgate mirror"
+placement = "split"
+command = ["node", "server/index.mjs", "pane"]

@@ -31,6 +31,7 @@ import { HostChannel, b64d, b64e, fingerprint, generateKeyPair } from "./e2e.mjs
 
 const D = dirs();
 const execFile = promisify(execFileCb);
+const run = execFile; // term.send/term.keys: argv arrays, never a shell
 /** diff.get ships at most 128 KiB of `git show` output, marked truncated beyond. */
 const MAX_DIFF_BYTES = 128 * 1024;
 const MAX_FILE_ENTRIES = 5000; // file.tree cap — the fuzzy finder ranks within this
@@ -902,6 +903,66 @@ async function publisherLoop() {
             return void replyTo({ op: "term.read", target, ansi });
           } catch (e) {
             return void replyTo({ op: "error", code: "herdr", message: `read failed: ${e instanceof Error ? e.message : String(e)}` });
+          }
+        }
+        if (op === "fleet.detail") {
+          // READ-ONLY fleet detail for mirrors (the sidebar phase): per-agent rows
+          // plus the pane index — richer than the pushed `view` summary, still a
+          // single throttled herdr read. No secrets, no session paths.
+          const now = Date.now();
+          const last = termThrottle.get(`fleet:${m.device}`) ?? 0;
+          if (now - last < 2_000) return void replyTo({ op: "error", code: "busy", message: "fleet.detail is throttled (1/2s)" });
+          termThrottle.set(`fleet:${m.device}`, now);
+          try {
+            const [snap, panes] = await Promise.all([herdrSnapshot(D.herdrBin), herdrPanes(D.herdrBin)]);
+            const agents = (Array.isArray(snap?.agents) ? snap.agents : [])
+              .filter((a) => a && typeof a.agent === "string")
+              .slice(0, 50)
+              .map((a) => ({
+                agent: String(a.agent).slice(0, 32),
+                status: typeof a.agent_status === "string" ? a.agent_status.slice(0, 16) : "unknown",
+                pane: typeof a.pane_id === "string" ? a.pane_id : "",
+                title: typeof a.terminal_title_stripped === "string" ? a.terminal_title_stripped.slice(0, 96) : "",
+                cwd: typeof a.cwd === "string" ? a.cwd.slice(0, 96) : "",
+              }));
+            return void replyTo({ op: "fleet.detail.result", takenAt: new Date().toISOString(),
+              herdr: snap ? `${snap.version ?? "?"} (protocol ${snap.protocol ?? "?"})` : "?",
+              agents, panes });
+          } catch (e) {
+            return void replyTo({ op: "error", code: "herdr", message: `snapshot failed: ${e instanceof Error ? e.message : String(e)}` });
+          }
+        }
+        if (op === "term.send" || op === "term.keys") {
+          // ACT — the typing lane for mirrors. Text goes through `herdr pane
+          // send-text` (argv array, no shell), keys through `herdr pane send-keys`;
+          // both only after the device holds an act grant from the owner.
+          if (devices.find((d) => d.id === m.device)?.scope !== "act") {
+            return void replyTo({ op: "error", code: "requires-act", message: `${op} needs an act device` });
+          }
+          const target = typeof payload.target === "string" ? payload.target : "";
+          if (!/^[A-Za-z0-9_:.-]{1,64}$/.test(target)) {
+            return void replyTo({ op: "error", code: "bad-target", message: `${op} needs a pane id` });
+          }
+          const argv = ["pane"];
+          if (op === "term.send") {
+            const text = typeof payload.text === "string" ? payload.text : "";
+            if (!text || text.length > 4096) {
+              return void replyTo({ op: "error", code: "bad-text", message: "term.send needs text of 1..4096 chars" });
+            }
+            argv.push("send-text", target, text);
+          } else {
+            const keys = Array.isArray(payload.keys) ? payload.keys : [];
+            if (!keys.length || keys.length > 8 || !keys.every((k) => typeof k === "string" && /^[A-Za-z0-9_-]{1,16}$/.test(k))) {
+              return void replyTo({ op: "error", code: "bad-keys", message: "term.keys needs 1..8 keys (Enter, Tab, C-c, …)" });
+            }
+            argv.push("send-keys", target, ...keys);
+          }
+          try {
+            await run(D.herdrBin, argv, { timeout: 8_000 });
+            log(`term: ${m.device} ${op} ${target}${op === "term.send" ? ` (${String(payload.text).length} chars)` : ` ${payload.keys.join(" ")}`}`);
+            return void replyTo({ op: op === "term.send" ? "term.sent" : "term.keyed", target });
+          } catch (e) {
+            return void replyTo({ op: "error", code: "herdr", message: `${op} failed: ${e instanceof Error ? e.message : String(e)}` });
           }
         }
         if (op === "diff.get") {

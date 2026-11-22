@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import test from "node:test";
 
@@ -30,4 +30,21 @@ test("npm files list covers plugin/server", () => {
   const pkg = JSON.parse(readFileSync(join(import.meta.dirname, "..", "package.json"), "utf8"));
   const shipped = pkg.files.join("\n");
   assert.match(shipped, /plugin\/server\/\*\.mjs/);
+});
+
+// The mirror plugin ships its own manifest and server — same self-containment
+// rule, same coverage check. Nothing under plugin/mirror reaches outside.
+test("plugin/mirror is self-contained and shipped", () => {
+  const pkg = JSON.parse(readFileSync(join(import.meta.dirname, "..", "package.json"), "utf8"));
+  assert.match(pkg.files.join("\n"), /plugin\/mirror\/herdr-plugin\.toml/);
+  assert.match(pkg.files.join("\n"), /plugin\/mirror\/server\/\*\.mjs/);
+  const mirrorDir = join(import.meta.dirname, "..", "plugin", "mirror", "server");
+  for (const f of readdirSync(mirrorDir).filter((n) => n.endsWith(".mjs"))) {
+    const src = readFileSync(join(mirrorDir, f), "utf8");
+    for (const m of src.matchAll(/from "(\.[^"]+)"/g)) {
+      const target = join(mirrorDir, m[1]);
+      assert.ok(existsSync(target), `plugin/mirror/server/${f} imports ${m[1]} — must be a shipped sibling`);
+    }
+    assert.ok(!/from "(\.\.\/){2,}/.test(src), `plugin/mirror/server/${f} must not reach outside plugin/mirror`);
+  }
 });
