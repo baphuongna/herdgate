@@ -4,7 +4,7 @@ Nguồn đã đọc: collie `push.ts` (154) + `push-decision.ts` (70) + `self-up
 
 ---
 
-## PHẦN 5 — Push & self-update
+## PHẦN 5 — Push & self-update — ✅ DONE c5b8cdf+00b3076 (RFC 8291, decision table, VAPID rotation, x-hg-build hysteresis; gate nhà đã bật push)
 
 ### Kiến trúc gốc (collie)
 - **push.ts**: máy trạng thái availability (`unsupported|insecure|server-off|denied|ready`) + preference per-device (`collie:push-disabled`); **keysMatch** — subscription bị buộc cứng với VAPID key sinh ra nó; khi bridge xoay keypair, mọi push về subscription cũ CHẾT IM LẶNG → detect lệch key → unsubscribe + subscribe lại. Server tự prune endpoint 410.
@@ -32,7 +32,7 @@ Nguồn đã đọc: collie `push.ts` (154) + `push-decision.ts` (70) + `self-up
 
 ---
 
-## PHẦN 6 — Review diff (herdr-reviewr)
+## PHẦN 6 — Review diff (herdr-reviewr) — ✅ DONE 9cc5e33 (291 test; turn-anchor = git-anchors journal bên ngoài repo, KHÔNG refs/reviewr — receipts không có commit hash như dự đoán)
 
 ### Kiến trúc gốc (đáng học từng điểm)
 - **3 tab**: Changes / All files / **PR** (đọc qua `gh`, không bao giờ post). **3 scope**: `u` uncommitted / `b` branch / **`t` last turn** — diff của ĐÚNG lượt agent vừa làm (cần herdr).
@@ -62,7 +62,8 @@ Nguồn đã đọc: collie `push.ts` (154) + `push-decision.ts` (70) + `self-up
 
 ---
 
-## PHẦN 7 — File viewer + deep-link (herdr-file-viewer)
+## PHẦN 7 — ✅ DONE 4a79ec9+c3397ba (file.tree/file.read + fuzzy.js + tab Files; cap 128KiB + wire-budget; git-safe allowlist subcommand) —
+ File viewer + deep-link (herdr-file-viewer)
 
 ### Kiến trúc gốc (24 module — những cái đáng học)
 - **Đọc-only tuyệt đối**: mọi git subcommand read-only; editor = hand-off process; annotation chỉ in-memory; copy qua OSC 52.
