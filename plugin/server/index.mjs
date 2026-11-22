@@ -34,6 +34,7 @@ const execFile = promisify(execFileCb);
 const run = execFile; // term.send/term.keys: argv arrays, never a shell
 /** diff.get ships at most 128 KiB of `git show` output, marked truncated beyond. */
 const MAX_DIFF_BYTES = 128 * 1024;
+const MAX_PANES = 200; // pane-carrying replies (term.list, fleet.detail) — a tab storm must not push the reply past the gate's 256KiB frame cap
 const MAX_FILE_ENTRIES = 5000; // file.tree cap — the fuzzy finder ranks within this
 const MAX_FILE_BYTES = 128 * 1024; // file.read cap — same class as diffs, and well under the gate's 256KiB frame limit
 const MAX_REVIEW_FILES = 5000; // review.files entries cap (one screen's worth of scrolling)
@@ -882,8 +883,9 @@ async function publisherLoop() {
           if (now - last < 1_000) return void replyTo({ op: "error", code: "busy", message: "term.list is throttled (1/s)" });
           termThrottle.set(`list:${m.device}`, now);
           try {
-            const panes = await herdrPanes(D.herdrBin);
-            return void replyTo({ op: "term.list", panes });
+            const all = await herdrPanes(D.herdrBin);
+            const capped = all.length > MAX_PANES;
+            return void replyTo({ op: "term.list", panes: capped ? all.slice(0, MAX_PANES) : all, panesCapped: capped, total: all.length });
           } catch (e) {
             return void replyTo({ op: "error", code: "herdr", message: `pane list failed: ${e instanceof Error ? e.message : String(e)}` });
           }
@@ -914,7 +916,7 @@ async function publisherLoop() {
           if (now - last < 2_000) return void replyTo({ op: "error", code: "busy", message: "fleet.detail is throttled (1/2s)" });
           termThrottle.set(`fleet:${m.device}`, now);
           try {
-            const [snap, panes] = await Promise.all([herdrSnapshot(D.herdrBin), herdrPanes(D.herdrBin)]);
+            const [snap, allPanes] = await Promise.all([herdrSnapshot(D.herdrBin), herdrPanes(D.herdrBin)]);
             const agents = (Array.isArray(snap?.agents) ? snap.agents : [])
               .filter((a) => a && typeof a.agent === "string")
               .slice(0, 50)
@@ -925,9 +927,11 @@ async function publisherLoop() {
                 title: typeof a.terminal_title_stripped === "string" ? a.terminal_title_stripped.slice(0, 96) : "",
                 cwd: typeof a.cwd === "string" ? a.cwd.slice(0, 96) : "",
               }));
+            const panesCapped = allPanes.length > MAX_PANES;
+            const panes = panesCapped ? allPanes.slice(0, MAX_PANES) : allPanes;
             return void replyTo({ op: "fleet.detail.result", takenAt: new Date().toISOString(),
               herdr: snap ? `${snap.version ?? "?"} (protocol ${snap.protocol ?? "?"})` : "?",
-              agents, panes });
+              agents, panes, panesCapped, total: allPanes.length });
           } catch (e) {
             return void replyTo({ op: "error", code: "herdr", message: `snapshot failed: ${e instanceof Error ? e.message : String(e)}` });
           }

@@ -151,3 +151,102 @@ test("publisher: term.list and term.read answer, throttle, and refuse junk targe
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/** A tab storm must not kill the publisher's own socket: both pane-carrying
+ *  replies are capped well under the gate's 256KiB frame limit. */
+function fakeHerdrManyPanes(dir: string): string {
+  const p = join(dir, "herdr-many");
+  const snap = { id: "cli:api:snapshot", result: { snapshot: { version: "0.9.5", protocol: 22, workspaces: [], agents: [] } } };
+  const many = { id: "cli:pane:list", result: { panes: Array.from({ length: 301 }, (_, i) => ({ pane_id: `w${i}:p1`, workspace_id: `w${i}`, cwd: `/src/${i}`, terminal_title_stripped: `pane ${i}` })) } };
+  writeFileSync(p, `#!/bin/sh
+case "$1 $2" in
+  "api snapshot") cat <<'JSON'
+${JSON.stringify(snap)}
+JSON
+;;
+  "pane list") cat <<'JSON'
+${JSON.stringify(many)}
+JSON
+;;
+esac
+`, { mode: 0o755 });
+  return p;
+}
+
+test("publisher: pane-carrying replies are capped (a tab storm must not exceed the frame budget)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "herdgate-termcap-"));
+  const server = createServer();
+  const wss = new WebSocketServer({ noServer: true });
+  const fromHost: Recv[] = [];
+  server.on("upgrade", (req, sock, head) => wss.handleUpgrade(req, sock, head, (ws) => {
+    ws.on("message", (d) => {
+      const m = JSON.parse(String(d)) as Recv;
+      if (m.t === "hello") {
+        ws.send(JSON.stringify({ v: 1, t: "hello", roomId: "r", devices: [{ id: "d1", name: "phone", scope: "read" }] }));
+        return;
+      }
+      if (m.t === "frame" && m.device === "d1") fromHost.push(m.payload as Recv);
+    });
+  }));
+  await new Promise<void>((res) => server.listen(0, "127.0.0.1", res));
+  const port = (server.address() as { port: number }).port;
+
+  const configDir = join(dir, "config");
+  const stateDir = join(dir, "state");
+  mkdirSync(configDir, { recursive: true });
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(join(configDir, "herdgate.env"), `HERDGATE_URL=http://127.0.0.1:${port}\nHERDGATE_ROOM_TOKEN=rt\n`);
+  const child = spawn(process.execPath, [INDEX, "serve"], {
+    env: {
+      ...process.env,
+      HERDR_ENV: "1",
+      HERDR_PLUGIN_ID: "dev.herdgate.host",
+      HERDR_PLUGIN_CONFIG_DIR: configDir,
+      HERDR_PLUGIN_STATE_DIR: stateDir,
+      HERDR_BIN_PATH: fakeHerdrManyPanes(dir),
+      HERDGATE_SETTINGS: join(dir, "settings.json"),
+      HERDGATE_PUBLISHER_CHILD: "1",
+    },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (d: Buffer) => (stderr += d));
+
+  const waitOp = async (op: string, since = 0, timeoutMs = 10_000): Promise<Recv> => {
+    const deadline = performance.now() + timeoutMs;
+    while (performance.now() < deadline) {
+      const hit = fromHost.slice(since).find((p) => p.op === op);
+      if (hit) return hit;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    throw new Error(`no ${op} reply; stderr: ${stderr.slice(0, 400)}`);
+  };
+  const sendOp = (payload: Recv) => wss.clients.forEach((c) => c.send(JSON.stringify({ v: 1, t: "frame", device: "d1", payload })));
+  try {
+    await new Promise<void>((res, rej) => {
+      const t = setTimeout(() => rej(new Error("publisher did not connect")), 10_000);
+      const tick = setInterval(() => {
+        if (fromHost.length) { clearTimeout(t); clearInterval(tick); res(); }
+      }, 50);
+      child.stderr.on("data", () => {});
+    });
+    sendOp({ op: "term.list" });
+    const list = (await waitOp("term.list")) as unknown as { panes: unknown[]; panesCapped?: boolean; total?: number };
+    assert.equal(list.panes.length, 200, "term.list caps the pane index");
+    assert.equal(list.panesCapped, true, "and says so");
+    assert.equal(list.total, 301);
+    assert.ok(JSON.stringify(list).length < 100_000, "the reply stays far under the 256KiB frame budget");
+
+    await new Promise((r) => setTimeout(r, 2_100)); // fleet.detail throttles 1/2s per device — separate budget
+    sendOp({ op: "fleet.detail" });
+    const fleet = (await waitOp("fleet.detail.result")) as unknown as { panes: unknown[]; panesCapped?: boolean; total?: number };
+    assert.equal(fleet.panes.length, 200, "fleet.detail caps the pane index too");
+    assert.equal(fleet.panesCapped, true);
+    assert.equal(fleet.total, 301);
+  } finally {
+    child.kill("SIGKILL");
+    await new Promise<void>((res) => server.close(() => res()));
+    wss.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
