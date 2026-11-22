@@ -274,6 +274,7 @@ dialog::backdrop {
 
 .row {
   display: flex;
+  flex-wrap: wrap; /* a receipt detail expansion wraps under its row */
   gap: 10px;
 }
 .row button {
@@ -520,6 +521,46 @@ dialog::backdrop {
   border-radius: 10px;
   padding: 8px 12px;
   margin: 6px 0;
+}
+/* Receipt detail (receipt.enrich): the expansion under a tapped receipt row —
+   transcript facts, two columns on mobile: label left, value right. */
+.receipt-detail {
+  flex: 1 1 100%;
+  margin-top: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 14px;
+  font-size: 13px;
+}
+.receipt-detail dt {
+  color: var(--muted);
+}
+.receipt-detail dd {
+  margin: 0;
+  justify-self: end;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.receipt-detail .error {
+  margin: 0;
+}
+/* Context fill bar — only rendered when a real window cap is known. */
+.receipt-detail .ctxbar {
+  grid-column: 1 / -1;
+  height: 6px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--fg) 12%, transparent);
+  overflow: hidden;
+}
+.receipt-detail .ctxbar i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
 }
 /* `path:line` links inside a chat bubble jump into the Diff view. */
 .msg .pathline {

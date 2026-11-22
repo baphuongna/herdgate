@@ -159,7 +159,7 @@ const state = {
   termBody: null,
   termPre: null,
   retry: 0,
-  worker: { health: null, jobs: new Map(), error: null, search: null, searchError: null, tab: "jobs", usage: null, chatError: null, bodyError: null, draft: null },
+  worker: { health: null, jobs: new Map(), error: null, search: null, searchError: null, tab: "jobs", usage: null, chatError: null, bodyError: null, draft: null, enrich: null },
   diff: null,
   chat: { filter: null, spawn: null },
 };
@@ -547,6 +547,39 @@ const usageClock = (ts) => {
     : "";
 };
 
+// ---- receipt.enrich: the detail panel under a receipt row ---------------------
+// Transcript facts for one receipt (model · context · turns · usage · last
+// activity). The context bar only renders when a real window cap is known —
+// the host never sends one and we do not invent thresholds, so
+// CONTEXT_WINDOW_MAX stays null and the tokens render bare.
+const CONTEXT_WINDOW_MAX = null;
+
+/** 12345 -> "12,345" without betting the runtime on ICU locale data. */
+const fmtTokens = (n) => (Number.isFinite(n) && n >= 0 ? String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",") : null);
+
+/** Context fill % against a known cap; null without one (never a guessed bar). */
+function contextPctOf(tokens, max = CONTEXT_WINDOW_MAX) {
+  if (!Number.isFinite(tokens) || !(tokens >= 0) || !Number.isFinite(max) || !(max > 0)) return null;
+  return Math.min(100, Math.max(0, Math.round((tokens / max) * 100)));
+}
+
+/** receipt.enrich.result → the panel's display rows (string-or-null; null hides). */
+function enrichRows(result) {
+  const r = result && typeof result === "object" ? result : {};
+  const ctx = Number.isFinite(r.contextTokens) ? r.contextTokens : null;
+  const pct = contextPctOf(ctx);
+  const u = r.usageTotal && typeof r.usageTotal === "object" ? r.usageTotal : {};
+  const usageTokens = fmtTokens(u.totalTokens);
+  return {
+    model: typeof r.model === "string" && r.model ? r.model : null,
+    context: ctx !== null ? `${fmtTokens(ctx)} tokens${pct !== null ? ` · ${pct}%` : ""}` : null,
+    contextPct: pct,
+    turns: Number.isFinite(r.turns) ? String(r.turns) : null,
+    usage: usageTokens !== null ? `${usageTokens} tokens${Number.isFinite(u.costUsd) ? ` · ${usageUsd(u.costUsd)}` : ""}` : null,
+    last: Number.isFinite(r.lastTs) ? usageClock(r.lastTs) : null,
+  };
+}
+
 function renderWorkerRecap(box, w) {
   box.replaceChildren();
   const buckets = new Map(RECAP_GROUPS.map((group) => [group.key, []]));
@@ -568,6 +601,7 @@ function renderWorkerRecap(box, w) {
       const span = document.createElement("span");
       span.textContent = `${job.id.slice(0, 8)} · ${job.status}${job.reason ? ` (${job.reason})` : ""}`;
       row.append(span, glyphNode(job));
+      attachReceiptDetail(row, job.id);
       list.append(row);
     }
     box.append(head, list);
@@ -874,6 +908,93 @@ function fetchReceiptBody(id) {
         applyBodyResult(p); // a refusal is also an answer (report not available)
       }
     });
+}
+
+/** Receipt enrich behind the fence: transcript facts for the row's detail
+ *  panel. A host refusal is also an answer — its message shows verbatim
+ *  ("no readable transcript…" is data, not a bug to swallow); a transport
+ *  fault keeps the shared never-blank banner instead of closing the panel. */
+const ENRICH_ERR_CODES = new Set(["receipt.enrich", "pi_receipts_disabled"]);
+
+function fetchReceiptEnrich(id) {
+  state.worker.enrich = { id, loading: true, error: null, result: null };
+  const online = () => Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online);
+  const gen = currentGeneration();
+  opFetch("receipt.enrich", "receipt.enrich.result", { id }, { key: `enrich:${id}`, errCodes: ENRICH_ERR_CODES })
+    .then((p) => {
+      if (!generationCurrent(gen)) return;
+      if (faultOf(p) === "superseded") return;
+      const cur = state.worker.enrich;
+      if (!cur || cur.id !== id) return; // another receipt owns the detail now
+      if (isTransportFault(p)) {
+        state.worker.enrich = { id, loading: false, error: p.message, result: null };
+      } else if (p.op === "error") {
+        state.worker.enrich = { id, loading: false, error: p.message ?? p.code ?? "receipt.enrich bị từ chối", result: null };
+      } else if (typeof p.reason === "string") {
+        state.worker.enrich = { id, loading: false, error: `receipt enrich không khả dụng (${p.reason})`, result: null };
+      } else {
+        state.worker.enrich = { id, loading: false, error: null, result: p };
+      }
+      state.roomUi?.updateWorker?.(online());
+    });
+  state.roomUi?.updateWorker?.(online());
+}
+
+/** Tap a receipt row → toggle its detail; opening one closes any other. */
+function toggleReceiptEnrich(id) {
+  if (state.worker.enrich?.id === id) state.worker.enrich = null;
+  else fetchReceiptEnrich(id);
+}
+
+/** The detail expansion itself: loading line, verbatim refusal, or the facts. */
+function receiptDetailNode(id) {
+  const box = document.createElement("div");
+  box.className = "receipt-detail";
+  const e = state.worker.enrich;
+  if (!e || e.id !== id) return box; // closed — the row stays a row
+  if (e.loading) {
+    box.append(note("đang tải chi tiết phiên…"));
+    return box;
+  }
+  if (e.error) {
+    box.append(note(e.error, "error")); // the host's words, kept visible
+    return box;
+  }
+  const rows = enrichRows(e.result);
+  const dl = document.createElement("dl");
+  const add = (label, value) => {
+    if (value === null || value === undefined || value === "") return;
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    dl.append(dt, dd);
+  };
+  add("model", rows.model);
+  add("context", rows.context);
+  add("turns", rows.turns);
+  add("usage", rows.usage);
+  add("last", rows.last);
+  box.append(dl);
+  if (rows.contextPct !== null) { // only with a real cap — never a guessed bar
+    const bar = document.createElement("div");
+    bar.className = "ctxbar";
+    const fill = document.createElement("i");
+    fill.style.width = `${rows.contextPct}%`;
+    bar.append(fill);
+    box.append(bar);
+  }
+  return box;
+}
+
+/** A receipt row opens its detail on tap — anywhere except its own buttons. */
+function attachReceiptDetail(row, id) {
+  row.addEventListener("click", (event) => {
+    if (event.target instanceof Element && event.target.closest("button")) return;
+    toggleReceiptEnrich(id);
+    state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
+  });
+  row.append(receiptDetailNode(id));
 }
 
 /** Fold a receipt.body answer back into the job row and the search hit that asked. */
@@ -1350,6 +1471,7 @@ function renderWorkerBox(box) {
             });
             row.append(" ", ack);
           }
+          attachReceiptDetail(row, hit.id);
           searchHits.append(row);
         }
       } else {
@@ -1401,6 +1523,7 @@ function renderWorkerBox(box) {
         });
         row.append(" ", ack);
       }
+      attachReceiptDetail(row, job.id);
       jobs.append(row);
     }
     renderWorkerRecap(recap, w);
@@ -2631,6 +2754,7 @@ function resetRoomView() {
   state.worker.chatError = null;
   state.worker.searchError = null;
   state.worker.bodyError = null;
+  state.worker.enrich = null;
   state.openWorkerTab = null;
   newGeneration(); // a new mount: replies answering the old generation are dropped
   $("view").replaceChildren();
@@ -2737,7 +2861,15 @@ if ("serviceWorker" in navigator && location.protocol !== "file:") {
         chatError: state.worker.chatError ?? null,
         filter: state.chat.filter ?? null,
       }),
+      enrichSnap: () => {
+        const e = state.worker.enrich;
+        return e ? { id: e.id, loading: e.loading, error: e.error ?? null, result: e.result ?? null } : null;
+      },
+      enrichToggle: (id) => toggleReceiptEnrich(id),
+      enrichRows: (result) => JSON.parse(JSON.stringify(enrichRows(result))),
+      contextPctOf: (tokens, max) => contextPctOf(tokens, max),
       probe: {
+        detail: (id) => receiptDetailNode(id),
         thread: (job) => chatThread(job),
         subagent: (name, extra = {}) => subagentCard({
           principal: `spawn:${name}`, requests: 1, replied: 1, failed: 0,
