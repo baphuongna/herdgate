@@ -23,7 +23,7 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { findSpawn, recordSelf, recordSpawn, readSpawns, spawnBase, spawnsFile, updateSpawn } from './registry.mjs';
+import { findSpawn, readSpawnsTolerant, recordSelf, recordSpawn, spawnBase, spawnsFile, updateSpawn } from './registry.mjs';
 import { findReceipt } from '../../plugin/server/pi-receipts.mjs';
 import { patchSpawn, readAllSpawns } from '../../plugin/server/pi-wake.mjs';
 
@@ -45,9 +45,11 @@ function myBinding() {
   return { myPane: mine?.pane_id ?? null, parentSessionId, panes };
 }
 
+const sessionFromFile = (file) =>
+  typeof file === 'string' ? (file.match(/([0-9a-f-]{36})\.jsonl$/)?.[1] ?? null) : null;
+
 function bindingOf(panes, paneId) {
-  const file = panes.find(p => p.pane_id === paneId)?.agent_session?.value;
-  return file ? (file.match(/([0-9a-f-]{36})\.jsonl$/)?.[1] ?? null) : null;
+  return sessionFromFile(panes.find(p => p.pane_id === paneId)?.agent_session?.value);
 }
 
 const fail = (message) => { console.error(message); process.exit(1); };
@@ -131,9 +133,9 @@ if (command === 'spawn') {
   console.log(JSON.stringify({ ...entry, registered: 'self' }));
 } else if (command === 'arm') {
   if (!arg) fail('usage: arm <name-or-id> [--body]');
-  const entry = findSpawn(spawnBase(), arg);
-  if (!entry) fail(`no spawn record for ${arg}`);
   const { panes } = myBinding();
+  const entry = findSpawn(spawnBase(), arg, panes.map(p => p.pane_id));
+  if (!entry) fail(`no spawn record for ${arg}`);
   if (!panes.some(p => p.pane_id === entry.paneId)) fail(`pane ${entry.paneId} is gone — restore first`);
   const wantBody = process.argv.includes('--body');
   const agent = run('agent', 'get', entry.paneId).result.agent;
@@ -161,7 +163,7 @@ if (command === 'spawn') {
     marker: `[herdr-request:${entry.id}]`, retainBody: wantBody }));
 } else if (command === 'list') {
   const { panes } = myBinding();
-  const rows = readSpawns(spawnsFile(spawnBase())).map(e => ({
+  const rows = readSpawnsTolerant(spawnsFile(spawnBase())).map(e => ({
     name: e.name, id: e.id, pane: e.paneId ?? null, status: e.status,
     live: e.paneId ? (panes.some(p => p.pane_id === e.paneId) ? 'attached' : 'gone') : (e.self ? 'self' : 'gone'),
     receipt: findReceipt(spawnBase(), e.id)?.status ?? 'none',
@@ -169,14 +171,21 @@ if (command === 'spawn') {
   }));
   console.log(JSON.stringify(rows, null, 2));
 } else if (command === 'close') {
-  // The parent owns its children's lifecycle: after a settle is handled and no
-  // further job is planned, close the child — tabs must not accumulate. The
-  // registry record survives (restore reopens the same one-id session), and a
-  // working child is refused: its wake has not arrived yet.
+  // The parent owns its children's lifecycle — but retire stays 3 explicit
+  // layers (the entwurf control-retire shape), never "best effort":
+  // (a) the operator names the target: no role, timer or idle-heuristic closes
+  //     a child implicitly, and the registry record survives for `restore`;
+  // (b) preflight refuses a busy child BY NAME — working/blocked means the
+  //     wake has not arrived yet;
+  // (c) a leaf generation check at accept-time: the record's sessionId must
+  //     still be the session herdr reports on that pane. A mismatch means the
+  //     pane was REUSED — closing it would kill a stranger's agent. ONE
+  //     attempt, no retry: a reused pane is not re-queried into an excuse to
+  //     close. The closedBy marker records the generation that was verified.
   if (!arg) fail('usage: close <name-or-id>');
-  const entry = findSpawn(spawnBase(), arg);
-  if (!entry) fail(`no spawn record for ${arg}`);
   const { panes } = myBinding();
+  const entry = findSpawn(spawnBase(), arg, panes.map(p => p.pane_id));
+  if (!entry) fail(`no spawn record for ${arg}`);
   const pane = panes.find(p => p.pane_id === entry.paneId);
   if (!pane) {
     console.log(JSON.stringify({ id: entry.id, name: entry.name, closed: null, reason: 'already_gone',
@@ -184,19 +193,26 @@ if (command === 'spawn') {
     process.exit(0);
   }
   const agent = run('agent', 'get', entry.paneId).result.agent;
-  if (agent?.agent_status === 'working') fail(`agent is working — wait for its wake, then close`);
+  if (agent?.agent_status === 'working' || agent?.agent_status === 'blocked')
+    fail(`agent is ${agent.agent_status} — wait for its wake, then close`);
+  const generation = sessionFromFile(agent?.agent_session?.value ?? pane?.agent_session?.value);
+  if (generation !== entry.sessionId)
+    fail(`generation mismatch: pane ${entry.paneId} now runs ${generation ?? 'no known session'}, not ${entry.sessionId} — the pane was reused, refusing to close it (restore by id instead)`);
   const kind = entry.tab && pane.tab_id ? 'tab' : 'pane';
   const target = kind === 'tab' ? pane.tab_id : entry.paneId;
   // Mark BEFORE the pane closes: an intentional close must never read as a
   // death — the publisher's death watch skips records closedBy their parent.
-  const marked = patchSpawn(spawnBase(), entry.id, { closedBy: 'parent', closedAt: Date.now() });
+  // closedGeneration carries the session id the close was verified against.
+  const marked = patchSpawn(spawnBase(), entry.id,
+    { closedBy: 'parent', closedAt: Date.now(), closedGeneration: generation });
   run(kind === 'tab' ? 'tab' : 'pane', 'close', target);
   console.log(JSON.stringify({ id: entry.id, name: entry.name, closed: target, kind,
-    closedBy: marked ? 'parent' : null,
+    closedBy: marked ? 'parent' : null, generation,
     restore: `node experiments/pi-spawn/spawn.mjs restore ${entry.name}` }));
 } else if (command === 'restore') {
   if (!arg) fail('usage: restore <name-or-id>');
-  const entry = findSpawn(spawnBase(), arg);
+  const { panes } = myBinding();
+  const entry = findSpawn(spawnBase(), arg, panes.map(p => p.pane_id));
   if (!entry) fail(`no spawn record for ${arg}`);
   let opened;
   try { opened = openRestorePane(entry); }
