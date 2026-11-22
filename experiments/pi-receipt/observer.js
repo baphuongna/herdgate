@@ -19,6 +19,11 @@ const TTL_MS = Number(process.env.HERDGATE_PI_ARM_TTL_MS) > 0
 const MAX_SUFFIX = 256;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const STATUSES = new Set(['replied', 'failed', 'canceled', 'unknown']);
+// Machine-readable reason→code map (mobrel ApiError discipline): `pi_error` and
+// `pi_length` come from the provider's stopReason; the arm TTL expiring is a
+// job timeout. Every other reason (runtime_changed, competing_input, …) is a
+// host-local lifecycle string, not a provider error — no error field at all.
+const ERROR_CODES = { pi_error: 'pi_error', pi_length: 'pi_length', expired: 'job_timeout' };
 const METADATA = new Set(['model_change', 'thinking_level_change', 'usage', 'custom', 'label', 'session_info']);
 
 // Consumption numbers are legitimate receipt metadata (Paseo surfaces per-turn
@@ -178,7 +183,22 @@ export default function observer(pi) {
     // transcript omits the count; the timestamp falls back to the settle
     // itself (which is real activity), never to a guess.
     const activity = sessionFile ? countTurnsFromSession(sessionFile) : null;
+    // Delivery (chat.md useDelivery.ts — transport-vs-app flag, host side): the
+    // marked prompt appended to this session IS the host acknowledgement, so an
+    // observed requestEntryId means `delivered`; without it nothing was verified
+    // — `unverified`, never a guessed `stalled` (only the sending transport can
+    // observe a stall).
+    const delivery = requestEntryId !== undefined ? 'delivered' : 'unverified';
+    // Phase (mobrel failure taxonomy, coordinator.go:884 + socket_api.go:157):
+    // requestEntryId is the dispatch boundary. A definite outcome (replied,
+    // failed, canceled) settles; `unknown` after dispatch keeps the outcome
+    // open (`dispatch`); failing before the request was ever observed never
+    // reached the provider — retry-safe `failed_before_dispatch`.
+    const phase = status !== 'unknown' ? 'settled'
+      : requestEntryId !== undefined ? 'dispatch' : 'failed_before_dispatch';
+    const code = ERROR_CODES[fields.reason];
     const entry = { v: 1, id, status, ...(requestEntryId ? { requestEntryId } : {}), sessionId: session, ts: Date.now(), ...(paneId ? { paneId } : {}), ...(principal ? { principal } : {}), ...(title ? { title } : {}), ...fields,
+      delivery, phase, ...(code ? { error: { code } } : {}),
       ...(activity ? { turns: activity.turns } : {}), lastActivityAt: activity?.lastActivityAt ?? Date.now() };
     const receipt = { id, status, ...(requestEntryId ? { requestEntryId } : {}), ...fields };
     active = undefined;
@@ -264,7 +284,9 @@ export default function observer(pi) {
       // Title stays out of the slash command's answer: notifications keep the
       // old metadata-only shape; the journal and host-local search own the title.
       // The activity counters follow the same rule — journal fields, not UI noise.
-      const { v, ts, sessionId: _session, paneId: _pane, title: _title, turns: _turns, lastActivityAt: _lastActivityAt, ...receipt } = stored;
+      // v2 journal fields (delivery, phase, error) are journal-only too: the
+      // notification answers what happened, never the diagnostics payload.
+      const { v, ts, sessionId: _session, paneId: _pane, title: _title, turns: _turns, lastActivityAt: _lastActivityAt, delivery: _delivery, phase: _phase, error: _error, ...receipt } = stored;
       notify(ctx, { id, ...receipt });
     },
   });

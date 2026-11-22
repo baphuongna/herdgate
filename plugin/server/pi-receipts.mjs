@@ -65,6 +65,43 @@ export function deriveTitle(promptText) {
   return '';
 }
 
+// Send-path delivery (chat.md useDelivery.ts:120-220 — the transport-vs-app
+// flag, seen from the host side): `delivered` = the host acknowledged the
+// prompt, `stalled` = the transport reported a stall after the host saw it,
+// `unverified` = sent with no acknowledgement. Only the sending transport can
+// observe a stall; the journal writer records what IT observed.
+export const DELIVERY = new Set(['delivered', 'stalled', 'unverified']);
+// Failure phase (mobrel coordinator.go:884 + socket_api.go:157 — "how many
+// bytes reached the socket" as the boundary): `failed_before_dispatch` = the
+// fail happened before the request reached the provider (retry-safe
+// knowledge), `dispatch` = dispatched with the outcome still unknown,
+// `settled` = a final outcome (replied, failed, canceled).
+export const PHASE = new Set(['dispatch', 'settled', 'failed_before_dispatch']);
+// A machine-readable error is bounded like mobrel's ApiError (protocol.go:324):
+// code ≤64 chars, ≤8 args, each string ≤256, total JSON ≤1024. Free-text
+// diagnostics never qualify — without a mappable code there is no error field.
+const ERROR_CODE = /^[a-z][a-z0-9_]{0,63}$/;
+const ERROR_ARGS_MAX = 8;
+const ERROR_STRING_MAX = 256;
+const ERROR_JSON_MAX = 1024;
+
+export function validError(error) {
+  if (!error || typeof error !== 'object' || Array.isArray(error)) return false;
+  if (Object.keys(error).some(key => key !== 'code' && key !== 'args')) return false;
+  if (typeof error.code !== 'string' || !ERROR_CODE.test(error.code)) return false;
+  if (error.args !== undefined) {
+    if (typeof error.args !== 'object' || error.args === null || Array.isArray(error.args)) return false;
+    const keys = Object.keys(error.args);
+    if (keys.length > ERROR_ARGS_MAX) return false;
+    if (!keys.every(key => {
+      const value = error.args[key];
+      return typeof value === 'string' ? value.length <= ERROR_STRING_MAX
+        : typeof value === 'number' ? Number.isFinite(value) : typeof value === 'boolean';
+    })) return false;
+  }
+  return JSON.stringify(error).length <= ERROR_JSON_MAX;
+}
+
 export function validEntry(entry) {
   return validEntryShape(entry) ? entry : null;
 }
@@ -79,6 +116,9 @@ function validEntryShape(entry) {
       && Object.keys(entry.usage).every(key => ['totalTokens', 'costUsd', 'durationMs'].includes(key))
       && Object.values(entry.usage).every(value => Number.isFinite(value)))
     && (entry.principal === undefined || PRINCIPAL.test(entry.principal)))
+    && (entry.delivery === undefined || DELIVERY.has(entry.delivery))
+    && (entry.phase === undefined || PHASE.has(entry.phase))
+    && (entry.error === undefined || validError(entry.error))
     && (entry.title === undefined || validTitle(entry.title))
     && (entry.turns === undefined || (typeof entry.turns === 'number' && Number.isInteger(entry.turns) && entry.turns >= 0))
     && (entry.lastActivityAt === undefined || (typeof entry.lastActivityAt === 'number' && Number.isFinite(entry.lastActivityAt))));
@@ -129,8 +169,14 @@ export function findReceipt(base, id) {
  *  no conversation content — so they pass through whenever the entry has them. */
 export function publicReceipt(entry, { withTitle = false } = {}) {
   if (!entry) return { status: 'unknown', reason: 'not_retained_in_runtime' };
-  const { v, ts, sessionId, paneId, title, ...rest } = entry;
-  return withTitle && title !== undefined ? { ...rest, title } : rest;
+  const { v, ts, sessionId, paneId, title, error, ...rest } = entry;
+  // `error` is host-side diagnostics and never leaves the host; devices get
+  // the delivery/phase metadata instead. Legacy journals predate both fields:
+  // a responseEntryId is itself a delivery proof, so it maps to `delivered` —
+  // anything else stays absent rather than guessed.
+  const shown = withTitle && title !== undefined ? { ...rest, title } : { ...rest };
+  if (shown.delivery === undefined && entry.responseEntryId !== undefined) shown.delivery = 'delivered';
+  return shown;
 }
 
 /** True when the receipt has not seen activity for longer than staleAfterMs.
@@ -182,8 +228,10 @@ export function findBody(base, id) {
 
 /**
  * Watch every workspace journal under base and hand each NEW settle to onEntry
- * (unseen id, or a newer ts for a known id). The first scan is a baseline and
- * emits nothing, so a restarting publisher does not replay old receipts.
+ * (unseen id, or a newer ts for a known id). Two copies of one id inside a
+ * single sweep collapse to its newest copy — one emit, never two. The first
+ * scan is a baseline and emits nothing, so a restarting publisher does not
+ * replay old receipts.
  * fs.watch (recursive where supported) gives low latency; a slow interval sweep
  * covers missed events and platforms without recursive watch. A missing base
  * directory just means the next sweep retries. Never throws to the caller.
@@ -199,15 +247,25 @@ export function watchReceipts(base, onEntry, { intervalMs = 4000 } = {}) {
     let scopes = [];
     try { scopes = readdirSync(base).filter(name => /^[0-9a-f]{16}$/.test(name)); }
     catch { /* base not created yet */ }
+    // Mailbox newer-of-two (usage.md refresh.rs:326-344 provider_snapshot_for_display):
+    // one sweep can observe two copies of the same id — an event writer and a
+    // poll writer racing on one mailbox. Gather everything from every scope,
+    // order by (id, ts), and keep only each id's newest copy, so a single sweep
+    // emits an id at most once and always the newest copy, never both.
+    const rows = [];
     for (const name of scopes) {
       let entries;
       try { entries = readJournal(join(base, name, RECEIPTS)); } catch { continue; }
-      for (const entry of entries) {
-        const prior = seen.get(entry.id);
-        if (prior !== undefined && prior >= entry.ts) continue;
-        seen.set(entry.id, entry.ts);
-        if (emit) { try { onEntry(entry); } catch { /* listener errors must not kill the sweep */ } }
-      }
+      rows.push(...entries);
+    }
+    rows.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : a.ts - b.ts));
+    const newest = rows.filter((entry, i) => i + 1 === rows.length || rows[i + 1].id !== entry.id);
+    newest.sort((a, b) => a.ts - b.ts || (a.id < b.id ? -1 : 1));
+    for (const entry of newest) {
+      const prior = seen.get(entry.id);
+      if (prior !== undefined && prior >= entry.ts) continue;
+      seen.set(entry.id, entry.ts);
+      if (emit) { try { onEntry(entry); } catch { /* listener errors must not kill the sweep */ } }
     }
   };
   const ensureWatcher = () => {
