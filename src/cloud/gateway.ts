@@ -1040,7 +1040,11 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
           })
         : Promise.resolve(null);
 
-      void sshPromise.then((h) => {
+      // Resolve the Cloud only once the sshd has bound (or cleanly failed):
+      // a caller reading cloud.ssh?.port right after `await startCloud` used to
+      // race the bind, fall back to port 22 in ssh2's defaults, and flake with
+      // ECONNREFUSED under load (ssh.test.ts publickey, seen ~1/3 full runs).
+      sshPromise.then((h) => {
         sshd = h;
         resolve({
         server,
