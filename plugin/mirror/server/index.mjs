@@ -83,6 +83,7 @@ function deviceWs(cfg, { onFrame, onOpen, onClose }) {
     }, intervalMs);
     if (askTimer.unref) askTimer.unref();
     ws._ask = ask;
+    ws._close = () => { try { ws.close(); } catch { /* already gone */ } };
     return ws;
   });
 }
@@ -128,53 +129,46 @@ async function cmdPane(once) {
   const cfg = readConfig();
   if (!cfg.url || !cfg.device || !cfg.secret) {
     paint([`${NAME}: chưa pair — chạy action "pair" trước (HERDGATE_MIRROR_URL + HERDGATE_MIRROR_ROOM + token).`, "", "q đóng"]);
-    await keyToClose();
-    return;
+    keyToClose();
+    await new Promise(() => {}); // a TTY pane waits for q; --once callers use the timeout
   }
-  let fleet = null;
-  let takenAt = 0;
-  let error = null;
+  const view = { fleet: null, takenAt: 0, error: null };
   let closed = false;
-  const stdin = keyToClose(() => { closed = true; }, (k) => { if (k === "r") wsAsk(); });
-  let askNow = null;
-  function wsAsk() { askNow?.(); }
-  let stopped = false;
-  while (!closed && !stopped) {
-    stopped = true;
+  const askNow = { fn: null };
+  const stdin = keyToClose(() => { closed = true; }, (k) => { if (k === "r") askNow.fn?.(); });
+  const paintNow = () => paint(drawFleet(view.fleet, { room: cfg.roomId, ageMs: view.takenAt ? Date.now() - view.takenAt : null, error: view.error }));
+  while (!closed) {
     await new Promise((resolve) => {
-      let wsClosed = false;
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
       const ws = deviceWs(cfg, {
-        onOpen: () => { error = null; askNow = () => ws?._ask?.(); setTimeout(() => ws?._ask?.(), 100); },
+        onOpen: () => { askNow.fn = () => { try { ws._ask?.(); } catch {} }; },
         onFrame: (payload) => {
           if (payload.op === "fleet.detail.result") {
-            fleet = sanitizeFleet(payload);
-            takenAt = Date.now();
-            error = null;
-          } else if (payload.op === "error" && payload.code === "busy") {
-            // throttled — the next interval tick asks again
-          } else if (payload.op === "error") {
-            error = payload.message ?? payload.code;
+            view.fleet = sanitizeFleet(payload);
+            view.takenAt = Date.now();
+            view.error = null;
+          } else if (payload.op === "error" && payload.code !== "busy") {
+            view.error = payload.message ?? payload.code;
           }
-          if (!closed && !once) paint(drawFleet(fleet, { room: cfg.roomId, ageMs: takenAt ? Date.now() - takenAt : null, error }));
+          if (once && (payload.op === "fleet.detail.result" || payload.op === "error")) {
+            try { ws._close?.(); } catch { /* already gone */ }
+            finish();
+          } else if (!closed && !once) {
+            paintNow();
+          }
         },
-        onClose: () => { wsClosed = true; },
+        onClose: finish,
       });
-      const watch = setInterval(() => {
-        if (closed) { clearInterval(watch); try { /* ws closes below */ } catch {} resolve(); }
-        if (wsClosed) { clearInterval(watch); resolve(); }
-      }, 200);
-      if (watch.unref) watch.unref();
+      if (once) { const t = setTimeout(finish, 8_000); if (t.unref) t.unref(); }
     });
-    if (closed) break;
-    if (once) break;
-    error = error ?? "mất kết nối gate — thử lại sau 3s";
-    paint(drawFleet(fleet, { room: cfg.roomId, ageMs: takenAt ? Date.now() - takenAt : null, error }));
-    await sleep(3000);
+    if (closed || once) break;
+    view.error = view.error ?? "mất kết nối gate — thử lại sau 3s";
+    paintNow();
+    await sleep(3_000);
   }
-  if (once) {
-    paint(drawFleet(fleet, { room: cfg.roomId, ageMs: takenAt ? Date.now() - takenAt : null, error: fleet ? null : (error ?? "chưa có dữ liệu") }));
-  }
-  stdin?.stop?.();
+  paintNow();
+  stdin.stop?.();
 }
 
 /** `stream <paneId>` — mirror one remote pane: poll term.read, repaint, and

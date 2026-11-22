@@ -83,12 +83,17 @@ export async function herdrPanes(bin, timeoutMs = 8_000) {
 
 /** One pane's screen as ANSI text — the PWA renders the colors itself. */
 export async function herdrRead(bin, target, lines = 40, timeoutMs = 8_000) {
-  const { stdout } = await run(
-    bin,
-    ["agent", "read", String(target), "--source", "visible", "--lines", String(lines), "--format", "ansi"],
-    { timeout: timeoutMs, maxBuffer: 8 << 20 },
-  );
-  return stdout;
+  // Agent panes read through `agent read`; plain terminal panes answer
+  // `agent_not_found` and belong to `pane read` — same flags, same formats.
+  const argv = (sub) => [sub, "read", String(target), "--source", "visible", "--lines", String(lines), "--format", "ansi"];
+  try {
+    const { stdout } = await run(bin, argv("agent"), { timeout: timeoutMs, maxBuffer: 8 << 20 });
+    return stdout;
+  } catch (e) {
+    if (!/agent_not_found|not found/i.test(`${e?.message ?? ""}${e?.stderr ?? ""}`)) throw e;
+    const { stdout } = await run(bin, argv("pane"), { timeout: timeoutMs, maxBuffer: 8 << 20 });
+    return stdout;
+  }
 }
 
 export function summarize(snap) {

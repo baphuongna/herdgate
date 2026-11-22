@@ -14,6 +14,7 @@ import { performance } from 'node:perf_hooks';
 import { startCloud } from '../src/cloud/gateway.ts';
 import { State } from '../src/cloud/stores.ts';
 import { DeviceSock } from './util2.ts';
+import { herdrRead } from '../plugin/server/common.mjs';
 import { PredEcho, CONFIRM_THRESHOLD, ECHO_TIMEOUT_MS, MAX_PENDING, looksFullScreen } from '../plugin/mirror/server/predict.mjs';
 import { drawFleet, sanitizeFleet } from '../plugin/mirror/server/panel.mjs';
 
@@ -207,4 +208,35 @@ test('fleet panel: pure renderer, wire shapes sanitized', () => {
   const errLines = drawFleet(null, { room: 'r', error: 'gate mất kết nối' });
   assert.match(errLines[1], /gate mất kết nối/);
   assert.match(errLines[2], /q đóng/);
+});
+
+test('herdrRead: agent panes via agent read, plain panes fall back to pane read', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hg-read-'));
+  try {
+    const stub = join(dir, 'herdr.sh');
+    writeFileSync(stub, [
+      '#!/bin/sh',
+      'if [ "$1" = "agent" ]; then',
+      '  printf \'{"error":{"code":"agent_not_found","message":"agent target not found"}}\' >&2',
+      '  exit 1',
+      'fi',
+      'printf \'PLAIN-PANE-SCREEN\\n\'',
+      '',
+    ].join('\n'));
+    chmodSync(stub, 0o755);
+    const out = await herdrRead(stub, 'w9:p2', 40, 5_000);
+    assert.match(out, /PLAIN-PANE-SCREEN/);
+    // A real agent-pane error (not agent_not_found) must NOT fall back.
+    const stub2 = join(dir, 'herdr2.sh');
+    writeFileSync(stub2, [
+      '#!/bin/sh',
+      'if [ "$1" = "agent" ]; then printf \'{"error":{"code":"pane_busy"}}\' >&2; exit 1; fi',
+      'printf \'SHOULD-NOT-RUN\\n\'',
+      '',
+    ].join('\n'));
+    chmodSync(stub2, 0o755);
+    await assert.rejects(() => herdrRead(stub2, 'w1:p1', 40, 5_000), /pane_busy/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
