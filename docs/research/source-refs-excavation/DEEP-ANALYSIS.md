@@ -90,7 +90,9 @@ Nguồn đã đọc: collie `push.ts` (154) + `push-decision.ts` (70) + `self-up
 
 ---
 
-## PHẦN 8 — Mirror plugin (herdr-mirror)
+## PHẦN 8 — Mirror plugin (herdr-mirror) — 🟡 PHASE 1+2 done 335a544+6d8052d (297 test)
+✅ fleet.detail op (read) · term.send/term.keys typing lane (act, argv không shell) · plugin/mirror (pair/status/pane/stream) · predict.mjs (threshold 2 + RTT grace 150ms mới, timeout 1200, cap 32) · herdrRead fallback pane read · live: panel fleet thật + stream ANSI thật từ room home.
+⬜ Còn: reconcile workspace `🏠 <room>` tự động qua plugin.pane.open (đang gọi tay stream), act-pair UX trong TUI, typing live-chưa-thử với act thật (HERDGATE_MIRROR_TYPE=1).
 
 ### Kiến trúc gốc
 - 1 binary, 2 mặt: **daemon** (control plane — reconcile remote workspaces thành local mirror workspaces `<host>: <name>`, đẩy agent status vào sidebar) + **1 process `pane` mỗi mirror pane** (data plane — stream terminal remote).
