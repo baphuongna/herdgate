@@ -7,10 +7,12 @@
 // with its pane. Failures (blocked parent, gone pane, herdr down) log and drop
 // — a missed wake is recoverable from the journal, a crash is not.
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { readSpawns } from '../../experiments/pi-spawn/registry.mjs';
 import { findReceipt } from './pi-receipts.mjs';
+
+const note = (line) => console.error(`herdgate pi-wake: ${line}`);
 
 const SCOPE = /^[0-9a-f]{16}$/;
 /** A receipt that proves the child finished speaking — anything else is silence.
@@ -78,9 +80,17 @@ export function wakeFrame(entry, spawn) {
  *  context ever adopts, and everyone swears nothing arrived. Waiting for the
  *  agent revision to hold steady across two probes proves the turn truly
  *  closed; the injected text then submits against the live leaf. */
-export function deliverToParent({ spawn, line, label, run, listPanes, agentState, agentProbe, onDelivered,
+export function deliverToParent({ spawn, line, label, run, listPanes, agentState, agentProbe, onDelivered, generation,
     log = () => {}, retryDelayMs = () => new Promise(r => setTimeout(r, 3000)), settleDelayMs = () => new Promise(r => setTimeout(r, 2000)), maxWaitMs = 15 * 60 * 1000 }) {
-  const deliver = (pane, waited) => {
+  const deliver = (pane, waited, seenRevision) => {
+    // Generation drift (herdr-sesh requestID, adapted): the caller captured the
+    // parent's revision at fire time; if the parent turned while we waited for
+    // a quiet moment the token no longer matches — but a wake is NOT a UI
+    // refresh, dropping it is unrecoverable, so the frame still goes and the
+    // drift is logged for the trail.
+    if (generation != null && seenRevision != null && seenRevision !== generation) {
+      log(`wake: parent pane ${pane} revision drifted ${generation}->${seenRevision} while waiting — delivering anyway (child ${spawn.name} ${label})`);
+    }
     try {
       // pane run TYPES into the parent's terminal — the same live-branch path
       // as /herdgate-arm markers. herdr agent prompt submits through the
@@ -140,7 +150,7 @@ export function deliverToParent({ spawn, line, label, run, listPanes, agentState
       let again = null;
       try { again = agentProbe(pane); } catch { again = null; }
       if (again && again.status !== 'working' && again.status !== 'blocked' && again.revision === probe.revision) {
-        return deliver(pane, Date.now() - started);
+        return deliver(pane, Date.now() - started, again.revision);
       }
       if (Date.now() - started >= maxWaitMs) {
         return log(`wake: parent pane ${pane} never quieted (${state}→${again?.status ?? '?'}, rev ${probe.revision}→${again?.revision ?? '?'}) — dropped wake for ${spawn.name}`);
@@ -190,6 +200,47 @@ export function wakeParentOnDeath({ run, listPanes, agentState, agentProbe, log 
   };
 }
 
+/** Stamp+byte-verified persistence — herdcats follower.rs:483-488 applied to
+ *  writes instead of tailing: tmp+rename, then read the file BACK and compare
+ *  every byte, taking a stat stamp before AND after the read so a read racing
+ *  another rewrite is detected rather than trusted (mtime/size alone lie — a
+ *  same-length rewrite is invisible to them). A miss rewrites exactly ONCE;
+ *  a second miss logs and gives up — never throws: bookkeeping must not kill
+ *  a wake. `readback` is the host-trait seam (herdr-sidebar FakeRefresh
+ *  style): tests inject lying reads to prove the retry; production always
+ *  reads the real file. */
+export function writeFileVerified(file, bytes, { log = note, readback = null } = {}) {
+  const data = Buffer.isBuffer(bytes) ? bytes : Buffer.from(String(bytes), 'utf8');
+  const stampOf = (st) => (st ? `${st.dev ?? 0}:${st.ino ?? 0}:${st.size}:${st.mtimeMs}` : null);
+  const realReadback = (path) => {
+    try {
+      const before = stampOf(statSync(path));
+      const back = readFileSync(path);
+      const after = stampOf(statSync(path));
+      return before && after && before === after ? back : null; // moved under us: not trustworthy
+    } catch { return null; }
+  };
+  const verify = (path, attempt) => (readback ? readback(path, attempt) : realReadback(path));
+  const attempt = (n) => {
+    try {
+      mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+      const tmp = `${file}.tmp`;
+      writeFileSync(tmp, data, { mode: 0o600 });
+      rmSync(file, { force: true });
+      renameSync(tmp, file);
+    } catch (error) {
+      log(`verified write #${n} failed for ${file}: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+    const back = verify(file, n);
+    return back !== null && back.length === data.length && back.equals(data);
+  };
+  if (attempt(1)) return true;
+  if (attempt(2)) return true; // hụt → ghi lại đúng một lần, rồi đọc lại lần nữa
+  log(`verified write still mismatches for ${file} after one retry — giving up (not fatal)`);
+  return false;
+}
+
 /** Patch one spawn record inside the scope file that actually holds it. The
  *  registry's own updateSpawn patches only the caller's cwd scope — the
  *  publisher daemon sits elsewhere, so deaths are marked wherever the record
@@ -204,11 +255,9 @@ export function patchSpawn(base, id, patch) {
     if (!entries.some(entry => entry.id === id)) continue;
     let updated = null;
     const next = entries.map(entry => entry.id === id ? (updated = { ...entry, ...patch }) : entry);
-    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-    const tmp = `${file}.tmp`;
-    writeFileSync(tmp, next.map(entry => JSON.stringify(entry)).join('\n') + '\n', { mode: 0o600 });
-    rmSync(file, { force: true });
-    renameSync(tmp, file);
+    // Stamp+byte-verified: the mark (died/closedBy) is what keeps ONE frame per
+    // child — a write that silently misses would re-fire wakes forever.
+    if (!writeFileVerified(file, `${next.map(entry => JSON.stringify(entry)).join('\n')}\n`)) return null;
     return updated;
   }
   return null;

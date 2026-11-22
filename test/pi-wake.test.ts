@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { execFile as execFileCb } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { deathFrame, paneForSession, parentOf, readAllSpawns, scanSpawnDeaths, wakeFrame, wakeParentOnSettle, watchSpawnDeaths } from '../plugin/server/pi-wake.mjs';
+import { deathFrame, paneForSession, parentOf, readAllSpawns, scanSpawnDeaths, wakeFrame, wakeParentOnSettle, watchSpawnDeaths, writeFileVerified } from '../plugin/server/pi-wake.mjs';
 import { readSpawns } from '../experiments/pi-spawn/registry.mjs';
 import { scopeFor, watchReceipts } from '../plugin/server/pi-receipts.mjs';
 
@@ -481,4 +481,14 @@ else if (cmd === 'agent' && sub === 'get') console.log(JSON.stringify({ result: 
     (error: NodeJS.ErrnoException & { stderr?: string }) => error.code === 1 && /no arm ack/i.test(error.stderr ?? ''),
     'a missing ack must fail loudly');
   assert.ok(Date.now() - t0 < 5_000, 'the test timeout flag is honored');
+});
+
+test('writeFileVerified lands exact bytes via tmp+rename and leaves no tmp behind', () => {
+  const dir = root();
+  const file = join(dir, 'nested', 'sidecar.json');
+  assert.equal(writeFileVerified(file, '{"a":1}\n'), true, 'a fresh write verifies against the real read-back');
+  assert.equal(readFileSync(file, 'utf8'), '{"a":1}\n');
+  assert.equal(writeFileVerified(file, '{"a":2}\n'), true, 'the overwrite path re-verifies too');
+  assert.equal(readFileSync(file, 'utf8'), '{"a":2}\n');
+  assert.deepEqual(readdirSync(join(dir, 'nested')).filter(n => n.endsWith('.tmp')), [], 'no tmp litter survives the rename');
 });
