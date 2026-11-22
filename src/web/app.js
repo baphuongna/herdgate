@@ -2913,7 +2913,10 @@ if ("serviceWorker" in navigator) {
 
 render();
 roomFromHash();
-if (state.token) connect();
+if (state.token) {
+  connect();
+  void subscribePush(); // upgrade an existing subscription (keys, VAPID rotation check)
+}
 
 // A phone that wakes up should not show a dead screen.
 document.addEventListener("visibilitychange", () => {
