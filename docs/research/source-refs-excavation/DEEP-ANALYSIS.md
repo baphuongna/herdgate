@@ -90,9 +90,13 @@ Nguồn đã đọc: collie `push.ts` (154) + `push-decision.ts` (70) + `self-up
 
 ---
 
-## PHẦN 8 — Mirror plugin (herdr-mirror) — 🟡 PHASE 1+2 done 335a544+6d8052d (297 test)
-✅ fleet.detail op (read) · term.send/term.keys typing lane (act, argv không shell) · plugin/mirror (pair/status/pane/stream) · predict.mjs (threshold 2 + RTT grace 150ms mới, timeout 1200, cap 32) · herdrRead fallback pane read · live: panel fleet thật + stream ANSI thật từ room home.
-⬜ Còn: reconcile workspace `🏠 <room>` tự động qua plugin.pane.open (đang gọi tay stream), act-pair UX trong TUI, typing live-chưa-thử với act thật (HERDGATE_MIRROR_TYPE=1).
+## PHẦN 8 — Mirror plugin (herdr-mirror) — ✅ DONE 335a544+6d8052d+b5c20ce (299 test)
+✅ fleet.detail (read) · term.send/term.keys (act, argv không shell) · plugin/mirror: pair/status/pane (fleet sidebar)/stream/watch.
+✅ predict.mjs (threshold 2, RTT grace 150ms, timeout 1200, cap 32 — echo mặc định OFF đến khi màn hình xác nhận 2 lần).
+✅ watch reconcile: workspace 🏠 <room> + tab M:<paneId> per remote pane (agent panes trước, cap 6, tab lạ không đụng), watch --stop dọn sạch.
+✅ herdrRead fallback pane read (PWA term.read cũng đọc được pane thường).
+✅ LIVE đầy đủ trên gate thật: panel fleet · stream ANSI 6 tab · reconcile idempotent · TYPING ACT THẬT (echo MIRROR-TYPING-OK-7f3a gõ từ mirror qua gate, output hiện trên pane remote thật).
+Ghi chú vận hành: watch gửi lệnh stream bằng pane.send_text (tab shell không có env plugin); api-bridge = 1 request/process; HERDGATE_MIRROR_TYPE=1 + scope act mới cho gõ.
 
 ### Kiến trúc gốc
 - 1 binary, 2 mặt: **daemon** (control plane — reconcile remote workspaces thành local mirror workspaces `<host>: <name>`, đẩy agent status vào sidebar) + **1 process `pane` mỗi mirror pane** (data plane — stream terminal remote).
