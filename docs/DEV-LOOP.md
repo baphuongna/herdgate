@@ -57,7 +57,8 @@
 |------|------|---------|------------|--------------------|
 | C1 | 2026-11-22 | ✅ xong — v0.9.43 + hotfix v0.9.44 | `f4a86ad` (feat) → tag v0.9.43 → fix staged package.json → tag v0.9.44 | Suite 303/0 (7 test mới/mở rộng). Live: home+laptop roster host.version 0.9.44 thật; laptop update 2 lần qua drive (`herdgate update` — tự học: `herdgate setup update` không tồn tại, chết an toàn ở check). Bug sống bắt thêm: staged release thiếu package.json → pkgVersion "unknown" → fix + test. askFleetOnce retry khi busy (throttle 1/2s đụng thật giữa pane và startup). Probe 5 device đã revoke |
 | C2 | 2026-11-23 | ✅ xong — v0.9.45 | feat echo + tag v0.9.45 | Suite 306/0 (4 test mới). **Live evidence**: scratch pane + tmux + device act tạm qua gate thật — header `off 0/2 → 1/2 → on` sau 2 batch gõ, lệnh gõ chạy thật trên pane gốc; dọn sạch sau (tmux, tab, revoke, temp cfg). Cốt lõi: flush hỏi frame ngay trong throttle 1/s (AskScheduler) + grace 900ms cho kiến trúc poll — grace LAN 150ms của port khiến echo không bao giờ bật được qua WAN |
-| C3 | 2026-11-23 | 🔄 STRIDE pass surface mới | — | spec đang viết |
+| C3 | 2026-11-23 | ✅ xong — review + fix F1, v0.9.46 | review `e034a54` + fix + tag v0.9.46 | STRIDE pass surface mới (docs/reviews/2026-11-23-c3-stride.md): **F1 Medium** — term.list/fleet.detail trả panes không giới hạn → tab storm ~2500 pane tự giết socket publisher (cùng lớp bug Part 7) → **fix cap 200 + {panesCapped,total}** (suite 307/0, test tab-storm 301 pane); F2/F3 Low ghi nhận chấp nhận; F4 (pane.focus không match `wG:p1`) → backlog C4. Live: home publisher restart nạp cap, fleet.detail probe xanh rồi revoke sạch; laptop 0.9.46 |
+| C4 | kế tiếp | 🔄 cadence thích ứng + pane.focus cho pane id chữ | — | mở đầu lượt sau: idle backoff view 5s, regex pane.focus mở rộng, sysmon chờ pid |
 
 ### Bài học C1 (nuôi vòng sau)
 - Drive laptop: lệnh đúng là `herdgate update` (không phải `setup update`); flow transaction của setup-tui chết an toàn ở bước `check` trước khi đụng publisher — đã chứng minh trên máy thật.
@@ -67,3 +68,7 @@
 ### Bài học C2
 - Port desktop sang kiến trúc poll phải soát lại mọi hằng số thời gian: grace 150ms tính cho RTT cục bộ thành "luôn contradiction" qua WAN — tham số hoá + bằng chứng sống mới đủ tin.
 - Evidence là sản phẩm: header trust meter (`off 1/2`) khiến trạng thái tin cậy quan sát được, không phải đoán.
+
+### Bài học C3
+- Review read-only tách commit với fix — audit trail giữ được "tôi thấy gì" trước "tôi đổi gì".
+- Lớp bug "reply tự giết socket publisher" lặp lại lần 3 (file.read → giờ panes) — mọi op trả danh sách phải có cap mặc định; cân nhắc invariant test chung ở C5.
