@@ -353,7 +353,11 @@ test('Pi receipt from an existing Herdr pane survives a Gate client reconnect wi
     // shape separately so the strict op-shape assert below stays exact.
     if ('turns' in remoteAfterRestart) assert.ok(Number.isInteger(remoteAfterRestart.turns));
     if ('lastActivityAt' in remoteAfterRestart) assert.ok(Number.isFinite(remoteAfterRestart.lastActivityAt));
-    const { turns: _t, lastActivityAt: _a, ...receiptCore } = remoteAfterRestart;
+    // Evidence-v2 passthroughs (spawn 009049b5): same treatment — assert shape,
+    // then deep-equal the op's core contract exactly.
+    if ('delivery' in remoteAfterRestart) assert.ok(['delivered', 'stalled', 'unverified'].includes(remoteAfterRestart.delivery));
+    if ('phase' in remoteAfterRestart) assert.ok(['dispatch', 'settled', 'failed_before_dispatch'].includes(remoteAfterRestart.phase));
+    const { turns: _t, lastActivityAt: _a, delivery: _d, phase: _p, ...receiptCore } = remoteAfterRestart;
     assert.deepEqual(receiptCore, { op: 'receipt.result', id: first.id, status: 'replied',
       requestEntryId: received.requestEntryId, responseEntryId: replied.responseEntryId,
       usage: { totalTokens: 48_585, costUsd: 0.03 } });

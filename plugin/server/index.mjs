@@ -17,8 +17,12 @@ import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, su
 import { gitRead, diffRepoDir } from "./git-safe.mjs";
 import { createSshBridge } from "./ssh.mjs";
 import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
-import { searchReceipts, sessionRoots as piSessionRoots } from "./pi-receipt-search.mjs";
+import { searchReceipts, sessionRoots as piSessionRoots, findSessionFile } from "./pi-receipt-search.mjs";
 import { usageRollup } from "./pi-usage.mjs";
+import { readAllSpawns } from "./pi-wake.mjs";
+import { sysSnapshot } from "./sysmon.mjs";
+import { attributePorts } from "./port-attr.mjs";
+import { parsePiTranscript } from "./pi-transcript.mjs";
 import { openWatchStore } from "./pi-receipt-watch.mjs";
 import { JOB_ID, MAX_PENDING, MAX_PROMPT, WORKSPACE_NAME, appendJob, jobsFile, publicJob, queueDepth, readHeartbeat, readJobs, workerBase } from "./pi-worker.mjs";
 import { registerPublisher } from "./publisher-tui-lifecycle.mjs";
@@ -121,6 +125,64 @@ function runningPid() {
   } catch {
     return null; // stale
   }
+}
+
+/** --- Wave 2 observer wiring: sysmon / port-attr / pi-transcript behind ops --- */
+
+/** Raw `herdr pane list` rows, every field kept. common.mjs's herdrPanes is the
+ *  PWA picker view and drops fields on purpose; the observers need `pid`, which
+ *  a Herdr build may or may not expose — "no pid column" must stay
+ *  distinguishable from "no live children". Returns null when the CLI fails. */
+async function paneRowsWithPids() {
+  try {
+    const { stdout } = await execFile(D.herdrBin, ["pane", "list"], { timeout: 8_000, maxBuffer: 8 << 20 });
+    const parsed = JSON.parse(stdout);
+    const panes = parsed?.result?.panes ?? parsed?.panes ?? [];
+    return Array.isArray(panes) ? panes.filter((p) => p && typeof p.pane_id === "string") : [];
+  } catch {
+    return null;
+  }
+}
+
+/** Every spawn-registry record across scopes; unreadable registry → [] (the
+ *  observers fail closed, they never take the host down). */
+function spawnRecords() {
+  try {
+    return readAllSpawns(receiptJournalBase());
+  } catch {
+    return [];
+  }
+}
+
+/** Live spawn children joined with their pane rows: one row per live child,
+ *  newest record per id. The registry stores pane ids, never pids — a pid
+ *  exists only when this Herdr's pane list carries one. */
+function liveSpawnChildren(panes) {
+  const byId = new Map();
+  for (const record of spawnRecords()) {
+    const prior = byId.get(record.id);
+    if (!prior || (record.ts ?? 0) >= (prior.ts ?? 0)) byId.set(record.id, record);
+  }
+  const byPane = new Map(panes.map((p) => [p.pane_id, p]));
+  const rows = [];
+  for (const record of byId.values()) {
+    const pane = record.paneId ? byPane.get(record.paneId) : undefined;
+    if (!pane) continue; // pane gone → child not live
+    const pid = Number(pane.pid);
+    rows.push({ key: record.name, paneId: record.paneId, pid: Number.isInteger(pid) && pid > 0 ? pid : null });
+  }
+  return rows;
+}
+
+/** The transcript behind one receipt: the spawn record's own sessionFile when
+ *  it exists (records may predate the field), else Pi's standard session roots.
+ *  Returns null when nothing is found — the caller answers a clear error op. */
+function transcriptFor(entry) {
+  const record = spawnRecords()
+    .filter((s) => s.sessionId === entry.sessionId && typeof s.sessionFile === "string")
+    .sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0];
+  if (record && existsSync(record.sessionFile)) return record.sessionFile;
+  return findSessionFile(piSessionRoots(), entry.sessionId);
 }
 
 /** Which Herdr argv focuses a pane — probed once from --help (pane focus, else the
@@ -510,6 +572,90 @@ async function publisherLoop() {
           const rollup = usageRollup({ base: receiptJournalBase(), days });
           log(`usage: ${m.device} roll-up ${days}d -> ${rollup.total.requests} request(s), ${rollup.total.tokens} token(s)`);
           return void replyTo({ op: "usage.rollup.result", ...rollup });
+        }
+        if (op === "sysmon.snapshot") {
+          // READ-ONLY machine observation (sysmon.mjs): CPU/RAM per live spawn
+          // child. Roots are the registry's live panes joined with pane rows —
+          // the registry stores no pids, so roots exist only when herdr's pane
+          // list carries a pid; without pids the answer is [] plus a note, never
+          // a guess. The sampler itself fails closed to []. Subprocess-backed
+          // (one pane list), so throttled like term.*.
+          const now = Date.now();
+          const last = termThrottle.get(`sysmon:${m.device}`) ?? 0;
+          if (now - last < 1_000) return void replyTo({ op: "error", code: "busy", message: "sysmon.snapshot is throttled (1/s)" });
+          termThrottle.set(`sysmon:${m.device}`, now);
+          const panes = await paneRowsWithPids();
+          let note = null;
+          let roots = [];
+          if (panes === null) {
+            note = "herdr pane list failed — no live child could be resolved";
+          } else {
+            const withPid = liveSpawnChildren(panes).filter((row) => row.pid);
+            if (withPid.length === 0) {
+              note = panes.some((p) => Number.isInteger(Number(p.pid)) && Number(p.pid) > 0)
+                ? "no live spawn child exposes a pid — nothing to sample"
+                : "herdr pane list carries no pid field — CPU/RAM roots unavailable";
+            } else {
+              roots = withPid.map((row) => ({ pid: row.pid, key: row.key }));
+            }
+          }
+          const agents = sysSnapshot(roots);
+          log(`sysmon: ${m.device} snapshot -> ${agents.length} agent row(s)${note ? ` (${note})` : ""}`);
+          return void replyTo({ op: "sysmon.snapshot.result", at: new Date().toISOString(), agents, ...(note ? { note } : {}) });
+        }
+        if (op === "ports.list") {
+          // READ-ONLY listener attribution (port-attr.mjs): every LISTEN socket,
+          // attributed to the live spawn child it descends from. Without shell
+          // pids nothing can be attributed — the module answers the unattributed
+          // list and a note says why; an owner is never invented. Throttled 1/s.
+          const now = Date.now();
+          const last = termThrottle.get(`ports:${m.device}`) ?? 0;
+          if (now - last < 1_000) return void replyTo({ op: "error", code: "busy", message: "ports.list is throttled (1/s)" });
+          termThrottle.set(`ports:${m.device}`, now);
+          const panes = await paneRowsWithPids();
+          let shellPids = [];
+          let note = null;
+          if (panes === null) {
+            note = "herdr pane list failed — every listener stays unattributed";
+          } else {
+            shellPids = liveSpawnChildren(panes).filter((row) => row.pid).map((row) => ({ pid: row.pid, key: row.key }));
+            if (shellPids.length === 0) {
+              note = panes.some((p) => Number.isInteger(Number(p.pid)) && Number(p.pid) > 0)
+                ? "no live spawn child exposes a pid — every listener stays unattributed"
+                : "herdr pane list carries no pid field — every listener stays unattributed";
+            }
+          }
+          const { attributed, unattributed } = attributePorts(shellPids);
+          log(`ports: ${m.device} list -> ${attributed.length} attributed, ${unattributed.length} unattributed${note ? ` (${note})` : ""}`);
+          return void replyTo({ op: "ports.list.result", attributed, unattributed, ...(note ? { note } : {}) });
+        }
+        if (op === "receipt.enrich") {
+          // Experimental (opt-in HERDGATE_PI_RECEIPTS=1): transcript facts for one
+          // receipt — model, context size, turns, usage totals, last activity —
+          // parsed from the session transcript of the spawn registry record
+          // matching the receipt's sessionId (Pi's session roots as fallback).
+          // Metadata only; a missing or unreadable transcript is a clear error
+          // op, never a throw and never a guessed number.
+          const id = typeof payload.id === "string" && JOB_ID.test(payload.id) ? payload.id : "";
+          if (!receiptsEnabled()) {
+            return void replyTo({ op: "receipt.enrich.result", id: id || null, reason: "pi_receipts_disabled" });
+          }
+          if (!id) return void replyTo({ op: "error", code: "receipt.enrich", message: "receipt.enrich needs a request id" });
+          const entry = findReceipt(receiptJournalBase(), id);
+          if (!entry) {
+            log(`receipts: ${m.device} enrich ${id} -> no receipt`);
+            return void replyTo({ op: "error", code: "receipt.enrich", message: `no receipt ${id} in the journal` });
+          }
+          const file = transcriptFor(entry);
+          const parsed = file ? parsePiTranscript(file) : null;
+          if (!parsed || parsed.error) {
+            log(`receipts: ${m.device} enrich ${id} -> no transcript (session ${entry.sessionId})`);
+            return void replyTo({ op: "error", code: "receipt.enrich", message: `no readable transcript for session ${entry.sessionId}` });
+          }
+          log(`receipts: ${m.device} enrich ${id} -> ${parsed.model ?? "?"}, ${parsed.turns} turn(s), ${parsed.usageTotal.totalTokens} token(s)`);
+          return void replyTo({ op: "receipt.enrich.result", id, sessionId: entry.sessionId,
+            model: parsed.model ?? null, contextTokens: parsed.contextTokens ?? null,
+            turns: parsed.turns, usageTotal: parsed.usageTotal, lastTs: parsed.lastTs });
         }
         if (op === "receipt.watch" || op === "receipt.ack") {
           // Experimental (opt-in HERDGATE_PI_RECEIPTS=1): durable per-request push

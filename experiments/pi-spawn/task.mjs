@@ -31,7 +31,20 @@ import { readAllSpawns } from '../../plugin/server/pi-wake.mjs';
 
 const spawnCli = fileURLToPath(new URL('./spawn.mjs', import.meta.url));
 const herdr = () => process.env.HERDR_BIN_PATH || 'herdr';
-const run = (...args) => JSON.parse(execFileSync(herdr(), args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }));
+
+/** @internal Test seam (the herdr-link setHerdrRunnerForTests lesson, link.md
+ *  §1): swap the herdr CLI runner for one that records argv. Tests assert the
+ *  exact argv sequence through the REAL module — no module mocking. Passing
+ *  anything but a function restores the production execFileSync runner. */
+const defaultHerdrRunner = (file, args) => ({
+  stdout: execFileSync(file, args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }),
+});
+let herdrRunner = defaultHerdrRunner;
+export function setHerdrRunnerForTests(runner) {
+  herdrRunner = typeof runner === 'function' ? runner : defaultHerdrRunner;
+}
+
+const run = (...args) => JSON.parse(herdrRunner(herdr(), args).stdout);
 const runSafe = (...args) => {
   try { return { ok: true, out: run(...args) }; }
   catch (error) { return { ok: false, error: String(error?.message ?? error).slice(0, 300) }; }
@@ -52,6 +65,19 @@ export const TASK_INSTRUCTION = 'Mỗi reply phải kèm tool call đến khi xo
  *  six-agent wave (marker glued straight onto the task text) unrepresentable. */
 export function buildTaskPrompt(marker, body) {
   return `${marker}\n${body}`;
+}
+
+/** herdr-link/1-style inbound wrapper (link.md mechanism §15): a CONTINUE
+ *  prompt is self-describing — line 1 the marker (as always), then the body,
+ *  and as the LAST line a JSON envelope naming where the answer goes, so the
+ *  child needs no side-channel docs to route its SUMMARY. replyTo reuses the
+ *  one-id chain (`spawn:<id>` — the principal form the receipt journal
+ *  already speaks). start does NOT wrap: its first prompt already carries
+ *  TASK_INSTRUCTION and the marker; the envelope is a continue-only addition. */
+export const ENVELOPE_HINT = 'Dòng cuối là envelope định tuyến: khi xong, gửi SUMMARY về replyTo (qua via), không cần hỏi lại.';
+
+export function buildInboundWrapper(marker, spawnId, body) {
+  return `${buildTaskPrompt(marker, taskBody(body))}\n${ENVELOPE_HINT}\n${JSON.stringify({ replyTo: `spawn:${spawnId}`, via: 'herdgate-task' })}`;
 }
 
 const markerOf = entry => `[herdr-request:${entry.id}]`;
@@ -114,7 +140,9 @@ function cmdStart(name, taskfile) {
   console.log(JSON.stringify({ id: entry.id, name: entry.name, paneId: entry.paneId, armed: true, prompted: true }));
 }
 
-function cmdContinue(name, taskfileOrText) {
+/** @internal Exported for the argv-recording test seam — the CLI dispatch
+ *  below calls this same function. */
+export function cmdContinue(name, taskfileOrText) {
   if (!name || !taskfileOrText) fail('usage: task.mjs continue <name> <taskfile-or-text>');
   const entry = findSpawn(spawnBase(), name);
   if (!entry) fail(`no spawn record for ${name}`);
@@ -136,7 +164,8 @@ function cmdContinue(name, taskfileOrText) {
   if (status === 'working' || status === 'blocked')
     fail(`agent is ${status} — a second marker now would die as competing_input; wait for its settle/wake, then continue`);
   try {
-    run('agent', 'prompt', entry.paneId, buildTaskPrompt(markerOf(entry), taskBody(text)));
+    // Self-describing wrapper: marker on line 1, envelope on the last line.
+    run('agent', 'prompt', entry.paneId, buildInboundWrapper(markerOf(entry), entry.id, text));
   } catch (error) {
     fail(`prompt failed: ${cliError(error)}`);
   }
