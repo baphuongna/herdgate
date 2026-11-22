@@ -1,15 +1,13 @@
 #!/usr/bin/env node
 // Subset of the Core API for TUI panes. Input requires explicit local opt-in.
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { open as openFile } from "node:fs/promises";
 import { hostname, homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { promisify, stripVTControlCharacters } from "node:util";
-import { openTerminal, validDimension } from "./mobile-tui-stream.mjs";
+import { stripVTControlCharacters } from "node:util";
+import { cksum, openShellManager, openTerminal, PaneLiveInputQueue, validDimension } from "./mobile-tui-stream.mjs";
 
-const invoke = promisify(execFile);
 const herdr = process.env.HERDR_BIN_PATH || join(homedir(), ".local/bin/herdr");
 const name = process.env.HERDGATE_HOST_NAME || "home-tui-mobile";
 const digest = (text) => createHash("sha256").update(text).digest("hex");
@@ -51,7 +49,17 @@ const pollMs = Math.max(250, Number.parseInt(process.env.HERDGATE_TUI_POLL_MS ??
 const startedAt = Date.now();
 let cache;
 let cacheUntil = 0;
-const run = async (args) => (await invoke(herdr, args, { timeout: 4_000, maxBuffer: 512 * 1024, windowsHide: true, shell: false })).stdout;
+// One persistent /bin/sh speaks for every Herdr call: each request is framed by a unique
+// marker, the shell is probed (`true`) before it counts as alive, and one channel failure
+// kills the whole generation — the written request is never retried, later requests fall
+// back to one exec per command, and only an explicit reinit() opens the next generation.
+const shells = openShellManager();
+const shellQuote = (word) => `'${String(word).replace(/'/g, "'\\''")}'`;
+const run = async (args) => {
+  const { stdout, code } = await shells.execute([herdr, ...args].map(shellQuote).join(" "));
+  if (code !== 0) throw Object.assign(new Error(`herdr ${args[0]} exited ${code}`), { definitive: true });
+  return stdout.toString("utf8");
+};
 
 async function panes() {
   if (cache && Date.now() < cacheUntil) return cache;
@@ -349,6 +357,40 @@ async function transcriptText(hit, { joinScreen = false } = {}) {
   return parts.length ? parts.join("\n") : null;
 }
 
+// Input from the phone rides a bounded, coalescing FIFO with in-order acks: adjacent
+// keystroke batches for one pane leave as a single send-keys, every input is acked in
+// submission order, and any ambiguous delivery flips the queue to needsResync — the
+// viewer must re-read the pane, and queued input is never replayed at it.
+let inputQueue = null;
+let inputStamp = 0; // advanced once a write has landed: snapshots older than it are stale
+async function applyInput(event) {
+  if (event.kind === "text") await run(["pane", "run", event.paneId, event.text]);
+  else await run(["pane", "send-keys", event.paneId, ...event.keys]);
+  inputStamp++;
+}
+async function queuedInput(paneId, kind, payload) {
+  if (!inputQueue) { // a queue-less path (never in this adapter today) still writes in order
+    await applyInput({ paneId, kind, ...payload });
+    return null;
+  }
+  try {
+    return await inputQueue.enqueue(paneId, kind, payload);
+  } catch (err) {
+    if (err?.kind === "needs_resync") throw new RpcError(-32000, "Pane input needs a resync; re-read the pane, never replay", "needs_resync");
+    throw err;
+  }
+}
+// In-flight snapshot sharing: concurrent readers of one pane share a single read, and a
+// read that began before a write is never served to a caller after it (the `fresh` rule).
+const stitchedInFlight = new Map(); // pane_id → { after, promise }
+async function stitchedRead(hit) {
+  const current = stitchedInFlight.get(hit.id);
+  if (current && current.after === inputStamp) return current.promise;
+  const promise = transcriptText(hit, { joinScreen: true });
+  stitchedInFlight.set(hit.id, { after: inputStamp, promise });
+  try { return await promise; } finally { if (stitchedInFlight.get(hit.id)?.promise === promise) stitchedInFlight.delete(hit.id); }
+}
+
 /** The terminal addresses a doc tree shows. */
 function collectTerminals(node, out = []) {
   if (!node || typeof node !== "object") return out;
@@ -456,7 +498,7 @@ async function findPane(terminal) {
 async function call(method, p, framed, attach, startEvents) {
   switch (method) {
     case "hello":
-      return { core, version, generation: 1, framed, features: framed ? ["framed", "attach", "status", ...(interactive ? ["resize_notifications"] : [])] : ["status"], methods: [...methods, ...(framed ? ["terminal.attach"] : []), ...(interactive ? inputMethods : [])], keeps_running_after_logout: true };
+      return { core, version, generation: 1, framed, features: framed ? ["framed", "attach", "status", "checksum_reads", ...(interactive ? ["resize_notifications", "input_ack"] : [])] : ["status", "checksum_reads"], methods: [...methods, ...(framed ? ["terminal.attach"] : []), ...(interactive ? inputMethods : [])], keeps_running_after_logout: true };
     case "server.status": return status();
     case "terminal.list": {
       const filters = p.labels ?? {};
@@ -481,14 +523,18 @@ async function call(method, p, framed, attach, startEvents) {
       const { turn } = terminal;
       if (method === "terminal.send") {
         if (!inputText(p.text) || p.wait === true || p.if != null) throw invalid();
-        // Herdr's pane run takes positional text and submits it with Enter in one API request.
-        await run(["pane", "run", id, p.text]);
-        return { turn, status: null, started: null, wait: null };
+        const ack = await queuedInput(id, "text", { text: p.text });
+        return { turn, status: null, started: null, wait: null, ...(ack === null ? {} : { ack }) };
       }
-      const keys = method === "terminal.interrupt" ? ["ctrl+c"] : p.keys;
+      if (method === "terminal.interrupt") {
+        // An interrupt must never sit behind typing already in the queue.
+        await run(["pane", "send-keys", id, "ctrl+c"]);
+        return { key: "ctrl+c", outcome: "unknown" };
+      }
+      const keys = p.keys;
       if (!Array.isArray(keys) || !keys.length || keys.length > 32 || keys.some((key) => typeof key !== "string" || !/^(?:(?:ctrl|alt|shift|super)\+)*[a-z0-9][a-z0-9_-]{0,15}$/i.test(key) || key.length > 32)) throw invalid();
-      await run(["pane", "send-keys", id, ...keys]);
-      return method === "terminal.interrupt" ? { key: keys[0], outcome: "unknown" } : { turn, status: null };
+      const ack = await queuedInput(id, "keys", { keys });
+      return { turn, status: null, ...(ack === null ? {} : { ack }) };
     }
     case "terminal.run": {
       if (!interactive) throw new RpcError(-32601, "This pairing is read-only", "forbidden");
@@ -535,15 +581,21 @@ async function call(method, p, framed, attach, startEvents) {
       }
       const lines = p.lines ?? 0;
       if (!Number.isSafeInteger(lines) || lines < 0) throw invalid();
+      // A checksum-stamped read: the viewer that already holds this text sends its stamp
+      // back and gets `unchanged` with no body when nothing moved (readChangedCommand
+      // semantics — POSIX cksum, no stat). Viewers without a stamp get the full body.
+      const prior = typeof p.checksum === "string" && /^[0-9]{1,10} [0-9]{1,20}$/.test(p.checksum) ? p.checksum : null;
       // An agent pane keeps its chat inside itself: serve the transcript as "stitched"
       // history (the core's term for a full-screen app read by scrolling it), joined to
       // the live screen so the seam never shows a gap mid-turn.
-      const transcript = await transcriptText(hit, { joinScreen: true });
+      const transcript = await stitchedRead(hit);
       if (transcript) {
         const all = transcript.split("\n");
         const take = lines > 0 ? all.slice(-Math.min(2000, lines)) : all.slice(-24);
-        const text = take.join("\n");
-        return { text: text.slice(0, 60 * 1024), complete: transcript.length <= 60 * 1024, how: "stitched", why: null };
+        const text = take.join("\n").slice(0, 60 * 1024);
+        const stamp = cksum(Buffer.from(text, "utf8"));
+        if (prior !== null && prior === stamp) return { unchanged: true, checksum: stamp, complete: transcript.length <= 60 * 1024, how: "stitched", why: null };
+        return { text, checksum: stamp, complete: transcript.length <= 60 * 1024, how: "stitched", why: null };
       }
       // A shell pane: `recent` carries the history viewers scroll (the phone reads it);
       // a pane with none — fresh — falls back to the on-screen text so it is not blank.
@@ -626,6 +678,7 @@ async function serve() {
   let framed = false;
   let buffer = Buffer.alloc(0);
   const streams = new Map();
+  inputQueue = interactive ? new PaneLiveInputQueue(applyInput) : null;
   let nextChannel = 1;
   let timer;
   let polling = false;
@@ -903,13 +956,19 @@ async function serve() {
     clearTimeout(timer);
     clearTimeout(eventTimer);
     for (const channel of streams.keys()) release(channel);
+    inputQueue?.resync("connection closed");
+    shells.close();
   }
 }
 
 const command = args.join(" ");
 try {
   if (command === "--version" || command === "-V") console.log(`hc ${version} (Herdgate ${mode} TUI adapter)`);
-  else if (command === "server status" || command === "server status --json") console.log(JSON.stringify(await status()));
+  else if (command === "server status" || command === "server status --json") {
+    const out = JSON.stringify(await status());
+    shells.close();
+    console.log(out);
+  }
   else if (command === "connect" || command === "connect --json") {
     await serve();
   } else {
