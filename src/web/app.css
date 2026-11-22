@@ -419,43 +419,126 @@ dialog::backdrop {
   color: var(--muted);
 }
 
-/* Timeline: one row per day; the token bar scales to the busiest day. */
-.timeline-view .tl {
-  list-style: none;
-  margin: 6px 0 0;
-  padding: 0;
+/* Chat threads (the Timeline tab, re-imagined): user/assistant bubbles,
+   tool-run folds, Delegation cards — and the path:line flash in Diff. */
+.chat-view .threads {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-}
-.tl-row {
-  display: grid;
-  grid-template-columns: 6.5em 1fr auto auto;
   gap: 10px;
-  align-items: center;
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
+  margin-top: 6px;
 }
-.tl-date {
-  color: var(--muted);
+.thread {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 10px 12px;
 }
-.tl-bar {
-  display: block;
-  height: 8px;
-  border-radius: 4px;
+.msg {
+  max-width: 92%;
+  padding: 8px 11px;
+  border-radius: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13.5px;
+}
+.msg.user {
+  align-self: flex-end;
+  background: color-mix(in srgb, var(--accent) 22%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+}
+.msg.assistant {
+  align-self: flex-start;
   background: var(--bg);
   border: 1px solid var(--line);
-  overflow: hidden;
 }
-.tl-bar i {
-  display: block;
-  height: 100%;
-  background: var(--accent);
-}
-.tl-count,
-.tl-cost {
+/* tool-run FOLD: one muted line until clicked open. */
+.fold {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 12.5px;
   color: var(--muted);
+}
+.fold summary {
+  cursor: pointer;
+  user-select: none;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fold[open] summary {
+  margin-bottom: 4px;
+}
+.folddetail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+/* Delegation cards: one per background spawn principal. */
+.subagent-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 6px 0;
+}
+.subagent {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: auto;
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font-weight: 400;
+  text-align: left;
+}
+.subagent.active {
+  outline: 2px solid var(--accent);
+}
+.subagent-name {
+  font-weight: 600;
+}
+.subagent-status {
+  font-size: 12px;
+  color: var(--muted);
+}
+.subagent-tokens {
+  font-size: 12px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.spawn-thread {
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  padding: 8px 12px;
+  margin: 6px 0;
+}
+/* `path:line` links inside a chat bubble jump into the Diff view. */
+.msg .pathline {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.95em;
+}
+/* path:line deep-link flash in the Diff patch — 3s, then it fades on its own. */
+.diff-patch .flash {
+  animation: hg-flash-line 3s ease-out;
+  border-radius: 3px;
+}
+@keyframes hg-flash-line {
+  0% {
+    background: color-mix(in srgb, var(--accent) 45%, transparent);
+  }
+  100% {
+    background: transparent;
+  }
 }
 
 /* Diff: stat header, then the patch with + green, - red, @@ purple. */

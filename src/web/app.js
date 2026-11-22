@@ -11,7 +11,7 @@
 //   - the token lives in localStorage on this device and is never sent anywhere but the
 //     cloud's own WS endpoint.
 
-const BUILD = "v0.9.34-web.2";
+const BUILD = "v0.9.34-web.3";
 
 const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = "herdgate.token";
@@ -159,9 +159,125 @@ const state = {
   termBody: null,
   termPre: null,
   retry: 0,
-  worker: { health: null, jobs: new Map(), error: null, search: null, tab: "jobs", usage: null },
+  worker: { health: null, jobs: new Map(), error: null, search: null, searchError: null, tab: "jobs", usage: null, chatError: null, bodyError: null, draft: null },
   diff: null,
+  chat: { filter: null, spawn: null },
 };
+
+// ---- fetch discipline: generation tokens + in-flight sharing ----------------
+// Every rendered fetch is fenced by the generation of the view that asked for
+// it (a fresh uuid per room mount). A reply answering an older generation is
+// dropped on arrival — it can never overwrite newer state. Identical calls
+// already in flight are joined instead of re-sent; `fresh: true` marks a read
+// that must start AFTER writes that already left, so it never joins an older
+// flight. Transport-level failures keep the last snapshot and raise a banner —
+// a list never silently blanks.
+
+const OP_TIMEOUT_MS = 15_000;
+const fetches = { gen: "", inflight: new Map(), pending: new Map() };
+
+/** A local fault marker (never a wire op): transport loss, a late host, or a
+ *  flight superseded by a fresher read. Callers keep their snapshot and say so. */
+function faultOf(p) {
+  return p && typeof p === "object" && typeof p.fault === "string" ? p.fault : null;
+}
+const isTransportFault = (p) => {
+  const fault = faultOf(p);
+  return fault === "transport" || fault === "fetch-timeout";
+};
+const USAGE_ERR_CODES = new Set(["usage-unavailable", "usage.rollup"]);
+const SEARCH_ERR_CODES = new Set(["pi_receipts_disabled", "receipt.search"]);
+const BODY_ERR_CODES = new Set(["pi_receipts_disabled", "pi_receipt_body_disabled", "receipt.body"]);
+
+function cryptoUUID() {
+  const uuid = globalThis.crypto?.randomUUID; // globalThis: no ReferenceError where crypto is absent
+  return typeof uuid === "function" ? uuid.call(globalThis.crypto) : `gen-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+/** A fresh generation per view mount; replies from older ones fall into the void. */
+function newGeneration() {
+  fetches.gen = cryptoUUID();
+  return fetches.gen;
+}
+function currentGeneration() {
+  return fetches.gen || newGeneration();
+}
+function generationCurrent(gen) {
+  return gen === fetches.gen;
+}
+
+function transportOpen() {
+  return Boolean(state.ws?.readyState === WebSocket.OPEN && state.roomId && !e2e.keyChanged);
+}
+
+/**
+ * One fenced op call. The same op already flying under the same generation is
+ * joined rather than re-sent (one wire call, many surfaces); `fresh: true`
+ * refuses to join a flight that started before the caller's writes — the older
+ * flight is superseded instead. Host refusals resolve as `{op:"error"}`
+ * payloads; transport faults resolve with a local `{fault}` marker so callers
+ * keep their snapshot and say so.
+ */
+function opFetch(op, replyOp, payload = {}, { fresh = false, key = op, errCodes = null } = {}) {
+  const gen = currentGeneration();
+  const flying = fetches.inflight.get(key);
+  if (flying && flying.gen === gen && (!fresh || flying.fresh)) return flying.promise;
+  if (flying) finishFetch(flying, { fault: "superseded", message: "một lượt đọc mới hơn đã thay thế lượt này" });
+  let settle;
+  const promise = new Promise((resolve) => { settle = resolve; });
+  const entry = { key, op, replyOp, gen, fresh, promise, errCodes, settle, timer: 0 };
+  fetches.inflight.set(key, entry);
+  const stack = fetches.pending.get(replyOp) ?? [];
+  stack.push(entry);
+  fetches.pending.set(replyOp, stack);
+  entry.timer = setTimeout(
+    () => finishFetch(entry, { fault: "fetch-timeout", message: "máy không trả lời kịp — giữ dữ liệu gần nhất" }),
+    OP_TIMEOUT_MS,
+  );
+  if (transportOpen()) sendPayload({ op, ...payload });
+  else finishFetch(entry, { fault: "transport", message: "mất kết nối tới máy — giữ dữ liệu gần nhất" });
+  return promise;
+}
+
+function finishFetch(entry, payload) {
+  clearTimeout(entry.timer);
+  if (fetches.inflight.get(entry.key) === entry) fetches.inflight.delete(entry.key);
+  const stack = fetches.pending.get(entry.replyOp);
+  const at = stack ? stack.indexOf(entry) : -1;
+  if (at !== -1) stack.splice(at, 1);
+  entry.settle(payload);
+}
+
+/** Hand an inbound payload to the waiting fetch, if any. True = consumed: the
+ *  surface that asked applies the answer itself, after its generation check. */
+function routeFencedReply(payload) {
+  if (!payload || typeof payload !== "object" || typeof payload.op !== "string") return false;
+  let consumed = false;
+  if (payload.op !== "error") {
+    const entry = fetches.pending.get(payload.op)?.shift();
+    if (entry) {
+      finishFetch(entry, payload);
+      consumed = true;
+    }
+  } else if (typeof payload.code === "string") {
+    for (const stack of fetches.pending.values()) {
+      for (const entry of [...stack]) {
+        if (entry.errCodes?.has(payload.code)) {
+          finishFetch(entry, payload);
+          consumed = true;
+        }
+      }
+    }
+  }
+  return consumed;
+}
+
+/** The socket died: every waiting fetch keeps its caller's snapshot and hears why. */
+function failAllFencedFetches(message) {
+  for (const stack of [...fetches.pending.values()]) {
+    for (const entry of [...stack]) finishFetch(entry, { fault: "transport", message });
+  }
+}
 
 /** The cloud base: an explicit setting, else this page's origin (same-origin deployment). */
 function cloudBase() {
@@ -466,7 +582,7 @@ function renderWorkerUsage(box, w, online) {
   const fetchUsage = document.createElement("button");
   fetchUsage.type = "button";
   fetchUsage.textContent = "Fetch usage";
-  fetchUsage.addEventListener("click", () => sendPayload({ op: "usage.rollup", days: 7 }));
+  fetchUsage.addEventListener("click", () => fetchChatUsage(true));
   box.append(fetchUsage);
   const line = (text) => {
     const p = document.createElement("p");
@@ -511,69 +627,375 @@ function renderWorkerUsage(box, w, online) {
   box.append(days, byPrincipal);
 }
 
-// Timeline: the same usage.rollup data as one row per day — date, a mini token
-// bar scaled to the busiest day, replies/failed, cost. Failing hosts get a plain
-// friendly line, never a broken table.
-function renderWorkerTimeline(box, w, online) {
+// Chat (the Timeline tab, re-imagined as threads): one thread per session over
+// data the host already serves. A locally submitted job is a session this device
+// knows end-to-end — prompt bubble, folded tool-run receipt events, reply bubble.
+// Background spawn principals roll up into Delegation cards (name + status +
+// tokens); clicking one filters the chat to that subagent. Anything the data
+// lacks simply does not render — no spinners, no invented rows.
+function renderWorkerChat(box, w, online) {
   box.replaceChildren();
   const head = document.createElement("p");
-  head.textContent = "Timeline — 7 ngày qua, mỗi ngày một hàng";
+  head.textContent = "Chat — mỗi session một thread";
   const again = document.createElement("button");
   again.type = "button";
   again.className = "link";
   again.textContent = "tải lại";
-  again.addEventListener("click", () => sendPayload({ op: "usage.rollup", days: 7 }));
+  again.addEventListener("click", () => fetchChatUsage(true));
   box.append(head, again);
-  const line = (msg, kind) => {
-    const p = document.createElement("p");
-    p.className = kind === "error" ? "error small" : "muted small";
-    p.textContent = msg;
-    box.append(p);
-  };
-  if (!online) {
-    line("host offline — Timeline cần máy đang chạy");
-    return;
-  }
+  if (w.chatError) box.append(note(w.chatError, "error")); // transport fault: the data below stays
   const u = w.usage;
-  if (!u) {
-    line("đang tải số liệu từ máy… (usage.rollup)");
-    return;
+  const today = !u || u.unavailable ? null : (Array.isArray(u.days) ? u.days[0] : null);
+  if (today && (today.requests ?? 0) > 0) {
+    const line = document.createElement("p");
+    line.className = "muted small";
+    line.textContent = `hôm nay: ${today.requests ?? 0} requests, ${today.tokens ?? 0} tokens, ${usageUsd(today.costUsd)}`;
+    box.append(line);
   }
-  if (u.unavailable) {
-    line("usage chưa sẵn sàng trên máy này — bật HERDGATE_PI_RECEIPTS để ghi receipt journal.");
-    return;
+  // Delegation cards — one per background `spawn:<id>` principal in the roll-up.
+  const byPrincipal = !u || u.unavailable ? [] : (Array.isArray(u.byPrincipal) ? u.byPrincipal : []);
+  const spawns = byPrincipal.filter((p) => /^spawn:[A-Za-z0-9._-]{1,64}$/.test(String(p.principal ?? "")));
+  if (spawns.length) {
+    const cards = document.createElement("div");
+    cards.className = "subagent-cards";
+    for (const s of spawns) cards.append(subagentCard(s, online));
+    box.append(cards);
   }
-  const days = Array.isArray(u.days) ? u.days : [];
-  const busy = days.some((d) => (d.tokens ?? 0) > 0 || (d.requests ?? 0) > 0);
-  if (!busy) {
-    line("7 ngày qua chưa có request nào — máy đang rảnh ✓");
-    return;
+  const filter = state.chat.filter;
+  if (filter) box.append(spawnThread(filter, online));
+  const jobs = [...w.jobs.values()].filter((job) => !filter || job.principal === filter).slice(-12).reverse();
+  const threads = document.createElement("div");
+  threads.className = "threads";
+  for (const job of jobs) threads.append(chatThread(job));
+  box.append(threads);
+  if (!jobs.length) {
+    box.append(note(filter
+      ? `không có session nào của ${filter} trên máy này`
+      : "chưa có session nào — gửi một job từ tab Jobs", "muted"));
   }
-  const max = Math.max(1, ...days.map((d) => d.tokens ?? 0));
-  const rows = document.createElement("ul");
-  rows.className = "tl";
-  for (const day of days) {
-    const row = document.createElement("li");
-    row.className = "tl-row";
-    const date = document.createElement("span");
-    date.className = "tl-date";
-    date.textContent = day.date ?? "";
-    const bar = document.createElement("span");
-    bar.className = "tl-bar";
-    bar.title = `${day.tokens ?? 0} tokens`;
-    const fill = document.createElement("i");
-    fill.setAttribute("style", `width:${Math.round(((day.tokens ?? 0) / max) * 100)}%`);
-    bar.append(fill);
-    const counts = document.createElement("span");
-    counts.className = "tl-count";
-    counts.textContent = `${day.replied ?? 0}✓ · ${day.failed ?? 0}✗`;
-    const cost = document.createElement("span");
-    cost.className = "tl-cost";
-    cost.textContent = usageUsd(day.costUsd);
-    row.append(date, bar, counts, cost);
-    rows.append(row);
+}
+
+function subagentStatus(p) {
+  if (Number.isFinite(p.lastTs) && Date.now() - p.lastTs < 5 * 60_000) return "running";
+  const failed = p.failed ?? 0;
+  return failed > 0 ? `failed ×${failed}` : `done ×${p.replied ?? 0}`;
+}
+
+/** A Delegation card for one `spawn:<id>` principal: name, status, tokens.
+ *  Click filters the chat to that subagent (and fetches its receipts). */
+function subagentCard(s, online) {
+  const card = document.createElement("button");
+  card.type = "button";
+  card.className = "subagent" + (state.chat.filter === s.principal ? " active" : "");
+  const name = document.createElement("span");
+  name.className = "subagent-name";
+  name.textContent = s.principal.slice("spawn:".length);
+  const status = document.createElement("span");
+  status.className = "subagent-status";
+  status.textContent = subagentStatus(s);
+  const tokens = document.createElement("span");
+  tokens.className = "subagent-tokens";
+  tokens.textContent = `${s.tokens ?? 0} tokens · ${usageUsd(s.costUsd)}`;
+  card.append(name, status, tokens);
+  card.addEventListener("click", () => {
+    state.chat.filter = state.chat.filter === s.principal ? null : s.principal;
+    if (state.chat.filter) fetchSpawnReceipts(state.chat.filter);
+    state.roomUi?.updateWorker?.(online);
+  });
+  return card;
+}
+
+/** The filtered view of one subagent: its receipts, listed like tool-runs. */
+function spawnThread(principal, online) {
+  const box = document.createElement("div");
+  box.className = "spawn-thread";
+  const head = document.createElement("p");
+  head.textContent = `Delegation · ${principal}`;
+  box.append(head);
+  const clear = document.createElement("button");
+  clear.type = "button";
+  clear.className = "link";
+  clear.textContent = "bỏ lọc";
+  clear.addEventListener("click", () => {
+    state.chat.filter = null;
+    state.roomUi?.updateWorker?.(online);
+  });
+  box.append(clear);
+  const spawn = state.chat.spawn?.principal === principal ? state.chat.spawn : null;
+  if (spawn?.error) box.append(note(spawn.error, "error")); // transport: the hits above stay
+  if (spawn?.settled) {
+    if (Array.isArray(spawn.hits) && spawn.hits.length) {
+      const rows = document.createElement("ul");
+      rows.className = "list";
+      for (const hit of spawn.hits) {
+        const row = document.createElement("li");
+        row.className = "row";
+        const span = document.createElement("span");
+        span.textContent = `${hit.id.slice(0, 8)} · ${hit.status}${hit.reason ? ` (${hit.reason})` : ""} · ${hit.usage?.totalTokens ?? 0} tokens`;
+        row.append(span, glyphNode(hit));
+        rows.append(row);
+      }
+      box.append(rows);
+    } else if (!spawn.error) {
+      box.append(note("chưa có receipt nào của subagent này", "muted"));
+    }
+  } else {
+    box.append(note("đang tải receipts của subagent…", "muted"));
   }
-  box.append(rows);
+  return box;
+}
+
+/** One session: user prompt → folded tool-run receipt events → assistant reply. */
+function chatThread(job) {
+  const thread = document.createElement("div");
+  thread.className = "thread";
+  if (job.prompt) {
+    const user = document.createElement("div");
+    user.className = "msg user";
+    user.textContent = job.prompt;
+    thread.append(user);
+  }
+  const events = Array.isArray(job.events) ? job.events : [];
+  if (events.length) {
+    // tool-run FOLD: one muted line; click opens the run underneath it.
+    const fold = document.createElement("details");
+    fold.className = "fold toolrun";
+    const sum = document.createElement("summary");
+    sum.textContent = `⚙ tool-run · receipt ${job.id.slice(0, 8)} · ${events.length} sự kiện`;
+    fold.append(sum);
+    const body = document.createElement("div");
+    body.className = "folddetail";
+    for (const ev of events) {
+      const line = document.createElement("div");
+      line.className = "toolevent";
+      line.textContent = `${usageClock(ev.at)} · ${ev.status}${ev.reason ? ` (${ev.reason})` : ""}${ev.tokens ? ` · ${ev.tokens} tokens` : ""}`;
+      body.append(line);
+    }
+    fold.append(body);
+    thread.append(fold);
+  }
+  const reply = document.createElement("div");
+  reply.className = "msg assistant";
+  if (typeof job.body === "string") {
+    appendLinkedText(reply, job.body); // `path:line` in a reply jumps into the Diff view
+  } else if (job.body && typeof job.body === "object") {
+    reply.textContent = `report not available (${job.body.reason ?? "unavailable"})`;
+  } else {
+    const line = document.createElement("span");
+    line.textContent = `${job.status ?? "unknown"}${job.reason ? ` (${job.reason})` : ""}`;
+    reply.append(glyphNode(job), line);
+  }
+  thread.append(reply);
+  return thread;
+}
+
+const PATH_LINE_RE = /((?:[A-Za-z0-9_.\-]+\/)*[A-Za-z0-9_.\-]+\.[A-Za-z0-9]{1,8})(?::(\d{1,7})(?:-\d{1,7})?|#L\d{1,7}(?:-L?\d{1,7})?)/g;
+
+/** Text with `path:line` tokens becomes text nodes + jump links (no innerHTML). */
+function appendLinkedText(box, text) {
+  const src = String(text ?? "");
+  let at = 0;
+  for (const m of src.matchAll(PATH_LINE_RE)) {
+    box.append(src.slice(at, m.index));
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "link pathline";
+    btn.textContent = m[0];
+    btn.addEventListener("click", () => gotoDiffLine(m[0]));
+    box.append(btn);
+    at = m.index + m[0].length;
+  }
+  box.append(src.slice(at));
+}
+
+/** usage.rollup behind the fence: the Chat and Usage surfaces share one flight. */
+function fetchChatUsage(fresh = false) {
+  const gen = currentGeneration();
+  opFetch("usage.rollup", "usage.rollup.result", { days: 7 }, { key: "chat-usage", fresh, errCodes: USAGE_ERR_CODES })
+    .then((p) => {
+      if (!generationCurrent(gen)) return; // a newer mount owns the screen now
+      if (faultOf(p) === "superseded") return; // a fresher flight replaces this one
+      if (isTransportFault(p)) {
+        state.worker.chatError = p.message; // the snapshot below stays
+      } else if (p.op === "error") {
+        state.worker.usage = { unavailable: true }; // scoped refusal, not a transport fault
+        state.worker.chatError = null;
+      } else {
+        state.worker.usage = p;
+        state.worker.chatError = null;
+      }
+      state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
+    });
+}
+
+/** Receipt search behind the fence; a transport fault keeps the last hits. */
+function fetchReceiptSearch(query) {
+  const gen = currentGeneration();
+  opFetch("receipt.search", "receipt.search.result", { query, limit: 8 }, { key: "search", fresh: true, errCodes: SEARCH_ERR_CODES })
+    .then((p) => {
+      if (!generationCurrent(gen)) return;
+      if (faultOf(p) === "superseded") return;
+      if (isTransportFault(p)) {
+        state.worker.searchError = p.message; // the hit list stays
+      } else if (p.op === "error") {
+        state.worker.search = { hits: [], reason: p.code };
+        state.worker.searchError = null;
+      } else {
+        state.worker.search = { hits: Array.isArray(p.hits) ? p.hits : [], reason: p.reason ?? null };
+        state.worker.searchError = null;
+      }
+      state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
+    });
+}
+
+/** One retained report behind the fence; a transport fault leaves the rows as they were. */
+function fetchReceiptBody(id) {
+  const gen = currentGeneration();
+  opFetch("receipt.body", "receipt.body.result", { id }, { key: `body:${id}`, errCodes: BODY_ERR_CODES })
+    .then((p) => {
+      if (!generationCurrent(gen)) return;
+      if (faultOf(p) === "superseded") return;
+      if (isTransportFault(p)) {
+        state.worker.bodyError = p.message; // rows keep their state, a banner says why
+      } else {
+        state.worker.bodyError = null;
+        applyBodyResult(p); // a refusal is also an answer (report not available)
+      }
+    });
+}
+
+/** Fold a receipt.body answer back into the job row and the search hit that asked. */
+function applyBodyResult(payload) {
+  workerJobTouched(payload.id, payload.text !== undefined
+    ? { body: payload.text }
+    : { body: { reason: payload.reason ?? payload.code ?? "unavailable" } });
+  const s = state.worker.search;
+  const hit = Array.isArray(s?.hits) ? s.hits.find((h) => h.id === payload.id) : null;
+  if (hit) {
+    hit.body = payload.text !== undefined ? payload.text : { reason: payload.reason ?? payload.code ?? "unavailable" };
+    state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
+  }
+}
+
+/** Receipts of one spawn principal (the Delegation filter's backing data). */
+function fetchSpawnReceipts(principal) {
+  const gen = currentGeneration();
+  const prior = state.chat.spawn?.principal === principal ? state.chat.spawn : null;
+  state.chat.spawn = { principal, settled: false, hits: prior?.hits ?? null, error: null };
+  opFetch("receipt.search", "receipt.search.result", { query: principal, limit: 12 }, { key: `spawn:${principal}`, fresh: true, errCodes: SEARCH_ERR_CODES })
+    .then((p) => {
+      if (!generationCurrent(gen)) return;
+      if (faultOf(p) === "superseded") return;
+      const keep = state.chat.spawn?.principal === principal ? state.chat.spawn : null;
+      if (p.op === "error") {
+        state.chat.spawn = { principal, settled: true, hits: [], error: `subagent search bị từ chối (${p.code})` };
+      } else {
+        const hits = (Array.isArray(p.hits) ? p.hits : []).filter((h) => h?.principal === principal);
+        state.chat.spawn = { principal, settled: true, hits, error: null };
+      }
+      if (isTransportFault(p)) {
+        state.chat.spawn = { principal, settled: true, hits: keep?.hits ?? null, error: p.message }; // the hits stay
+      }
+      state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
+    });
+}
+
+/** filev open_target `parse_line_suffix`, web form: `src/app.rs:42`, `:42-48`,
+ *  `#L42`, `#L42-L48` → {path, line, end}. Null when the target names no file. */
+function parseLineSuffix(target) {
+  const m = /^(.+?)(?::(\d{1,7})(?:-(\d{1,7}))?|#L(\d{1,7})(?:-L?(\d{1,7}))?)$/.exec(String(target ?? "").trim());
+  if (!m) return null;
+  const path = m[1];
+  if (!path || path.length > 512 || /\s/.test(path) || !/[A-Za-z\u00C0-\u024F]/.test(path)) return null;
+  const line = Number(m[2] ?? m[4]);
+  const end = Number(m[3] ?? m[5] ?? line);
+  if (!(line >= 1) || end < line) return null;
+  return { path, line, end };
+}
+
+function diffGotoPathMatches(file, path) {
+  return file === path || file.endsWith(`/${path}`) || (!path.includes("/") && file.split("/").pop() === path);
+}
+
+/** Row indexes of `path:line(-end)` inside a unified diff's patch lines: walk
+ *  the file headers, then each `@@ -a,b +c,d @@` hunk counting the NEW side.
+ *  An absent path simply yields no rows — the caller says so, gently. */
+function diffGotoIndexes(lines, goto) {
+  if (!Array.isArray(lines) || !goto || !goto.path || !(goto.line >= 1)) return [];
+  const file = goto.path;
+  const end = Math.max(goto.line, goto.end ?? goto.line);
+  const hits = [];
+  let current = null;
+  let newline = 0;
+  let inHunk = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const t = String(lines[i] ?? "");
+    if (t.startsWith("diff --git ")) {
+      const m = /^diff --git a\/(\S+) b\/(\S+)$/.exec(t.trim());
+      current = m ? m[2] : null;
+      inHunk = false;
+      continue;
+    }
+    if (current === null || !diffGotoPathMatches(current, file)) {
+      inHunk = false;
+      continue;
+    }
+    if (t.startsWith("@@")) {
+      const m = /@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/.exec(t);
+      newline = m ? Number(m[1]) : 0;
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+    if (t.startsWith("-")) continue; // old-side only: it carries no new-side number
+    if (newline >= goto.line && newline <= end) hits.push(i); // + and context rows alike
+    newline += 1;
+  }
+  return hits;
+}
+
+/** Load a diff behind the fence. `goto` (a path:line deep-link) survives the
+ *  round-trip; a transport fault restores the last good patch, never a blank. */
+function loadDiff(ref, goto = null) {
+  const prev = state.diff && typeof state.diff.text === "string" ? state.diff : null;
+  state.diff = { ref, text: null, truncated: false, bytes: 0, error: null, loading: true, goto, prev };
+  const gen = currentGeneration();
+  opFetch("diff.get", "diff.result", { ref }, { key: "diff", fresh: true, errCodes: DIFF_ERROR_CODES })
+    .then((p) => {
+      if (!generationCurrent(gen)) return;
+      if (faultOf(p) === "superseded") return;
+      if (isTransportFault(p)) {
+        // transport: keep the last good patch and say so — never a silent blank.
+        const message = p.message;
+        state.diff = prev
+          ? { ...prev, error: message, loading: false }
+          : { ref, text: null, truncated: false, bytes: 0, error: message, loading: false, goto };
+      } else if (p.op === "error") {
+        const message = p.message ?? p.code ?? "the host refused";
+        state.diff = { ref, text: null, truncated: false, bytes: 0, error: message, loading: false, goto };
+      } else {
+        state.diff = {
+          ref: typeof p.ref === "string" ? p.ref : ref,
+          text: typeof p.text === "string" ? p.text : "",
+          bytes: p.bytes ?? 0,
+          truncated: p.truncated === true,
+          error: null,
+          loading: false,
+          goto,
+        };
+      }
+      state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
+    });
+  state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
+}
+
+/** A `path:line` deep-link (Cmd+K palette or a chat-card link) → the Diff view. */
+function gotoDiffLine(target) {
+  const goto = parseLineSuffix(target);
+  if (!goto) return false;
+  state.openWorkerTab?.("diff");
+  loadDiff(state.diff?.ref || "HEAD", goto);
+  return true;
 }
 
 // Diff: render one `git show --stat --patch` answer — the stat block first, then
@@ -614,6 +1036,7 @@ function renderWorkerDiff(out, d) {
   }
   const patch = document.createElement("div");
   patch.className = "diff-patch";
+  const rows = [];
   for (const line of patchLines) {
     const row = document.createElement("div");
     if (line.startsWith("+")) row.className = "diff-add";
@@ -621,9 +1044,28 @@ function renderWorkerDiff(out, d) {
     else if (line.startsWith("@@")) row.className = "diff-hunk";
     else row.className = "diff-ctx";
     row.textContent = line || " ";
+    rows.push(row);
     patch.append(row);
   }
   out.append(patch);
+  // path:line deep-link: scroll the target row into view and flash it for 3s
+  // (filev OpenRangeFlash — the highlight fades on its own).
+  if (d.goto) {
+    const hit = diffGotoIndexes(patchLines, d.goto);
+    if (hit.length) {
+      for (const i of hit) rows[i]?.classList?.add?.("flash");
+      rows[hit[0]]?.scrollIntoView?.({ block: "center" });
+      setTimeout(() => {
+        for (const i of hit) rows[i]?.classList?.remove?.("flash");
+      }, 3_000);
+    } else {
+      const miss = document.createElement("p");
+      miss.className = "muted small";
+      miss.textContent = `${d.goto.path}:${d.goto.line} không nằm trong diff này`;
+      out.append(miss);
+    }
+    d.goto = null; // one reveal per deep-link, not per re-render
+  }
 }
 
 function renderWorkerBox(box) {
@@ -643,7 +1085,7 @@ function renderWorkerBox(box) {
   const bar = document.createElement("div");
   bar.className = "activity-bar";
   const tabButtons = new Map();
-  for (const [key, label] of [["jobs", "Jobs"], ["search", "Search"], ["recap", "Recap"], ["usage", "Usage"], ["timeline", "Timeline"], ["diff", "Diff"]]) {
+  for (const [key, label] of [["jobs", "Jobs"], ["search", "Search"], ["recap", "Recap"], ["usage", "Usage"], ["timeline", "Chat"], ["diff", "Diff"]]) {
     const tab = document.createElement("button");
     tab.type = "button";
     tab.textContent = label;
@@ -703,7 +1145,7 @@ function renderWorkerBox(box) {
   // Timeline (usage.rollup as daily mini bars) and Diff (git show of one ref)
   // share the same activity-bar surface; both stay above the jobs list.
   const timelineView = document.createElement("div");
-  timelineView.className = "timeline-view";
+  timelineView.className = "chat-view";
   timelineView.hidden = true;
   const diffView = document.createElement("div");
   diffView.className = "diff-view";
@@ -734,6 +1176,7 @@ function renderWorkerBox(box) {
     formError.hidden = true;
     const text = prompt.value.trim();
     if (!text) return;
+    state.worker.draft = text; // the thread's user bubble when the host echoes the id
     sendPayload({ op: "worker.submit", prompt: text, ...(workspace.value.trim() ? { workspace: workspace.value.trim() } : {}) });
     prompt.value = "";
   });
@@ -742,15 +1185,15 @@ function renderWorkerBox(box) {
     const query = searchInput.value.trim();
     if (!query) return;
     state.worker.lastQuery = query;
-    sendPayload({ op: "receipt.search", query, limit: 8 });
+    fetchReceiptSearch(query);
   });
   diffForm.addEventListener("submit", (event) => {
     event.preventDefault();
     const ref = diffInput.value.trim();
     if (!ref) return;
-    state.diff = { ref, text: null, truncated: false, bytes: 0, error: null, loading: true };
-    sendPayload({ op: "diff.get", ref });
-    update(liveOnline);
+    const goto = parseLineSuffix(ref); // a path:line typed straight into the box
+    if (goto) loadDiff(state.diff?.ref || "HEAD", goto);
+    else loadDiff(ref);
   });
 
   const ui = { details, health, jobs, formError, asked: false };
@@ -758,7 +1201,7 @@ function renderWorkerBox(box) {
   for (const [key, tab] of tabButtons) {
     tab.addEventListener("click", () => {
       state.worker.tab = key;
-      if (key === "timeline" && !state.worker.usage) sendPayload({ op: "usage.rollup", days: 7 });
+      if (key === "timeline" && !state.worker.usage) fetchChatUsage();
       update(liveOnline);
     });
   }
@@ -766,7 +1209,7 @@ function renderWorkerBox(box) {
   state.openWorkerTab = (key) => {
     details.open = true;
     state.worker.tab = key;
-    if (key === "timeline" && !state.worker.usage) sendPayload({ op: "usage.rollup", days: 7 });
+    if (key === "timeline" && !state.worker.usage) fetchChatUsage();
     update(liveOnline);
   };
   const update = (online) => {
@@ -799,6 +1242,12 @@ function renderWorkerBox(box) {
     formError.hidden = !w.error;
     formError.textContent = w.error ?? "";
     searchHits.replaceChildren();
+    if (w.searchError) {
+      const banner = document.createElement("li");
+      banner.className = "error small";
+      banner.textContent = w.searchError; // transport fault — the hits below stay
+      searchHits.append(banner);
+    }
     const s = w.search;
     if (s) {
       if (Array.isArray(s.hits) && s.hits.length) {
@@ -815,7 +1264,7 @@ function renderWorkerBox(box) {
             view.className = "link";
             view.textContent = hit.body === undefined ? "view report" : "hide report";
             view.addEventListener("click", () => {
-              if (hit.body === undefined) sendPayload({ op: "receipt.body", id: hit.id });
+              if (hit.body === undefined) fetchReceiptBody(hit.id);
               else hit.body = undefined;
               update(online);
             });
@@ -868,7 +1317,7 @@ function renderWorkerBox(box) {
         view.className = "link";
         view.textContent = job.body === undefined ? "view report" : "hide report";
         view.addEventListener("click", () => {
-          if (job.body === undefined) sendPayload({ op: "receipt.body", id: job.id });
+          if (job.body === undefined) fetchReceiptBody(job.id);
           else job.body = undefined;
           update(online);
         });
@@ -899,7 +1348,7 @@ function renderWorkerBox(box) {
     }
     renderWorkerRecap(recap, w);
     renderWorkerUsage(usageView, w, online);
-    renderWorkerTimeline(timelineView, w, online);
+    renderWorkerChat(timelineView, w, online);
     renderWorkerDiff(diffOut, state.diff);
   };
   return update;
@@ -908,7 +1357,18 @@ function renderWorkerBox(box) {
 function workerJobTouched(id, fields) {
   const job = state.worker.jobs.get(id);
   if (!job) return;
+  const prevStatus = job.status;
   Object.assign(job, fields);
+  if (fields.status && fields.status !== prevStatus) {
+    // The receipt machinery running under a thread: one line in the chat, the
+    // detail (status, reason, tokens) folded behind it.
+    (job.events ??= []).push({
+      at: Date.now(),
+      status: fields.status,
+      reason: fields.reason ?? null,
+      tokens: fields.usage?.totalTokens ?? null,
+    });
+  }
   state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
 }
 
@@ -1433,6 +1893,7 @@ function connect() {
     if (state.ws !== ws) return;
     state.ws = null;
     e2eReset();
+    failAllFencedFetches("mất kết nối tới máy — giữ dữ liệu gần nhất"); // snapshots stay
     if (state.roomId && pinnedHost()) clearRoomPayload();
     if (event.code === 4001 && ["unknown device credentials", "revoked"].includes(event.reason)) {
       dropDevice();
@@ -1604,6 +2065,7 @@ function askView() {
   return sendPayload({ op: "view" });
 }
 function applyPayload(payload) {
+  if (routeFencedReply(payload)) return; // fenced: the surface that asked applies it
   // The plaintext (or decrypted) payload from the host lands here.
   if (payload && typeof payload === "object" && payload.op === "view") {
     state.view = payload.view;
@@ -1624,18 +2086,30 @@ function applyPayload(payload) {
     state.roomUi?.updateWorker?.(true);
     return;
   } else if (payload && typeof payload === "object" && payload.op === "worker.submitted") {
-    state.worker.jobs.set(payload.id, { id: payload.id, status: payload.state, duplicate: payload.duplicate === true, hasBody: false });
+    state.worker.jobs.set(payload.id, {
+      id: payload.id,
+      status: payload.state,
+      duplicate: payload.duplicate === true,
+      hasBody: false,
+      prompt: state.worker.draft ?? undefined, // the session's user bubble, when we typed it
+      ts: Date.now(),
+      principal: state.deviceId ? `device:${state.deviceId}` : null,
+      events: [],
+    });
+    state.worker.draft = null;
     sendPayload({ op: "receipt.watch", id: payload.id, wantBody: true });
     state.roomUi?.updateWorker?.(true);
     return;
   } else if (payload && typeof payload === "object" && payload.op === "worker.status.result") {
-    workerJobTouched(payload.id, { status: payload.state, ...(payload.reason ? { reason: payload.reason } : {}) });
+    workerJobTouched(payload.id, { status: payload.state, ...(payload.reason ? { reason: payload.reason } : {}), ...(payload.usage ? { usage: payload.usage } : {}) });
     return;
   } else if (payload && typeof payload === "object" && payload.op === "receipt.watched") {
-    workerJobTouched(payload.id, payload.pending ? { status: "pending" } : { status: payload.status, ...(payload.reason ? { reason: payload.reason } : {}) });
+    workerJobTouched(payload.id, payload.pending
+      ? { status: "pending" }
+      : { status: payload.status, ...(payload.reason ? { reason: payload.reason } : {}), ...(payload.usage ? { usage: payload.usage } : {}) });
     return;
   } else if (payload && typeof payload === "object" && payload.op === "receipt.push") {
-    workerJobTouched(payload.id, { status: payload.status, ...(payload.reason ? { reason: payload.reason } : {}), hasBody: payload.hasBody === true });
+    workerJobTouched(payload.id, { status: payload.status, ...(payload.reason ? { reason: payload.reason } : {}), hasBody: payload.hasBody === true, ...(payload.usage ? { usage: payload.usage } : {}) });
     sendPayload({ op: "receipt.ack", id: payload.id }); // displayed — retire the intent
     return;
   } else if (payload && typeof payload === "object" && payload.op === "receipt.search.result") {
@@ -1645,16 +2119,7 @@ function applyPayload(payload) {
     state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
     return;
   } else if (payload && typeof payload === "object" && payload.op === "receipt.body.result") {
-    workerJobTouched(payload.id, payload.text !== undefined
-      ? { body: payload.text }
-      : { body: { reason: payload.reason ?? "unavailable" } });
-    // A search hit that was never a tracked job still gets its fetched report.
-    const s = state.worker.search;
-    const hit = Array.isArray(s?.hits) ? s.hits.find((h) => h.id === payload.id) : null;
-    if (hit) {
-      hit.body = payload.text !== undefined ? payload.text : { reason: payload.reason ?? "unavailable" };
-      state.roomUi?.updateWorker?.(Boolean(state.hello?.agents?.find((r) => r.roomId === state.roomId)?.online));
-    }
+    applyBodyResult(payload); // unfenced fallback (pushes); fenced replies apply at their caller
     return;
   } else if (payload && typeof payload === "object" && payload.op === "diff.result") {
     state.diff = {
@@ -1791,7 +2256,7 @@ const CMDK_VIEWS = [
   ["search", "Search — tìm receipt theo nội dung"],
   ["recap", "Recap — đến lượt ai?"],
   ["usage", "Usage — bảng 7 ngày"],
-  ["timeline", "Timeline — thanh token theo ngày"],
+  ["timeline", "Chat — thread mỗi session"],
   ["diff", "Diff — git show một ref"],
 ];
 
@@ -1821,13 +2286,21 @@ function cmdkItems(query) {
   for (const [key, label] of CMDK_VIEWS) {
     items.push({ label: `View · ${label}`, score: fuzzyScore(query, `${key} ${label}`), run: () => state.openWorkerTab?.(key) });
   }
+  const goto = parseLineSuffix(query);
+  if (goto) {
+    items.push({
+      label: `Goto · ${goto.path}:${goto.line}${goto.end > goto.line ? `-${goto.end}` : ""}`,
+      score: 2,
+      run: () => gotoDiffLine(query),
+    });
+  }
   for (const job of [...state.worker.jobs.values()].slice(-10).reverse()) {
     items.push({
       label: `Receipt · ${job.id.slice(0, 8)} · ${job.status}${job.reason ? ` (${job.reason})` : ""}`,
       score: fuzzyScore(query, `${job.id} ${job.status} ${job.reason ?? ""}`),
       run: () => {
         state.openWorkerTab?.("jobs");
-        if (job.status === "replied") sendPayload({ op: "receipt.body", id: job.id });
+        if (job.status === "replied") fetchReceiptBody(job.id);
         else if (job.status === "unknown") sendPayload({ op: "receipt.get", id: job.id });
       },
     });
@@ -1841,9 +2314,7 @@ function cmdkItems(query) {
 /** Jump straight to the Diff view with a ref (palette or URL hand-off). */
 function openDiffRef(ref) {
   state.openWorkerTab?.("diff");
-  state.diff = { ref, text: null, truncated: false, bytes: 0, error: null, loading: true };
-  sendPayload({ op: "diff.get", ref });
-  state.roomUi?.updateWorker?.(true);
+  loadDiff(ref);
 }
 
 let cmdk = null;
@@ -2099,7 +2570,12 @@ function resetRoomView() {
   state.viewError = null;
   state.roomUi = null;
   state.diff = null;
+  state.chat = { filter: null, spawn: null };
+  state.worker.chatError = null;
+  state.worker.searchError = null;
+  state.worker.bodyError = null;
   state.openWorkerTab = null;
+  newGeneration(); // a new mount: replies answering the old generation are dropped
   $("view").replaceChildren();
 }
 
@@ -2168,4 +2644,54 @@ if ("serviceWorker" in navigator && location.protocol !== "file:") {
       /* an app without offline start is still an app */
     });
   });
+}
+
+// ---- node:test seam ----------------------------------------------------------
+// The PWA suite runs this file in a bare VM and anchors these helpers through
+// `globalThis.__herdgateWebTest`. The browser never defines the anchor, so this
+// block is inert in production.
+{
+  const anchor = globalThis.__herdgateWebTest;
+  if (anchor) {
+    Object.assign(anchor, {
+      parseLineSuffix,
+      newGeneration,
+      generationCurrent,
+      diffGotoIndexes,
+      fetchInfo: () => ({
+        gen: fetches.gen,
+        inflight: [...fetches.inflight.values()].map((e) => ({ key: e.key, gen: e.gen, fresh: e.fresh })),
+      }),
+      fetchDrive: (op, replyOp, payload, opts) => {
+        const sent = [];
+        state.roomId ??= "pwa3-room";
+        state.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+        return { sent, promise: opFetch(op, replyOp, payload, opts) };
+      },
+      fetchReply: (payload) => routeFencedReply(payload),
+      online: () => {
+        state.roomId ??= "pwa3-room";
+        state.ws = { readyState: 1, send() {} };
+      },
+      offline: () => { state.ws = null; },
+      chatFetch: (fresh) => fetchChatUsage(fresh),
+      chatSnap: () => ({
+        usage: state.worker.usage ?? null,
+        chatError: state.worker.chatError ?? null,
+        filter: state.chat.filter ?? null,
+      }),
+      probe: {
+        thread: (job) => chatThread(job),
+        subagent: (name, extra = {}) => subagentCard({
+          principal: `spawn:${name}`, requests: 1, replied: 1, failed: 0,
+          tokens: 4321, costUsd: 0.01, lastTs: Date.now() - 60_000, ...extra,
+        }, true),
+        linked: (text) => {
+          const el = document.createElement("div");
+          appendLinkedText(el, text);
+          return el;
+        },
+      },
+    });
+  }
 }
