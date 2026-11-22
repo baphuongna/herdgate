@@ -38,8 +38,27 @@ import { type Account, type DeviceRecord, type RoomRecord, State } from "./store
 import { pruneBudget, readJsonBody, randomId, sameSecret, sha256Hex } from "./util.ts";
 import { serveStatic } from "./static.ts";
 import { startSshd, type SshHandle, type SshConfig } from "./sshd.ts";
-import { pushEndpoint, sendWake } from "./push.ts";
+import { pushEndpoint, sendPush, encryptPayload, canPayload, type PushKeys } from "./push.ts";
 import { type VapidKeys } from "./vapid.ts";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/** The gate's own build id (npm package version) — served on /healthz so a PWA can
+ *  detect that the bundle it is running is older than the gate and offer a reload. */
+const BUILD_ID: string = (() => {
+  try {
+    return String(JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../package.json"), "utf8")).version ?? "");
+  } catch {
+    return "";
+  }
+})();
+
+/** What changed on the host, for the encrypted push payload (Vietnamese copy is PWA-side). */
+export interface WakeNote {
+  kind: "settle" | "died" | "needs-you" | "activity";
+  agent?: string;
+}
 
 export interface CloudConfig {
   accounts: { id: string; name: string; token: string }[];
@@ -178,13 +197,27 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     return s;
   };
   const pendingWakes = new Set<string>();
-  const wakeDevice = (deviceId: string): void => {
+  /** Push a wake to an away device. `note` (from the host) upgrades the ping to an
+   *  encrypted payload when the subscription captured its p256dh/auth keys — the
+   *  provider still sees only ciphertext; keyless subscriptions keep the silent ping. */
+  const wakeDevice = (deviceId: string, note?: WakeNote): void => {
     const push = cfg.push;
-    const endpoint = pushEndpoint(state.deviceById(deviceId)?.push?.endpoint ?? "");
+    const rec = state.deviceById(deviceId);
+    const endpoint = pushEndpoint(rec?.push?.endpoint ?? "");
     if (!push || !endpoint || pendingWakes.has(deviceId) || pendingWakes.size >= 8) return;
     pendingWakes.add(deviceId);
-    void sendWake(endpoint, push.keys, push.sub).catch(() => log("push: wake failed"))
-      .finally(() => pendingWakes.delete(deviceId));
+    const send = async (): Promise<void> => {
+      const keys = rec?.push;
+      if (note && keys && canPayload(keys)) {
+        const payload = Buffer.from(JSON.stringify({
+          v: 1, kind: note.kind, room: rec!.roomId, ...(note.agent ? { agent: note.agent } : {}),
+        }), "utf8");
+        const body = encryptPayload(payload, keys.p256dh!, keys.auth!);
+        return sendPush(endpoint, push.keys, push.sub, body, note.kind === "needs-you" || note.kind === "died" ? "high" : "normal");
+      }
+      return sendPush(endpoint, push.keys, push.sub, null, "normal");
+    };
+    void send().catch(() => log("push: wake failed")).finally(() => pendingWakes.delete(deviceId));
   };
 
   const streamEmit = (roomId: string, msg: Record<string, unknown>, device?: string): void => {
@@ -420,14 +453,26 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         }
         case "wake": {
           // The host asks for a phone to be woken: deliver a silent push only if the
-          // device is not connected right now (a connected one is already live).
+          // device is not connected right now (a connected one is already live). A
+          // `note` upgrades the ping to an encrypted payload (settle / died / needs-you)
+          // when the subscription carries its RFC 8291 keys.
           if (!cfg.push) return fail(ws, "no-push", "push is not configured");
           const deviceId = typeof m.device === "string" ? m.device : null;
           if (!deviceId) return fail(ws, "bad-message", "wake.device");
           const rec = state.deviceById(deviceId);
           if (!rec || rec.roomId !== room.id) return fail(ws, "no-such-device", "not one of this room's devices");
+          const rawNote = m.note;
+          let note: WakeNote | undefined;
+          if (rawNote && typeof rawNote === "object") {
+            const kind = (rawNote as { kind?: unknown }).kind;
+            const agent = (rawNote as { agent?: unknown }).agent;
+            if (kind !== "settle" && kind !== "died" && kind !== "needs-you" && kind !== "activity") {
+              return fail(ws, "bad-message", "wake.note.kind");
+            }
+            note = { kind, ...(typeof agent === "string" && agent.length <= 64 ? { agent: agent.slice(0, 64) } : {}) };
+          }
           if ([...deviceConns].some((c) => c.device?.id === deviceId)) return;
-          wakeDevice(deviceId);
+          wakeDevice(deviceId, note);
           return;
         }
         case "ping":
@@ -816,7 +861,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
     const path = url.pathname;
 
     if (req.method === "GET" && path === "/healthz") {
-      res.writeHead(200);
+      res.writeHead(200, BUILD_ID ? { "x-hg-build": BUILD_ID } : undefined);
       return res.end("ok");
     }
 
@@ -897,7 +942,15 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
         const validated = pushEndpoint(endpoint);
         if (!validated) return json(res, 400, { error: "unsupported push endpoint" });
-        state.setDevicePush(device.id, validated.href);
+        // Optional RFC 8291 keys: validate the shapes once here, then store verbatim.
+        // A subscription without them keeps working as a silent wake ping.
+        const p256dh = typeof body?.p256dh === "string" ? body.p256dh : "";
+        const auth = typeof body?.auth === "string" ? body.auth : "";
+        if ((p256dh || auth) && !canPayload({ p256dh, auth })) {
+          return json(res, 400, { error: "bad push keys" });
+        }
+        const keys: PushKeys | undefined = p256dh && auth ? { p256dh, auth } : undefined;
+        state.setDevicePush(device.id, validated.href, keys);
         return json(res, 200, { ok: true });
       });
     }
@@ -917,7 +970,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       return json(res, 200, {
         devices: state.devices
           .filter((d) => d.roomId === room.id)
-          .map((d) => ({ id: d.id, name: d.name, scope: d.scope, connected: live.has(d.id), keys: (d.sshKeys ?? []).length, created: d.created })),
+          .map((d) => ({ id: d.id, name: d.name, scope: d.scope, connected: live.has(d.id), keys: (d.sshKeys ?? []).length, created: d.created, push: !!d.push, payload: canPayload(d.push) })),
       });
     }
     if (path === "/v1/device/revoke") {

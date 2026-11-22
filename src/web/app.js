@@ -2362,7 +2362,11 @@ function applyPayload(payload) {
 
 // ---- push wake ---------------------------------------------------------------
 
-/** Subscribe this device to silent wake pushes; ask for permission only once paired. */
+/** Subscribe this device to silent wake pushes; ask for permission only once paired.
+ *  The subscription's p256dh/auth keys ride along so the gate can send ENCRYPTED
+ *  payloads (RFC 8291) — and if the gate ever rotates its VAPID keypair, the old
+ *  subscription would silently stop delivering, so the key is checked every time
+ *  and a mismatch re-subscribes fresh (a subscription is bound to its birth key). */
 async function subscribePush() {
   const { deviceId, deviceSecret } = state;
   const base = cloudBase();
@@ -2370,24 +2374,39 @@ async function subscribePush() {
   if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
   try {
     const reg = await navigator.serviceWorker.ready;
+    const keyRes = await fetch(`${base}/v1/push/key`);
+    if (!keyRes.ok) return; // push disabled on this cloud
+    const { publicKey } = await keyRes.json();
+    const raw = Uint8Array.from(atob(publicKey.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
     let sub = await reg.pushManager.getSubscription();
+    if (sub && !keysMatch(sub.options.applicationServerKey, raw)) {
+      await sub.unsubscribe(); // born under an older VAPID key — dead weight
+      sub = null;
+    }
     if (!sub) {
-      const keyRes = await fetch(`${base}/v1/push/key`);
-      if (!keyRes.ok) return; // push disabled on this cloud
-      const { publicKey } = await keyRes.json();
-      const raw = Uint8Array.from(atob(publicKey.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
       sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: raw });
     }
     const endpoint = sub.endpoint;
     if (cloudBase() !== base || state.deviceId !== deviceId) return;
+    const j = sub.toJSON();
     await fetch(`${base}/v1/device/push`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ device: deviceId, deviceSecret, endpoint }),
+      body: JSON.stringify({ device: deviceId, deviceSecret, endpoint, p256dh: j.keys?.p256dh, auth: j.keys?.auth }),
     });
   } catch {
     /* permission denied or push unavailable: the gate still works without it */
   }
+}
+
+/** A push subscription is permanently bound to the VAPID key it was created with.
+ *  Byte-compare the subscription's key with the server's current one. */
+function keysMatch(existing, serverKey) {
+  if (!existing) return false;
+  const a = "buffer" in existing ? new Uint8Array(existing.buffer, existing.byteOffset, existing.byteLength) : new Uint8Array(0);
+  if (a.length !== serverKey.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== serverKey[i]) return false;
+  return true;
 }
 
 /** The host answered our handshake: finish it, pin its fingerprint (TOFU). */
@@ -2804,7 +2823,96 @@ function forgetToken() {
   }
 }
 
+// Deep link #room=<id>: a notification tap opens the app straight into that room.
+// The saved pairing is enough to enter; an unknown room falls back to the list.
+function roomFromHash() {
+  const m = /^#room=([A-Za-z0-9_-]{1,64})$/.exec(location.hash ?? "");
+  if (!m) return null;
+  const id = m[1];
+  const pair = roomPairs().get(id);
+  if (pair && state.token) selectRoom(id, pair, true);
+  return id;
+}
+if (typeof addEventListener === "function") addEventListener("hashchange", roomFromHash);
+
+// A notification tap on an OPEN window arrives as { t: "nav", room } from the SW —
+// navigate in place, no reload (pairing and drafts survive).
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    const d = event.data;
+    if (d?.t === "nav" && typeof d.room === "string" && state.token) {
+      const pair = roomPairs().get(d.room);
+      if (pair) selectRoom(d.room, pair, true);
+    }
+  });
+}
+
+// ---- self-update --------------------------------------------------------------
+// The gate stamps its build id on /healthz (x-hg-build). When the serving gate is
+// NEWER than the bundle this page booted from, reload — but only after two agreeing
+// polls (hysteresis: an atomic dist swap must not half-trigger), at most once per
+// build id (sessionStorage guard against a reload loop), and never while the user
+// is typing (an input holding text holds the reload; the banner shows instead).
+{
+  const SEEN_KEY = "hg:build-seen";
+  let pendingBuild = null;
+  let banner = null;
+  const reloadedKey = (id) => `hg:auto-reloaded:${id}`;
+  const holdActive = () => {
+    const el = document.activeElement;
+    return !!el && /^(INPUT|TEXTAREA)$/.test(el.tagName) && el.value !== "";
+  };
+  const showBanner = (on) => {
+    let node = document.getElementById("upd");
+    if (!node && on) {
+      node = document.createElement("div");
+      node.id = "upd";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = "Bản mới — chạm để cập nhật";
+      btn.addEventListener("click", () => {
+        localStorage.setItem(SEEN_KEY, pendingBuild ?? "");
+        location.reload();
+      });
+      node.append(btn);
+      document.body.append(node);
+    }
+    banner = node;
+    if (node) node.hidden = !on;
+  };
+  const act = (id) => {
+    let already = false;
+    try { already = sessionStorage.getItem(reloadedKey(id)) !== null; } catch { already = false; }
+    if (already || holdActive()) return showBanner(true);
+    try { sessionStorage.setItem(reloadedKey(id), "1"); } catch { /* storage off — reload anyway */ }
+    localStorage.setItem(SEEN_KEY, id);
+    location.reload();
+  };
+  const checkBuild = async () => {
+    try {
+      const res = await fetch("/healthz", { cache: "no-store" });
+      const id = res.headers.get("x-hg-build");
+      if (!id) return;
+      let seen = null;
+      try { seen = localStorage.getItem(SEEN_KEY); } catch { seen = null; }
+      if (!seen) { localStorage.setItem(SEEN_KEY, id); return; } // first boot on this device
+      if (id === seen) { pendingBuild = null; showBanner(false); return; }
+      if (id === pendingBuild) { act(id); return; } // second agreeing sighting
+      pendingBuild = id; // first sighting — wait one more poll
+    } catch {
+      /* offline: try again on the next tick */
+    }
+  };
+  if (typeof addEventListener === "function") {
+    addEventListener("load", () => {
+      void checkBuild();
+      if (typeof setInterval === "function") setInterval(checkBuild, 5 * 60_000);
+    });
+  }
+}
+
 render();
+roomFromHash();
 if (state.token) connect();
 
 // A phone that wakes up should not show a dead screen.

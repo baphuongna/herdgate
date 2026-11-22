@@ -3,8 +3,12 @@
 //
 // Bump VERSION when a shell file changes; old caches are dropped on activate.
 
-const VERSION = "herdgate-v17";
-const SHELL = ["/", "/app.css", "/e2e.js", "/app.js", "/app.webmanifest", "/icons/icon.svg"];
+const VERSION = "herdgate-v18";
+const SHELL = ["/", "/app.css", "/e2e.js", "/app.js", "/app.webmanifest", "/icons/icon.svg", "/push-decision.js"];
+
+// The push decision table lives in its own plain file so Node tests can load it too
+// (importScripts works in a classic worker; the file assigns onto `self`).
+importScripts("/push-decision.js");
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -27,17 +31,42 @@ self.addEventListener("activate", (event) => {
   );
 });
 
-// Push wake: the cloud sends a silent, payload-less ping (VAPID) when the host has
-// news and this device is away. If a window is already open its socket reconnects on
-// its own — otherwise raise a notification that opens the app.
+// Push wake: the gate sends either a silent payload-less ping (legacy / keyless
+// subscriptions) or an encrypted payload (RFC 8291) saying WHAT changed — settle,
+// died, needs-you or plain activity. The decision table is in push-decision.js:
+// a visible client suppresses (the in-app UI already surfaces it), a retraction
+// closes the slot regardless, otherwise one notification per room (tag coalesce).
 self.addEventListener("push", (event) => {
   event.waitUntil(
     (async () => {
+      let data = null;
+      try {
+        data = event.data ? event.data.json() : null;
+      } catch {
+        data = null; // not JSON — treat as a legacy silent ping
+      }
       const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-      if (all.length > 0) {
-        for (const client of all) client.postMessage({ t: "wake" });
+      const hasVisibleClient = all.some((c) => c.visibilityState === "visible");
+      const d = self.hgDecidePush(data, hasVisibleClient);
+      if (d.kind === "clear") {
+        for (const n of await self.registration.getNotifications({ tag: d.tag })) n.close();
         return;
       }
+      if (d.kind === "suppress" || d.kind === "legacy") {
+        for (const client of all) client.postMessage({ t: "wake" });
+        if (d.kind === "suppress" || all.length > 0) return;
+        // legacy with no window at all → the generic notification below
+      }
+      if (d.kind === "show") {
+        await self.registration.showNotification(d.title, {
+          body: d.body,
+          tag: d.tag,
+          renotify: d.renotify,
+          data: { room: d.room, agent: d.agent },
+        });
+        return;
+      }
+      // Legacy silent ping with no window: generic notification (old behaviour).
       await self.registration.showNotification("herdgate", {
         body: "Có hoạt động mới trên máy của bạn — chạm để mở.",
         tag: "herdgate-wake",
@@ -51,9 +80,17 @@ self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   event.waitUntil(
     (async () => {
+      const room = event.notification.data && event.notification.data.room;
       const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-      for (const client of all) if ("focus" in client) return client.focus();
-      return self.clients.openWindow("/");
+      // An open window navigates in place (no reload — pairing and drafts survive);
+      // with none open, land on the deep link `/#room=<id>` and let the app route it.
+      if (all.length > 0) {
+        const win = all.find((c) => "focus" in c) ?? all[0];
+        await win.focus();
+        if (room) win.postMessage({ t: "nav", room });
+        return;
+      }
+      return self.clients.openWindow(room ? "/#room=" + encodeURIComponent(room) : "/");
     })(),
   );
 });

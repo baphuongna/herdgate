@@ -36,8 +36,10 @@ export interface DeviceRecord {
   created: string;
   /** sha256 of the device's own secret; the plaintext exists only at pair time. */
   secretHash?: string;
-  /** The device's web-push subscription endpoint for silent wake pings (VAPID). */
-  push?: { endpoint: string; at: string };
+  /** The device's web-push subscription: endpoint for silent wake pings (VAPID) plus
+   *  the user-agent half for encrypted payloads (RFC 8291) — p256dh (65-byte point,
+   *  base64url) and auth (16 bytes). Old subscriptions carry the endpoint only. */
+  push?: { endpoint: string; at: string; p256dh?: string; auth?: string };
   /** SSH public keys this device may log in with (authorized_keys lines, parsed). */
   sshKeys?: { algo: string; b64: string; comment?: string; at: string }[];
 }
@@ -117,11 +119,13 @@ export class State {
     return this.devices.find((d) => d.id === id) ?? null;
   }
 
-  /** Remember (or forget, with a null endpoint) where to wake a device. */
-  setDevicePush(id: string, endpoint: string | null): boolean {
+  /** Remember (or forget, with a null endpoint) where to wake a device. `keys` is
+   *  the subscription's p256dh/auth pair (validated by the caller) — present only
+   *  on subscriptions made by the current PWA; absent keeps the legacy silent ping. */
+  setDevicePush(id: string, endpoint: string | null, keys?: { p256dh: string; auth: string }): boolean {
     const d = this.deviceById(id);
     if (!d) return false;
-    d.push = endpoint ? { endpoint, at: new Date().toISOString() } : undefined;
+    d.push = endpoint ? { endpoint, at: new Date().toISOString(), ...keys } : undefined;
     if (!endpoint) delete d.push;
     this.#save();
     return true;

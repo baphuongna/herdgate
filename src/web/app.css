@@ -710,3 +710,23 @@ button.attach {
   box-shadow: 0 6px 24px rgb(0 0 0 / 0.35);
   z-index: 40;
 }
+
+/* Self-update banner: a newer gate than the running bundle — shown only when the
+   reload has to wait (once-per-build already used, or the user is typing). */
+#upd {
+  position: fixed;
+  left: 50%;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 14px);
+  transform: translateX(-50%);
+  z-index: 45;
+}
+#upd button {
+  background: var(--accent, #4da3ff);
+  color: #0b1220;
+  border: none;
+  border-radius: 999px;
+  padding: 10px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.4);
+}

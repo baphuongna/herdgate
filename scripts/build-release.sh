@@ -21,7 +21,7 @@ CLOUD="$STAGE/$NAME"
 mkdir -p "$CLOUD/runtime/web/icons" "$CLOUD/scripts"
 
 npm run build:cloud -- --outDir "$CLOUD/runtime"
-cp src/web/{index.html,app.js,app.css,app.webmanifest,sw.js,e2e.js} "$CLOUD/runtime/web/"
+cp src/web/{index.html,app.js,app.css,app.webmanifest,sw.js,e2e.js,push-decision.js} "$CLOUD/runtime/web/"
 cp src/web/icons/{icon.svg,icon-192.png,icon-512.png} "$CLOUD/runtime/web/icons/"
 cp templates/cloud/{Dockerfile,compose.yml,compose.env.example,.dockerignore,herdgate-cloud.service,herdgate-cloud-edge.service,Caddyfile.example,README.md} "$CLOUD/"
 cp templates/cloud/gitignore.example "$CLOUD/.gitignore"

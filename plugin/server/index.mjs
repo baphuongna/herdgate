@@ -453,13 +453,13 @@ async function publisherLoop() {
       const known = devices.find(d => d.id === sub.device);
       if (known && known.connected !== false) continue;
       log(`receipts: wake ${sub.device} (settle while offline)`);
-      wakeAway(true);
+      wakeAway(true, { kind: "settle", agent: entry.title ?? undefined });
     }
   };
 
   /** Wake phones that are away when something actually changed (throttled per device). */
   const lastWake = new Map(); // deviceId → epoch ms
-  const wakeAway = (changed) => {
+  const wakeAway = (changed, note = { kind: "activity" }) => {
     if (!changed) return;
     const now = Date.now();
     for (const d of devices) {
@@ -467,7 +467,7 @@ async function publisherLoop() {
       const at = lastWake.get(d.id) ?? 0;
       if (now - at < 5 * 60_000) continue;
       lastWake.set(d.id, now);
-      if (wsRef && wsRef.readyState === 1) wsRef.send(JSON.stringify({ v: 1, t: "wake", device: d.id }));
+      if (wsRef && wsRef.readyState === 1) wsRef.send(JSON.stringify({ v: 1, t: "wake", device: d.id, note }));
     }
   };
 
