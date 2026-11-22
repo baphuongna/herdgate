@@ -76,10 +76,11 @@ test("web: the worker panel submits, tracks the settle push, fetches the report,
     device.close();
 
     const storage = new Map([["herdgate.token", accountToken], ["herdgate.device", grant.device.id], ["herdgate.deviceSecret", grant.deviceSecret]]);
-    const source = readFileSync(new URL("../src/web/app.js", import.meta.url), "utf8").replace(/^import .* from "\/e2e.js";$/m, "");
+    const source = readFileSync(new URL("../src/web/app.js", import.meta.url), "utf8").replace(/^import .*$/gm, "");
     const doc = new Element();
     const $ = (id: string) => doc.querySelector(id);
-    runInNewContext(source, {
+    const fuzzy = readFileSync(new URL("../src/web/fuzzy.js", import.meta.url), "utf8");
+    runInNewContext(fuzzy + "\n" + source, {
       document: Object.assign(doc, { getElementById: $, createElement: () => new Element() }), Element,
       navigator: { userAgent: "test" }, location: { origin: base },
       localStorage: { getItem: (k: string) => storage.get(k) ?? null, setItem: (k: string, v: string) => storage.set(k, v), removeItem: (k: string) => storage.delete(k) },
@@ -259,11 +260,12 @@ test("web: separate room pairings survive reload, and pinned rooms reject plaint
     const grant = await old.expect("pair.granted") as unknown as { device: { id: string }; deviceSecret: string };
     old.close();
     const storage = new Map([["herdgate.token", accountToken], ["herdgate.device", grant.device.id], ["herdgate.deviceSecret", grant.deviceSecret]]);
-    const source = readFileSync(new URL("../src/web/app.js", import.meta.url), "utf8").replace(/^import .* from "\/e2e.js";$/m, "");
+    const source = readFileSync(new URL("../src/web/app.js", import.meta.url), "utf8").replace(/^import .*$/gm, "");
     const browser = (realCrypto = false) => {
       const doc = new Element();
       const $ = (id: string) => doc.querySelector(id);
-      runInNewContext(source, {
+      const fuzzy = readFileSync(new URL("../src/web/fuzzy.js", import.meta.url), "utf8");
+      runInNewContext(fuzzy + "\n" + source, {
         document: Object.assign(doc, { getElementById: $, createElement: () => new Element() }), Element,
         navigator: { userAgent: "test" }, location: { origin: base },
         localStorage: { getItem: (k: string) => storage.get(k) ?? null, setItem: (k: string, v: string) => storage.set(k, v), removeItem: (k: string) => storage.delete(k) },

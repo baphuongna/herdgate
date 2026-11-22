@@ -38,6 +38,7 @@ function clearLegacyPair() {
 }
 
 import { DeviceChannel, generateKeyPair, needsRekey } from "/e2e.js";
+import { hgFuzzy } from "/fuzzy.js";
 
 // E2E payloads: this device's Noise_XX identity (kept locally, never sent to the cloud
 // in the clear) and the host fingerprints it has pinned (TOFU per room).
@@ -159,7 +160,7 @@ const state = {
   termBody: null,
   termPre: null,
   retry: 0,
-  worker: { health: null, jobs: new Map(), error: null, search: null, searchError: null, tab: "jobs", usage: null, chatError: null, bodyError: null, draft: null, enrich: null },
+  worker: { health: null, jobs: new Map(), error: null, search: null, searchError: null, tab: "jobs", usage: null, chatError: null, bodyError: null, draft: null, enrich: null, files: { tree: null, total: 0, capped: false, loading: false, error: null, query: "", open: null, text: null, lines: 0, truncated: false, goto: null, search: "" } },
   diff: null,
   chat: { filter: null, spawn: null },
 };
@@ -915,6 +916,7 @@ function fetchReceiptBody(id) {
  *  ("no readable transcript…" is data, not a bug to swallow); a transport
  *  fault keeps the shared never-blank banner instead of closing the panel. */
 const ENRICH_ERR_CODES = new Set(["receipt.enrich", "pi_receipts_disabled"]);
+const FILE_ERR_CODES = new Set(["diff.repo", "files.tree", "files.read", "bad-path", "no-file", "file.tree", "file.read"]);
 
 function fetchReceiptEnrich(id) {
   state.worker.enrich = { id, loading: true, error: null, result: null };
@@ -1131,6 +1133,173 @@ function gotoDiffLine(target) {
   return true;
 }
 
+// ---- Files (filev): fuzzy find, read one, smartcase in-file search -------------
+
+function fetchFileTree() {
+  const w = state.worker.files;
+  w.loading = true;
+  const gen = currentGeneration();
+  opFetch("file.tree", "file.tree.result", {}, { key: "file-tree", fresh: true, errCodes: FILE_ERR_CODES })
+    .then((p) => {
+      if (!generationCurrent(gen)) return;
+      w.loading = false;
+      if (isTransportFault(p)) { w.error = p.message; return; }
+      if (p.op === "error") { w.error = p.message; return; }
+      w.error = null;
+      w.tree = p.files ?? [];
+      w.total = p.total ?? w.tree.length;
+      w.capped = Boolean(p.capped);
+    })
+    .catch(() => { if (generationCurrent(gen)) { w.loading = false; w.error = "file.tree không trả lời"; } });
+}
+
+function openFileAt(path, goto) {
+  const w = state.worker.files;
+  state.openWorkerTab?.("files");
+  w.open = path;
+  w.text = null;
+  w.error = null;
+  w.goto = goto ?? null;
+  w.search = "";
+  const gen = currentGeneration();
+  opFetch("file.read", "file.read.result", { path }, { key: `file-read:${path}`, fresh: true, errCodes: FILE_ERR_CODES })
+    .then((p) => {
+      if (!generationCurrent(gen) || w.open !== path) return;
+      if (isTransportFault(p)) { w.error = p.message; return; }
+      if (p.op === "error") { w.error = p.message; return; }
+      w.error = null;
+      w.text = typeof p.text === "string" ? p.text : "";
+      w.lines = p.lines ?? 0;
+      w.truncated = Boolean(p.truncated);
+    })
+    .catch(() => { if (generationCurrent(gen) && w.open === path) w.error = "file.read không trả lời"; });
+}
+
+/** Render the Files surface into its slot: the fuzzy list, or the open file with
+ *  line numbers, search highlighting and a path:line flash. Wire-only — the
+ *  scoring lives in /fuzzy.js, the hardening on the host. */
+function renderWorkerFiles(out, w) {
+  out.replaceChildren();
+  if (w.error) {
+    out.append(note(w.error, "error"));
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "link";
+    back.textContent = "← danh sách file";
+    back.addEventListener("click", () => { const f = state.worker.files; f.error = null; f.open = null; f.text = null; });
+    out.append(back);
+    return;
+  }
+  if (w.open) {
+    renderFileBody(out, w);
+    return;
+  }
+  if (w.loading) {
+    out.append(note("đang đọc cây file…"));
+    return;
+  }
+  if (!w.tree) {
+    out.append(note("chưa có cây file — mở tab Files khi host online."));
+    return;
+  }
+  const paths = w.tree.map((f) => f.path);
+  const statusOf = new Map(w.tree.map((f) => [f.path, f.status]));
+  const ranked = w.query ? hgFuzzy.matchAndRank(w.query, paths) : paths.map((_, i) => i);
+  const shown = ranked.slice(0, 100).map((i) => w.tree[i]);
+  if (w.capped) out.append(note(`cây bị giới hạn ${w.tree.length}/${w.total} file — tìm mờ để lọc.`));
+  const list = document.createElement("ul");
+  list.className = "files-list";
+  for (const f of shown) {
+    const li = document.createElement("li");
+    const row = document.createElement("button");
+    row.type = "button";
+    const mark = document.createElement("span");
+    mark.className = `fstat ${f.status ? "fstat-" + f.status[0] : ""}`;
+    mark.textContent = f.status ? f.status[0] : "·";
+    const name = document.createElement("span");
+    name.className = "fpath";
+    name.textContent = f.path;
+    row.append(mark, name);
+    row.addEventListener("click", () => openFileAt(f.path));
+    li.append(row);
+    list.append(li);
+  }
+  out.append(list);
+  if (!shown.length) out.append(note(w.query ? "không file nào khớp truy vấn." : "repo rỗng (không có file nào được git theo dõi)."));
+}
+
+function renderFileBody(out, w) {
+  const head = document.createElement("div");
+  head.className = "files-head";
+  const back = document.createElement("button");
+  back.type = "button";
+  back.className = "link";
+  back.textContent = "← files";
+  back.addEventListener("click", () => { w.open = null; w.text = null; w.goto = null; });
+  const title = document.createElement("span");
+  title.className = "fpath";
+  title.textContent = w.open;
+  head.append(back, title);
+  if (w.truncated) head.append(note(" (capped 256KiB)", "small"));
+  const search = document.createElement("input");
+  search.type = "text";
+  search.placeholder = "tìm trong file (smartcase)";
+  search.maxLength = 128;
+  search.className = "file-search";
+  search.value = w.search;
+  search.addEventListener("input", () => { w.search = search.value; });
+  head.append(search);
+  out.append(head);
+  if (w.text === null) {
+    out.append(note(`đang đọc ${w.open}…`));
+    return;
+  }
+  const lines = w.text.split("\n");
+  const body = document.createElement("div");
+  body.className = "file-body";
+  let firstHit = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const row = document.createElement("div");
+    row.className = "file-line";
+    const no = document.createElement("span");
+    no.className = "line-no";
+    no.textContent = String(i + 1);
+    row.append(no);
+    const text = lines[i] || " ";
+    if (w.search) {
+      const hits = hgFuzzy.searchLine(text, w.search);
+      let at = 0;
+      for (const [s, e] of hits) {
+        if (s > at) row.append(document.createTextNode(text.slice(at, s)));
+        const hit = document.createElement("span");
+        hit.className = "file-hit";
+        hit.textContent = text.slice(s, e);
+        row.append(hit);
+        at = e;
+        if (firstHit === -1) firstHit = i;
+      }
+      row.append(document.createTextNode(text.slice(at)));
+    } else {
+      row.append(document.createTextNode(text));
+    }
+    body.append(row);
+  }
+  out.append(body);
+  // path:line flash (the same 3s reveal the diff uses) — goto wins over search.
+  const target = w.goto;
+  w.goto = null;
+  const flashRows = body.children;
+  const applyFlash = (idx) => {
+    for (let k = Math.max(0, idx - 2); k <= Math.min(flashRows.length - 1, idx + 2); k++) flashRows[k]?.classList?.add?.("flash");
+    flashRows[idx]?.scrollIntoView?.({ block: "center" });
+    setTimeout(() => {
+      for (let k = 0; k < flashRows.length; k++) flashRows[k]?.classList?.remove?.("flash");
+    }, 3000);
+  };
+  if (target && target.line >= 1 && target.line <= lines.length) applyFlash(target.line - 1);
+  else if (firstHit >= 0) applyFlash(firstHit);
+}
+
 // Diff: render one `git show --stat --patch` answer — the stat block first, then
 // the patch with + green, - red, @@ purple. A truncated patch says so plainly.
 function renderWorkerDiff(out, d) {
@@ -1196,6 +1365,16 @@ function renderWorkerDiff(out, d) {
       miss.className = "muted small";
       miss.textContent = `${d.goto.path}:${d.goto.line} không nằm trong diff này`;
       out.append(miss);
+      const direct = document.createElement("button");
+      direct.type = "button";
+      direct.className = "link";
+      direct.textContent = "mở trực tiếp file này →";
+      direct.addEventListener("click", () => {
+        const goto = d.goto;
+        d.goto = null;
+        openFileAt(goto.path, goto);
+      });
+      out.append(direct);
     }
     d.goto = null; // one reveal per deep-link, not per re-render
   }
@@ -1218,7 +1397,7 @@ function renderWorkerBox(box) {
   const bar = document.createElement("div");
   bar.className = "activity-bar";
   const tabButtons = new Map();
-  for (const [key, label] of [["jobs", "Jobs"], ["search", "Search"], ["recap", "Recap"], ["usage", "Usage"], ["timeline", "Chat"], ["diff", "Diff"]]) {
+  for (const [key, label] of [["jobs", "Jobs"], ["search", "Search"], ["recap", "Recap"], ["usage", "Usage"], ["timeline", "Chat"], ["diff", "Diff"], ["files", "Files"]]) {
     const tab = document.createElement("button");
     tab.type = "button";
     tab.textContent = label;
@@ -1343,8 +1522,40 @@ function renderWorkerBox(box) {
   const diffOut = document.createElement("div");
   diffOut.className = "diff-out";
   diffView.append(diffForm, diffOut);
-  details.append(summary, health, refresh, bar, form, formError, search, recap, usageView, timelineView, diffView, jobs);
+
+  // Files (filev pattern): the host repo's tracked files — fuzzy find, read one
+  // file, smartcase in-file search, path:line jump. Read-only like every view op.
+  const filesView = document.createElement("div");
+  filesView.className = "files-view";
+  filesView.hidden = true;
+  const filesForm = document.createElement("form");
+  filesForm.autocomplete = "off";
+  const filesLabel = document.createElement("label");
+  filesLabel.textContent = "Files — repo trên máy, chỉ đọc (tìm mờ · enter mở file đầu tiên)";
+  const filesInput = document.createElement("input");
+  filesInput.type = "text";
+  filesInput.maxLength = 128;
+  filesInput.placeholder = "vd: index.mjs · wake · test/push";
+  filesForm.append(filesLabel, filesInput);
+  const filesOut = document.createElement("div");
+  filesOut.className = "files-out";
+  filesView.append(filesForm, filesOut);
+  details.append(summary, health, refresh, bar, form, formError, search, recap, usageView, timelineView, diffView, filesView, jobs);
   box.append(details);
+
+  filesForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const f = state.worker.files;
+    f.query = filesInput.value.trim();
+    // Enter opens the best match — the fuzzy finder's one-keystroke path.
+    if (f.tree && f.query) {
+      const best = hgFuzzy.matchAndRank(f.query, f.tree.map((x) => x.path))[0];
+      if (best !== undefined) openFileAt(f.tree[best].path);
+    }
+  });
+  filesInput.addEventListener("input", () => {
+    state.worker.files.query = filesInput.value.trim();
+  });
 
   const askHealth = () => sendPayload({ op: "worker.health" });
   refresh.addEventListener("click", askHealth);
@@ -1393,7 +1604,7 @@ function renderWorkerBox(box) {
   const update = (online) => {
     liveOnline = online;
     const w = state.worker;
-    const tab = ["search", "recap", "usage", "timeline", "diff"].includes(w.tab) ? w.tab : "jobs";
+    const tab = ["search", "recap", "usage", "timeline", "diff", "files"].includes(w.tab) ? w.tab : "jobs";
     const working = [...w.jobs.values()].filter((job) => ["queued", "running", "pending"].includes(job.status)).length;
     tabButtons.get("jobs").textContent = `Jobs (${working})`;
     for (const [key, button] of tabButtons) button.className = key === tab ? "active" : "";
@@ -1403,7 +1614,9 @@ function renderWorkerBox(box) {
     usageView.hidden = tab !== "usage";
     timelineView.hidden = tab !== "timeline";
     diffView.hidden = tab !== "diff";
+    filesView.hidden = tab !== "files";
     jobs.hidden = tab !== "jobs";
+    if (online && tab === "files" && !w.files.tree && !w.files.loading) fetchFileTree();
     if (state.diff?.ref && diffInput.value !== state.diff.ref) diffInput.value = state.diff.ref;
     if (online && details.open && !ui.asked) { ui.asked = true; askHealth(); }
     const h = w.health;
@@ -1530,6 +1743,7 @@ function renderWorkerBox(box) {
     renderWorkerUsage(usageView, w, online);
     renderWorkerChat(timelineView, w, online);
     renderWorkerDiff(diffOut, state.diff);
+    renderWorkerFiles(filesOut, w.files);
   };
   return update;
 }
@@ -2248,6 +2462,11 @@ function applyPayload(payload) {
   if (routeFencedReply(payload)) return; // fenced: the surface that asked applies it
   // The plaintext (or decrypted) payload from the host lands here.
   if (payload && typeof payload === "object" && payload.op === "view") {
+    if (state.pendingFileLink) {
+      const link = state.pendingFileLink;
+      state.pendingFileLink = null;
+      openFileAt(link.path, link.goto);
+    }
     state.view = payload.view;
     state.viewError = null;
   } else if (payload && typeof payload === "object" && payload.op === "term.list") {
@@ -2833,7 +3052,24 @@ function roomFromHash() {
   if (pair && state.token) selectRoom(id, pair, true);
   return id;
 }
-if (typeof addEventListener === "function") addEventListener("hashchange", roomFromHash);
+
+// Files deep-link #f=<path>[:line[-end]] — a receipt or diff link can land straight
+// in the viewer at the exact line (the filev open_target shape). At boot the socket
+// may not be open yet; the link waits for the first live view (askView path).
+function filesFromHash() {
+  const m = /^#f=([^&\s]{1,512})$/.exec(location.hash ?? "");
+  if (!m) return null;
+  const goto = parseLineSuffix(m[1]) ?? { path: m[1], line: 1, end: 1 };
+  if (!state.token || !goto.path) return null;
+  const target = goto.line >= 1 ? goto : null;
+  if (state.ws?.readyState === WebSocket.OPEN && state.roomId) {
+    openFileAt(goto.path, target);
+  } else {
+    state.pendingFileLink = { path: goto.path, goto: target };
+  }
+  return goto.path;
+}
+if (typeof addEventListener === "function") addEventListener("hashchange", () => { roomFromHash(); filesFromHash(); });
 
 // A notification tap on an OPEN window arrives as { t: "nav", room } from the SW —
 // navigate in place, no reload (pairing and drafts survive).
@@ -2913,6 +3149,7 @@ if ("serviceWorker" in navigator) {
 
 render();
 roomFromHash();
+filesFromHash();
 if (state.token) {
   connect();
   void subscribePush(); // upgrade an existing subscription (keys, VAPID rotation check)

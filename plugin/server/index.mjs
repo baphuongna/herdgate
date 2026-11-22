@@ -9,7 +9,7 @@
 import { execFile as execFileCb, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, statSync, realpathSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { hostname, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -33,6 +33,8 @@ const D = dirs();
 const execFile = promisify(execFileCb);
 /** diff.get ships at most 128 KiB of `git show` output, marked truncated beyond. */
 const MAX_DIFF_BYTES = 128 * 1024;
+const MAX_FILE_ENTRIES = 5000; // file.tree cap — the fuzzy finder ranks within this
+const MAX_FILE_BYTES = 128 * 1024; // file.read cap — same class as diffs, and well under the gate's 256KiB frame limit
 const NAME = process.env.HERDGATE_HOST_NAME || hostname();
 const log = (line) => console.error(`herdgate: ${line}`);
 /** The panel's settings file (app home herdgate dir) — the owner's switches live
@@ -903,6 +905,85 @@ async function publisherLoop() {
             return void replyTo({ op: "error", code: noRepo ? "diff.repo" : "diff.ref",
               message: noRepo ? "the plugin directory is not a git repository"
                 : stderr.split("\n")[0] || err.message });
+          }
+        }
+        if (op === "file.tree") {
+          // READ-ONLY file index (filev pattern): tracked files from `git ls-files`
+          // (already .gitignore-aware) with `git status --porcelain` markers overlaid.
+          // Same hardened gitRead as diff.get — no payload-chosen cwd, scrubbed env.
+          // Untracked files are invisible by design: only what git tracks can be read.
+          const repoDir = diffRepoDir();
+          try {
+            const [files, status] = await Promise.all([
+              gitRead(["ls-files"], repoDir, 10_000),
+              gitRead(["status", "--porcelain"], repoDir, 10_000),
+            ]);
+            // XY status + path; rename lines take the "-> " target. Quoted paths
+            // (git quotes specials) are unquoted minimally — markers are advisory.
+            const markers = new Map();
+            for (const line of String(status.stdout).split("\n")) {
+              const m = /^([ MARDRCU?!]{1,2})\s+(.+)$/.exec(line);
+              if (!m || !m[1].trim()) continue; // "??" and blank lead chars alike
+              let target = m[2].split(" -> ").pop() ?? m[2];
+              if (target.startsWith('"') && target.endsWith('"')) target = target.slice(1, -1);
+              markers.set(target, m[1].trim());
+            }
+            const all = String(files.stdout).split("\n").filter(Boolean);
+            const capped = all.length > MAX_FILE_ENTRIES;
+            const entries = (capped ? all.slice(0, MAX_FILE_ENTRIES) : all)
+              .map((path) => ({ path, status: markers.get(path) ?? null }))
+              .sort((a, b) => a.path.localeCompare(b.path));
+            return void replyTo({ op: "file.tree.result", files: entries, capped, total: all.length });
+          } catch (e) {
+            const err = e instanceof Error ? e : new Error(String(e));
+            const stderr = String(e?.stderr ?? "");
+            const noRepo = /not a git repository/i.test(`${err.message}\n${stderr}`);
+            log(`files: ${m.device} tree refused: ${err.message}`);
+            return void replyTo({ op: "error", code: noRepo ? "diff.repo" : "files.tree",
+              message: noRepo ? "the plugin directory is not a git repository"
+                : stderr.split("\n")[0] || err.message });
+          }
+        }
+        if (op === "file.read") {
+          // READ-ONE-FILE with filev's hardening rules: git-tracked paths only (the
+          // tree above is the whitelist), no leading /, no .., no NUL, ≤ 255 chars,
+          // realpath must stay under the repo (a symlink planted inside must not
+          // read outside), size capped — and the bytes go back as text, nothing else.
+          const path = typeof payload.path === "string" ? payload.path : "";
+          if (!/^[^/\0][^\0]{0,254}$/.test(path) || path.split("/").includes("..")) {
+            return void replyTo({ op: "error", code: "bad-path", message: "file.read needs a root-relative path without .." });
+          }
+          const repoDir = diffRepoDir();
+          try {
+            const repoReal = realpathSync(repoDir);
+            const full = join(repoDir, path);
+            let st;
+            try { st = statSync(full); } catch { st = null; }
+            if (!st || !st.isFile()) {
+              return void replyTo({ op: "error", code: "no-file", message: "no such file in the repo" });
+            }
+            if (!realpathSync(full).startsWith(repoReal + "/")) {
+              return void replyTo({ op: "error", code: "bad-path", message: "path escapes the repo" });
+            }
+            const tracked = await gitRead(["ls-files", "--", path], repoDir, 10_000);
+            if (!String(tracked.stdout).trim()) {
+              return void replyTo({ op: "error", code: "no-file", message: "not a tracked file" });
+            }
+            const truncated = st.size > MAX_FILE_BYTES;
+            const buf = readFileSync(full);
+            let text = truncated ? buf.subarray(0, MAX_FILE_BYTES).toString("utf8") : buf.toString("utf8");
+            // JSON escaping can inflate a hostile file several-fold (\u0000 = 6x);
+            // shrink until the ENVELOPE fits the gate's 256KiB frame cap — a reply
+            // that kills the publisher's own socket is worse than a shorter view.
+            while (Buffer.byteLength(JSON.stringify({ t: "frame", payload: { op: "file.read.result", path, text } })) > 240 * 1024 && text.length > 0) {
+              text = text.slice(0, Math.floor(text.length * 0.8));
+            }
+            const lines = text.length ? text.split("\n").length : 0;
+            return void replyTo({ op: "file.read.result", path, text, lines, bytes: st.size, truncated: truncated || text.length < Math.min(st.size, MAX_FILE_BYTES) });
+          } catch (e) {
+            const err = e instanceof Error ? e : new Error(String(e));
+            log(`files: ${m.device} read ${path} refused: ${err.message}`);
+            return void replyTo({ op: "error", code: "files.read", message: err.message });
           }
         }
         if (op === "pane.focus") {

@@ -58,10 +58,15 @@ export function scrubEnv() {
 
 /** Args must be short printable words: refs, hashes, paths, allowed flags. */
 const ARG_RE = /^[A-Za-z0-9._/::~^-]{1,128}$/;
-/** Flags a read may carry. Anything else option-looking is refused. */
-const ALLOWED_FLAGS = new Set(["-C", "--no-color", "--stat", "--patch", "--no-ext-diff", "--no-textconv"]);
+/** Flags a read may carry. Anything else option-looking is refused.
+ *  `--porcelain` is `status`'s machine-readable mode — read-only output shaping,
+ *  the same trust class as `--stat`; `--` is the path separator (`ls-files -- <path>`). */
+const ALLOWED_FLAGS = new Set(["-C", "--no-color", "--stat", "--patch", "--no-ext-diff", "--no-textconv", "--porcelain", "--"]);
 /** Subcommands that produce diffs — the only ones that take --no-ext-diff/--no-textconv. */
 const DIFF_COMMANDS = new Set(["diff", "show", "log", "whatchanged", "format-patch", "range-diff"]);
+/** Read-only subcommands gitRead will run at all. Anything else is refused before
+ *  argv is even built — the allowlist is the whole attack surface for this seam. */
+const ALLOWED_COMMANDS = new Set(["show", "log", "diff", "ls-files", "status", "rev-parse", "config"]);
 
 function refuse(code, message) {
   const err = new Error(message);
@@ -113,6 +118,20 @@ function buildArgv(args) {
  */
 export async function gitRead(args, cwd = diffRepoDir(), timeoutMs = 10_000, maxBuffer = 8 * 1024 * 1024) {
   validateArgs(args);
+  // The subcommand itself must be on the read allowlist — flags alone were never
+  // the whole surface (`config`, `clone`, … are all flagless). The command is the
+  // first arg that is not an option, skipping any leading `-C <dir>` pair.
+  let i = 0;
+  while (i < args.length && args[i].startsWith("-")) i += args[i] === "-C" ? 2 : 1;
+  const command = args[i] ?? "";
+  if (!ALLOWED_COMMANDS.has(command)) {
+    throw refuse("GIT_SAFE_ARG", `gitRead refuses command ${JSON.stringify(command)}: not a read command`);
+  }
+  // `config` is readable but writable too (`git config key value` has no flag!) —
+  // admit ONLY the two-arg read form, never a value or --add/--global.
+  if (command === "config" && args.length !== i + 2) {
+    throw refuse("GIT_SAFE_ARG", "gitRead refuses config: only the two-arg read form `config <name>`");
+  }
   const allowed = new Set([PLUGIN_DIR]);
   if (process.env.HERDGATE_DIFF_REPO_DIR) allowed.add(resolve(process.env.HERDGATE_DIFF_REPO_DIR));
   const startDir = resolve(cwd);

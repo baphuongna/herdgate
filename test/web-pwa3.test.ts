@@ -78,11 +78,16 @@ type WebApi = {
 
 /** Run the real browser module with a minimal DOM; return its test seam. */
 function loadApp(): WebApi {
-  const source = readFileSync(join(root, "src/web/app.js"), "utf8").replace(/^import .* from "\/e2e.js";$/m, "");
+  // Module imports are browser-only wiring (e2e crypto, fuzzy scoring); the VM
+  // runs the app as a classic script, so every import line is stripped.
+  const source = readFileSync(join(root, "src/web/app.js"), "utf8").replace(/^import .*$/gm, "");
+  // fuzzy.js assigns hgFuzzy onto the realm's globalThis — run it first so app.js
+  // renders (it only calls the matcher at Files-render time, but keep it honest).
+  const fuzzy = readFileSync(join(root, "src/web/fuzzy.js"), "utf8");
   const doc = new Element();
   const $ = (id: string) => doc.querySelector(id);
   const api: Record<string, unknown> = {};
-  runInNewContext(source, {
+  runInNewContext(fuzzy + "\n" + source, {
     document: Object.assign(doc, { getElementById: $, createElement: () => new Element() }),
     Element,
     navigator: { userAgent: "pwa3-test" },

@@ -87,11 +87,14 @@ type WebApi = {
 
 /** Run the real browser module with a minimal DOM; return its test seam. */
 function loadApp(): WebApi {
-  const source = readFileSync(join(root, "src/web/app.js"), "utf8").replace(/^import .* from "\/e2e.js";$/m, "");
+  // Module imports are browser-only wiring (e2e crypto, fuzzy scoring); the VM
+  // runs the app as a classic script, so every import line is stripped.
+  const source = readFileSync(join(root, "src/web/app.js"), "utf8").replace(/^import .*$/gm, "");
+  const fuzzy = readFileSync(join(root, "src/web/fuzzy.js"), "utf8");
   const doc = new Element();
   const $ = (id: string) => doc.querySelector(id);
   const api: Record<string, unknown> = {};
-  runInNewContext(source, {
+  runInNewContext(fuzzy + "\n" + source, {
     document: Object.assign(doc, { getElementById: $, createElement: () => new Element() }),
     Element,
     navigator: { userAgent: "web-enrich-test" },

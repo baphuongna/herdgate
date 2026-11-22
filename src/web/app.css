@@ -730,3 +730,30 @@ button.attach {
   font-weight: 600;
   box-shadow: 0 6px 24px rgb(0 0 0 / 0.4);
 }
+
+/* Files (filev): fuzzy list + one-file reader with line numbers and smartcase
+   search — the status glyph borrows the diff palette. */
+.files-list { list-style: none; margin: 8px 0; padding: 0; }
+.files-list li button {
+  display: flex; gap: 8px; align-items: baseline; width: 100%;
+  background: none; border: none; color: inherit; text-align: left;
+  padding: 4px 2px; font: inherit; cursor: pointer;
+}
+.files-list li button:active { background: var(--hover, rgb(255 255 255 / 0.08)); }
+.fstat { width: 1.1em; text-align: center; font-weight: 700; opacity: 0.9; }
+.fstat-M { color: #e6b450; }
+.fstat-A { color: #7fd962; }
+.fstat-D { color: #f07178; }
+.fstat-R, .fstat-C, .fstat-U { color: #73d0ff; }
+.fpath { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; }
+.files-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; margin: 6px 0; }
+.files-head .fpath { font-weight: 600; }
+.file-search { flex: 1; min-width: 140px; }
+.file-body {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+  line-height: 1.5; overflow-x: auto; white-space: pre; margin-top: 6px;
+}
+.file-line { display: flex; gap: 10px; }
+.line-no { color: var(--muted, #8b8b8b); min-width: 3.5em; text-align: right; user-select: none; flex-shrink: 0; }
+.file-hit { background: rgb(115 208 255 / 0.35); border-radius: 2px; }
+.file-body .flash { background: rgb(230 180 80 / 0.3); }
