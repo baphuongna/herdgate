@@ -160,7 +160,7 @@ const state = {
   termBody: null,
   termPre: null,
   retry: 0,
-  worker: { health: null, jobs: new Map(), error: null, search: null, searchError: null, tab: "jobs", usage: null, chatError: null, bodyError: null, draft: null, enrich: null, files: { tree: null, total: 0, capped: false, loading: false, error: null, query: "", open: null, text: null, lines: 0, truncated: false, goto: null, search: "" } },
+  worker: { health: null, jobs: new Map(), error: null, search: null, searchError: null, tab: "jobs", usage: null, chatError: null, bodyError: null, draft: null, enrich: null, files: { tree: null, total: 0, capped: false, loading: false, error: null, query: "", open: null, text: null, lines: 0, truncated: false, goto: null, search: "" }, review: { scope: "uncommitted", files: null, base: null, capped: false, loading: false, error: null, open: null, diff: null, truncated: false, comments: {}, boxLine: null, sending: false, sent: null } },
   diff: null,
   chat: { filter: null, spawn: null },
 };
@@ -917,6 +917,7 @@ function fetchReceiptBody(id) {
  *  fault keeps the shared never-blank banner instead of closing the panel. */
 const ENRICH_ERR_CODES = new Set(["receipt.enrich", "pi_receipts_disabled"]);
 const FILE_ERR_CODES = new Set(["diff.repo", "files.tree", "files.read", "bad-path", "no-file", "file.tree", "file.read"]);
+const REVIEW_ERR_CODES = new Set(["diff.repo", "review", "bad-scope", "no-base", "no-anchor", "bad-path", "no-file"]);
 
 function fetchReceiptEnrich(id) {
   state.worker.enrich = { id, loading: true, error: null, result: null };
@@ -1300,6 +1301,244 @@ function renderFileBody(out, w) {
   else if (firstHit >= 0) applyFlash(firstHit);
 }
 
+// ---- Review (reviewr mobile): scoped change lists, per-line comments, send ---
+
+const REVIEW_SCOPES = [["uncommitted", "Chưa commit"], ["branch", "Chưa đẩy"], ["turn", "Lượt cuối"]];
+
+/** Unified diff → typed rows with old/new line numbers. Pure — the wire gives
+ *  text, the view needs structure (hunk headers, +/-/ctx, numbering). */
+function parseUnifiedDiff(text) {
+  const rows = [];
+  let a = 0;
+  let b = 0;
+  for (const line of String(text ?? "").split("\n")) {
+    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    if (hunk) { a = Number(hunk[1]); b = Number(hunk[2]); rows.push({ type: "hunk", text: line }); continue; }
+    if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff ") || line.startsWith("index ") || line.startsWith("\\ No newline")) { rows.push({ type: "meta", text: line }); continue; }
+    if (line.startsWith("+")) { rows.push({ type: "add", b, text: line.slice(1) }); b++; continue; }
+    if (line.startsWith("-")) { rows.push({ type: "del", a, text: line.slice(1) }); a++; continue; }
+    if (line.startsWith(" ")) { rows.push({ type: "ctx", a, b, text: line.slice(1) }); a++; b++; continue; }
+    rows.push({ type: "meta", text: line }); // diff/index/---/+++ headers and \ No newline
+  }
+  return rows;
+}
+
+function fetchReviewFiles(scope) {
+  const w = state.worker.review;
+  w.scope = scope;
+  w.loading = true;
+  w.error = null;
+  w.files = null;
+  w.open = null;
+  w.diff = null;
+  const gen = currentGeneration();
+  opFetch("review.files", "review.files.result", { scope }, { key: `review-files:${scope}`, fresh: true, errCodes: REVIEW_ERR_CODES })
+    .then((p) => {
+      if (!generationCurrent(gen)) return;
+      w.loading = false;
+      if (isTransportFault(p)) { w.error = p.message; return; }
+      if (p.op === "error") { w.error = p.message; return; }
+      w.error = null;
+      w.files = p.files ?? [];
+      w.base = p.base ?? null;
+      w.capped = Boolean(p.capped);
+    })
+    .catch(() => { if (generationCurrent(gen)) { w.loading = false; w.error = "review.files không trả lời"; } });
+}
+
+function openReviewDiff(path) {
+  const w = state.worker.review;
+  w.open = path;
+  w.diff = null;
+  w.error = null;
+  w.boxLine = null;
+  const gen = currentGeneration();
+  opFetch("review.diff", "review.diff.result", { scope: w.scope, path }, { key: `review-diff:${w.scope}:${path}`, fresh: true, errCodes: REVIEW_ERR_CODES })
+    .then((p) => {
+      if (!generationCurrent(gen) || w.open !== path) return;
+      if (isTransportFault(p)) { w.error = p.message; return; }
+      if (p.op === "error") { w.error = p.message; return; }
+      w.error = null;
+      w.diff = typeof p.text === "string" ? p.text : "";
+      w.truncated = Boolean(p.truncated);
+    })
+    .catch(() => { if (generationCurrent(gen) && w.open === path) w.error = "review.diff không trả lời"; });
+}
+
+/** Session-only comment store — nothing crosses the wire until Send (the
+ *  reviewr discipline: the worktree and the gate stay untouched while reviewing). */
+function setReviewComment(path, line, text) {
+  const w = state.worker.review;
+  const key = `${path}:${line}`;
+  if (!text || !text.trim()) delete w.comments[key];
+  else w.comments[key] = [{ path, line, text: text.trim().slice(0, 500) }];
+  w.boxLine = null;
+  state.roomUi?.updateWorker?.(true);
+}
+
+function sendReviewComments() {
+  const w = state.worker.review;
+  const all = Object.values(w.comments ?? {}).flat();
+  if (!all.length || w.sending) return;
+  w.sending = true;
+  w.sent = null;
+  w.error = null;
+  sendPayload({ op: "review.send", comments: all });
+  // The reply (review.sent) or refusal lands in the frame router above.
+}
+
+function renderWorkerReview(out, w) {
+  out.replaceChildren();
+  const r = w.review;
+  if (r.error) out.append(note(r.error, "error"));
+  const chips = document.createElement("div");
+  chips.className = "rev-scopes";
+  for (const [key, label] of REVIEW_SCOPES) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = `rev-chip${r.scope === key ? " active" : ""}`;
+    chip.textContent = label;
+    chip.addEventListener("click", () => { if (r.scope !== key) fetchReviewFiles(key); });
+    chips.append(chip);
+  }
+  out.append(chips);
+  if (r.open) { renderReviewDiff(out, r); return; }
+  if (r.loading) { out.append(note("đang đọc danh sách thay đổi…")); return; }
+  if (r.sent) {
+    const sent = note(`đã gửi ${r.sent.count} comment — job ${String(r.sent.id).slice(0, 8)} (xem Jobs/Chat)`);
+    sent.classList.add("rev-sent");
+    out.append(sent);
+  }
+  if (!r.files) {
+    if (!r.error) out.append(note("chọn scope: thay đổi chưa commit / cả nhánh / đúng lượt agent vừa settle."));
+    return;
+  }
+  const list = document.createElement("ul");
+  list.className = "rev-list";
+  for (const f of r.files) {
+    const li = document.createElement("li");
+    const row = document.createElement("button");
+    row.type = "button";
+    const name = document.createElement("span");
+    name.className = "fpath";
+    name.textContent = f.path;
+    row.append(name);
+    if (f.status === "??") {
+      const badge = document.createElement("span");
+      badge.className = "rev-stat new";
+      badge.textContent = "mới";
+      row.append(badge);
+    } else if (f.plus !== null && f.plus !== undefined) {
+      const stat = document.createElement("span");
+      stat.className = "rev-stat";
+      stat.textContent = `+${f.plus} −${f.minus}`;
+      row.append(stat);
+    }
+    const nComments = Object.keys(r.comments).filter((k) => k.startsWith(`${f.path}:`)).length;
+    if (nComments) {
+      const c = document.createElement("span");
+      c.className = "rev-stat comments";
+      c.textContent = `✎ ${nComments}`;
+      row.append(c);
+    }
+    row.addEventListener("click", () => openReviewDiff(f.path));
+    li.append(row);
+    list.append(li);
+  }
+  out.append(list);
+  if (r.capped) out.append(note("danh sách bị giới hạn 5000 file."));
+  if (!r.files.length && !r.error) out.append(note("scope này không có thay đổi nào."));
+}
+
+function renderReviewDiff(out, r) {
+  const head = document.createElement("div");
+  head.className = "files-head";
+  const back = document.createElement("button");
+  back.type = "button";
+  back.className = "link";
+  back.textContent = "← review";
+  back.addEventListener("click", () => { r.open = null; r.diff = null; r.boxLine = null; });
+  const title = document.createElement("span");
+  title.className = "fpath";
+  title.textContent = r.open;
+  head.append(back, title);
+  if (r.truncated) head.append(note(" (capped 128KiB)", "small"));
+  out.append(head);
+  if (r.diff === null) { out.append(note(`đang đọc diff ${r.open}…`)); return; }
+  const body = document.createElement("div");
+  body.className = "file-body rev-diff";
+  const hint = document.createElement("div");
+  hint.className = "rev-hint";
+  hint.textContent = "chạm một dòng để comment";
+  body.append(hint);
+  for (const row of parseUnifiedDiff(r.diff)) {
+    if (row.type === "meta") continue; // headers hidden — the path is in the title
+    const line = document.createElement("div");
+    line.className = `rev-row ${row.type === "hunk" ? "dhunk" : `d${row.type}`}`;
+    if (row.type === "hunk") {
+      line.textContent = row.text;
+      body.append(line);
+      continue;
+    }
+    const num = row.type === "del" ? row.a : row.b;
+    const no = document.createElement("span");
+    no.className = "line-no";
+    no.textContent = num ?? "";
+    const text = document.createElement("span");
+    text.className = "rev-text";
+    text.textContent = row.text;
+    line.append(no, text);
+    if (row.type !== "del") line.addEventListener("click", () => {
+      r.boxLine = r.boxLine === num ? null : num;
+      state.roomUi?.updateWorker?.(true);
+    });
+    body.append(line);
+    const lineComments = r.comments[`${r.open}:${num}`];
+    if (lineComments) for (const c of lineComments) {
+      const chip = document.createElement("div");
+      chip.className = "rev-chip-comment";
+      const label = document.createElement("span");
+      label.textContent = `✎ ${c.text}`;
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "link";
+      del.textContent = "×";
+      del.addEventListener("click", () => setReviewComment(r.open, num, null));
+      chip.append(label, del);
+      body.append(chip);
+    }
+    if (r.boxLine === num) {
+      const box = document.createElement("div");
+      box.className = "rev-cbox";
+      const ta = document.createElement("textarea");
+      ta.rows = 2;
+      ta.maxLength = 500;
+      ta.placeholder = `comment cho dòng ${num}`;
+      ta.value = r.comments[`${r.open}:${num}`]?.[0]?.text ?? "";
+      const save = document.createElement("button");
+      save.type = "button";
+      save.textContent = "Lưu";
+      save.addEventListener("click", () => { if (ta.value.trim()) setReviewComment(r.open, num, ta.value); });
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "link";
+      cancel.textContent = "Đóng";
+      cancel.addEventListener("click", () => { r.boxLine = null; state.roomUi?.updateWorker?.(true); });
+      box.append(ta, save, cancel);
+      body.append(box);
+    }
+  }
+  out.append(body);
+  const count = Object.values(r.comments).flat().length;
+  const send = document.createElement("button");
+  send.type = "button";
+  send.className = "rev-send";
+  send.textContent = r.sending ? "đang gửi…" : `Gửi ${count} comment về agent`;
+  send.disabled = !count || r.sending;
+  send.addEventListener("click", sendReviewComments);
+  out.append(send);
+}
+
 // Diff: render one `git show --stat --patch` answer — the stat block first, then
 // the patch with + green, - red, @@ purple. A truncated patch says so plainly.
 function renderWorkerDiff(out, d) {
@@ -1397,7 +1636,7 @@ function renderWorkerBox(box) {
   const bar = document.createElement("div");
   bar.className = "activity-bar";
   const tabButtons = new Map();
-  for (const [key, label] of [["jobs", "Jobs"], ["search", "Search"], ["recap", "Recap"], ["usage", "Usage"], ["timeline", "Chat"], ["diff", "Diff"], ["files", "Files"]]) {
+  for (const [key, label] of [["jobs", "Jobs"], ["search", "Search"], ["recap", "Recap"], ["usage", "Usage"], ["timeline", "Chat"], ["diff", "Diff"], ["files", "Files"], ["review", "Review"]]) {
     const tab = document.createElement("button");
     tab.type = "button";
     tab.textContent = label;
@@ -1540,7 +1779,15 @@ function renderWorkerBox(box) {
   const filesOut = document.createElement("div");
   filesOut.className = "files-out";
   filesView.append(filesForm, filesOut);
-  details.append(summary, health, refresh, bar, form, formError, search, recap, usageView, timelineView, diffView, filesView, jobs);
+
+  // Review (reviewr mobile): scoped change lists, tap-line comments, one Send.
+  const reviewView = document.createElement("div");
+  reviewView.className = "review-view";
+  reviewView.hidden = true;
+  const reviewOut = document.createElement("div");
+  reviewOut.className = "review-out";
+  reviewView.append(reviewOut);
+  details.append(summary, health, refresh, bar, form, formError, search, recap, usageView, timelineView, diffView, filesView, reviewView, jobs);
   box.append(details);
 
   filesForm.addEventListener("submit", (event) => {
@@ -1604,7 +1851,7 @@ function renderWorkerBox(box) {
   const update = (online) => {
     liveOnline = online;
     const w = state.worker;
-    const tab = ["search", "recap", "usage", "timeline", "diff", "files"].includes(w.tab) ? w.tab : "jobs";
+    const tab = ["search", "recap", "usage", "timeline", "diff", "files", "review"].includes(w.tab) ? w.tab : "jobs";
     const working = [...w.jobs.values()].filter((job) => ["queued", "running", "pending"].includes(job.status)).length;
     tabButtons.get("jobs").textContent = `Jobs (${working})`;
     for (const [key, button] of tabButtons) button.className = key === tab ? "active" : "";
@@ -1615,8 +1862,10 @@ function renderWorkerBox(box) {
     timelineView.hidden = tab !== "timeline";
     diffView.hidden = tab !== "diff";
     filesView.hidden = tab !== "files";
+    reviewView.hidden = tab !== "review";
     jobs.hidden = tab !== "jobs";
     if (online && tab === "files" && !w.files.tree && !w.files.loading) fetchFileTree();
+    if (online && tab === "review" && !w.review.files && !w.review.loading) fetchReviewFiles(w.review.scope);
     if (state.diff?.ref && diffInput.value !== state.diff.ref) diffInput.value = state.diff.ref;
     if (online && details.open && !ui.asked) { ui.asked = true; askHealth(); }
     const h = w.health;
@@ -1744,6 +1993,7 @@ function renderWorkerBox(box) {
     renderWorkerChat(timelineView, w, online);
     renderWorkerDiff(diffOut, state.diff);
     renderWorkerFiles(filesOut, w.files);
+    renderWorkerReview(reviewOut, w);
   };
   return update;
 }
@@ -2484,6 +2734,28 @@ function applyPayload(payload) {
     state.worker.error = payload.enabled === false ? payload.message ?? "worker queue disabled on this host" : null;
     state.roomUi?.updateWorker?.(true);
     return;
+  } else if (payload && typeof payload === "object" && payload.op === "error" && payload.code === "pi_worker_disabled" && state.worker.review?.sending) {
+    // A refused review.send faults the Review tab only — the comments stay.
+    state.worker.review.sending = false;
+    state.worker.review.error = payload.message ?? payload.code ?? "host từ chối review.send";
+    state.roomUi?.updateWorker?.(true);
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "error" && ["requires-act", "bad-comments", "bad-comment", "queue-full", "worker-queue"].includes(payload.code) && state.worker.review?.sending) {
+    state.worker.review.sending = false;
+    state.worker.review.error = payload.code === "requires-act" ? "cần cấp quyền act cho điện thoại để gửi review" : payload.message ?? payload.code;
+    state.roomUi?.updateWorker?.(true);
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "review.sent") {
+    const r = state.worker.review;
+    if (r) {
+      r.sending = false;
+      r.sent = { id: payload.id, count: payload.count, at: Date.now() };
+      r.comments = {}; // delivered — the queue owns them now
+      r.boxLine = null;
+      r.open = null; // back to the list; the job lands in Jobs/Chat like any turn
+    }
+    state.roomUi?.updateWorker?.(true);
+    return;
   } else if (payload && typeof payload === "object" && payload.op === "worker.submitted") {
     state.worker.jobs.set(payload.id, {
       id: payload.id,
@@ -3216,6 +3488,16 @@ if ("serviceWorker" in navigator && location.protocol !== "file:") {
       enrichToggle: (id) => toggleReceiptEnrich(id),
       enrichRows: (result) => JSON.parse(JSON.stringify(enrichRows(result))),
       contextPctOf: (tokens, max) => contextPctOf(tokens, max),
+      parseUnifiedDiff, reviewSnap: () => JSON.parse(JSON.stringify(state.worker.review)),
+      reviewComment: (path, line, text) => setReviewComment(path, line, text),
+      reviewSend: () => {
+        const sent = [];
+        state.roomId ??= "pwa3-room";
+        state.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+        sendReviewComments();
+        return sent;
+      },
+      apply: (payload) => applyPayload(payload),
       probe: {
         detail: (id) => receiptDetailNode(id),
         thread: (job) => chatThread(job),

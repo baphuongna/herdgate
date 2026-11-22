@@ -97,7 +97,6 @@ test('file ops e2e: tracked tree, status overlay, hardened reads', { skip: !hasG
     }
 
     const ask = async (payload: Record<string, unknown>, expectOp: string): Promise<Record<string, unknown>> => {
-      console.error('ASK', JSON.stringify(payload).slice(0, 80));
       const sock = new DeviceSock(`${gate}/v1/device/ws`);
       try {
         const hello = await sock.hello({ device: device.id, deviceSecret: secret });

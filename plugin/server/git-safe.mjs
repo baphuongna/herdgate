@@ -61,7 +61,7 @@ const ARG_RE = /^[A-Za-z0-9._/::~^-]{1,128}$/;
 /** Flags a read may carry. Anything else option-looking is refused.
  *  `--porcelain` is `status`'s machine-readable mode — read-only output shaping,
  *  the same trust class as `--stat`; `--` is the path separator (`ls-files -- <path>`). */
-const ALLOWED_FLAGS = new Set(["-C", "--no-color", "--stat", "--patch", "--no-ext-diff", "--no-textconv", "--porcelain", "--"]);
+const ALLOWED_FLAGS = new Set(["-C", "--no-color", "--stat", "--patch", "--numstat", "--no-ext-diff", "--no-textconv", "--porcelain", "--verify", "--"]);
 /** Subcommands that produce diffs — the only ones that take --no-ext-diff/--no-textconv. */
 const DIFF_COMMANDS = new Set(["diff", "show", "log", "whatchanged", "format-patch", "range-diff"]);
 /** Read-only subcommands gitRead will run at all. Anything else is refused before

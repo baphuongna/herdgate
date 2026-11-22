@@ -64,6 +64,11 @@ type WebApi = {
   diffGotoIndexes(lines: string[], goto: { path: string; line: number; end?: number }): number[];
   fetchInfo(): { gen: string; inflight: { key: string; gen: string; fresh: boolean }[] };
   fetchDrive(op: string, replyOp: string, payload: Record<string, unknown>, opts?: Record<string, unknown>): { sent: Record<string, unknown>[]; promise: Promise<Record<string, unknown>> };
+  parseUnifiedDiff(text: string): { type: string; a?: number; b?: number; text: string }[];
+  reviewSnap(): { comments: Record<string, unknown[]>; sending: boolean; sent: { id: string; count: number } | null; error: string | null };
+  reviewComment(path: string, line: number, text: string | null): void;
+  reviewSend(): Record<string, unknown>[];
+  apply(payload: Record<string, unknown>): void;
   fetchReply(payload: Record<string, unknown>): boolean;
   online(): void;
   offline(): void;
@@ -311,4 +316,50 @@ test("pwa3 units: diffGotoIndexes walks a real `git show` patch to the target li
   assert.deepEqual(goto(two, { path: "two.rs", line: 5, end: 5 }), [two.indexOf("+fresh")]);
   // a bare name still matches a nested file (the deep link may be relative)
   assert.deepEqual(goto(two, { path: "one.rs", line: 2, end: 2 }), [two.indexOf("+    let x = 1;")]);
+});
+
+test("pwa3 units: review — diff rows number both sides, comments stay session-only, send rides the wire", () => {
+  const api = loadApp();
+  const parse = (t: string) => JSON.parse(JSON.stringify(api.parseUnifiedDiff(t))) as { type: string; a?: number; b?: number; text: string }[];
+  const patch = [
+    "diff --git a/x b/x", "index 111..222 100644", "--- a/x", "+++ b/x",
+    "@@ -1,3 +1,4 @@", " one", "-two", "+two!", "+three", " ctx",
+  ].join("\n");
+  const rows = parse(patch);
+  assert.equal(rows.filter((r) => r.type === "meta").length, 4, "headers are meta rows");
+  const adds = rows.filter((r) => r.type === "add");
+  assert.deepEqual(adds.map((r) => r.b), [2, 3], "added rows carry new-side numbers");
+  assert.equal(rows.find((r) => r.type === "del")?.a, 2, "deleted rows carry old-side numbers");
+  assert.deepEqual(rows.filter((r) => r.type === "ctx").map((r) => r.a), [1, 3], "context rows advance both sides");
+  assert.equal(rows.find((r) => r.type === "hunk")?.text.startsWith("@@"), true);
+
+  // Comments live in session state only; delete clears the slot.
+  api.reviewComment("x", 2, "dòng này sai");
+  assert.equal((api.reviewSnap().comments["x:2"] as { text: string }[])[0].text, "dòng này sai");
+  api.reviewComment("x", 2, null);
+  assert.equal(api.reviewSnap().comments["x:2"], undefined);
+
+  // Send: one frame, then the reply clears comments and marks delivery.
+  api.reviewComment("x", 2, "fix chỗ này");
+  const sent = api.reviewSend();
+  assert.equal(sent.length, 1);
+  const frame = sent[0] as { t: string; payload: { op: string; comments: unknown[] } };
+  assert.equal(frame.t, "frame");
+  assert.equal(frame.payload.op, "review.send");
+  assert.equal(frame.payload.comments.length, 1);
+  assert.equal(api.reviewSnap().sending, true);
+  api.apply({ op: "review.sent", id: "33333333-2222-4333-8444-555555555555", state: "queued", count: 1 });
+  const snap = api.reviewSnap();
+  assert.equal(snap.sending, false);
+  assert.equal(snap.sent?.count, 1);
+  assert.equal(Object.keys(snap.comments).length, 0, "delivered comments belong to the queue now");
+
+  // A refused send keeps every comment — nothing is lost on a requires-act.
+  api.reviewComment("x", 3, "chưa gửi được");
+  api.reviewSend();
+  api.apply({ op: "error", code: "requires-act", message: "review.send needs an act device" });
+  const refused = api.reviewSnap();
+  assert.equal(refused.sending, false);
+  assert.ok(refused.comments["x:3"], "comments survive a refusal");
+  assert.match(refused.error ?? "", /act/);
 });

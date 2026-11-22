@@ -35,6 +35,8 @@ const execFile = promisify(execFileCb);
 const MAX_DIFF_BYTES = 128 * 1024;
 const MAX_FILE_ENTRIES = 5000; // file.tree cap — the fuzzy finder ranks within this
 const MAX_FILE_BYTES = 128 * 1024; // file.read cap — same class as diffs, and well under the gate's 256KiB frame limit
+const MAX_REVIEW_FILES = 5000; // review.files entries cap (one screen's worth of scrolling)
+const MAX_REVIEW_COMMENTS = 50; // review.send comments per batch — a review, not a prompt
 const NAME = process.env.HERDGATE_HOST_NAME || hostname();
 const log = (line) => console.error(`herdgate: ${line}`);
 /** The panel's settings file (app home herdgate dir) — the owner's switches live
@@ -441,7 +443,29 @@ async function publisherLoop() {
     }
     if (replayed) log(`receipts: replayed ${replayed} unacknowledged push(es) to ${device}`);
   };
+  /** Settle-anchored git heads — the `turn` review scope without a ref write
+   *  (reviewr keeps its baseline in refs/reviewr/*; herdgate journals settle
+   *  heads BESIDE the repo instead). Receipts carry no hashes, so this journal
+   *  is the honest baseline: every settle records HEAD; `turn` diffs the two
+   *  newest anchors = exactly the last settled agent turn. */
+  const gitAnchorsFile = () => (D.statePath ? join(D.statePath, "..", "git-anchors.json") : "");
+  const recordGitAnchor = async (reason) => {
+    const file = gitAnchorsFile();
+    if (!file) return;
+    try {
+      const { stdout } = await gitRead(["rev-parse", "HEAD"], diffRepoDir(), 5_000);
+      const head = String(stdout).trim();
+      if (!/^[0-9a-f]{7,40}$/.test(head)) return;
+      const prior = readState(file);
+      const anchors = Array.isArray(prior.anchors) ? prior.anchors : [];
+      if (anchors[anchors.length - 1]?.head === head) return; // no new commits since
+      anchors.push({ head, at: Date.now(), reason });
+      writeState(file, { v: 1, anchors: anchors.slice(-8) });
+      log(`review: anchor ${head.slice(0, 8)} (${reason})`);
+    } catch { /* not a repo — `turn` will say so honestly */ }
+  };
   const pushReceipt = (entry) => {
+    void recordGitAnchor("settle"); // journal the turn boundary first — subscriber fan-out is separate
     const store = watches();
     if (!store) return;
     store.sweep();
@@ -463,6 +487,7 @@ async function publisherLoop() {
   const lastWake = new Map(); // deviceId → epoch ms
   const wakeAway = (changed, note = { kind: "activity" }) => {
     if (!changed) return;
+    if (note?.kind === "settle") void recordGitAnchor("settle"); // event-hook settles journal too
     const now = Date.now();
     for (const d of devices) {
       if (d.connected !== false) continue;
@@ -525,6 +550,7 @@ async function publisherLoop() {
         if (timer) clearInterval(timer);
         timer = setInterval(() => void publish(ws), PUBLISH_MS);
         timer.unref?.();
+        void recordGitAnchor("boot"); // seed the first boundary so turn 1 is diffable
         return;
       }
       if (m.t === "room.update") {
@@ -985,6 +1011,138 @@ async function publisherLoop() {
             log(`files: ${m.device} read ${path} refused: ${err.message}`);
             return void replyTo({ op: "error", code: "files.read", message: err.message });
           }
+        }
+        if (op === "review.files" || op === "review.diff") {
+          // READ-ONLY review scopes — the reviewr pattern, mobile: `uncommitted`,
+          // `branch` (three-dot vs upstream/main — merge-base for free), `turn`
+          // (diff of the last settled agent turn, anchored by the git-anchors
+          // journal — no ref writes). All git flows through the hardened gitRead.
+          const scope = typeof payload.scope === "string" ? payload.scope : "";
+          if (!["uncommitted", "branch", "turn"].includes(scope)) {
+            return void replyTo({ op: "error", code: "bad-scope", message: "review.* needs scope uncommitted | branch | turn" });
+          }
+          const repoDir = diffRepoDir();
+          try {
+            let range;
+            let base = null;
+            if (scope === "uncommitted") {
+              range = ["HEAD"];
+            } else if (scope === "branch") {
+              // Candidates avoid ref-expression braces (@{upstream}, ^{commit}) —
+              // gitRead's arg grammar keeps them out, so plain names only.
+              for (const cand of ["origin/main", "origin/master", "main", "master"]) {
+                try {
+                  const { stdout } = await gitRead(["rev-parse", "--verify", cand], repoDir, 5_000);
+                  const sha = String(stdout).trim();
+                  if (/^[0-9a-f]{7,40}$/.test(sha)) { base = sha; break; }
+                } catch { /* try the next candidate */ }
+              }
+              if (!base) {
+                return void replyTo({ op: "error", code: "no-base", message: "không thấy upstream/main — không định vị được scope branch" });
+              }
+              range = [`${base}...HEAD`];
+            } else {
+              const anchors = readState(gitAnchorsFile()).anchors;
+              if (!Array.isArray(anchors) || anchors.length < 2) {
+                return void replyTo({ op: "error", code: "no-anchor", message: "chưa đủ 2 mốc settle — chờ agent settle thêm một lượt để có diff lượt cuối" });
+              }
+              const from = anchors[anchors.length - 2].head;
+              const to = anchors[anchors.length - 1].head;
+              range = [`${from}..${to}`];
+              base = from;
+            }
+            if (op === "review.files") {
+              const numstat = await gitRead(["diff", "--no-color", "--numstat", ...range], repoDir, 10_000);
+              const files = [];
+              for (const line of String(numstat.stdout).split("\n")) {
+                const nm = /^(\d+|-)\t(\d+|-)\t(.+)$/.exec(line);
+                if (!nm) continue;
+                let path = nm[3].split(" -> ").pop() ?? nm[3];
+                if (path.startsWith('"') && path.endsWith('"')) path = path.slice(1, -1);
+                files.push({ path, plus: nm[1] === "-" ? null : Number(nm[1]), minus: nm[2] === "-" ? null : Number(nm[2]) });
+              }
+              let untracked = 0;
+              if (scope === "uncommitted") {
+                // `git diff` never sees untracked files; the porcelain overlay adds
+                               // them as zero-stat rows so the review list matches reality.
+                const status = await gitRead(["status", "--porcelain"], repoDir, 10_000);
+                for (const line of String(status.stdout).split("\n")) {
+                  const sm = /^\?\?\s+(.+)$/.exec(line);
+                  if (!sm) continue;
+                  let path = sm[1].split(" -> ").pop() ?? sm[1];
+                  if (path.startsWith('"') && path.endsWith('"')) path = path.slice(1, -1);
+                  if (files.some((f) => f.path === path)) continue;
+                  files.push({ path, plus: null, minus: null, status: "??" });
+                  untracked++;
+                }
+              }
+              files.sort((a, b) => a.path.localeCompare(b.path));
+              const capped = files.length > MAX_REVIEW_FILES;
+              log(`review: ${m.device} files ${scope}${base ? ` @${String(base).slice(0, 8)}` : ""} -> ${files.length} file${untracked ? ` (${untracked} chưa track)` : ""}`);
+              return void replyTo({ op: "review.files.result", scope, base, files: capped ? files.slice(0, MAX_REVIEW_FILES) : files, capped });
+            }
+            const path = typeof payload.path === "string" ? payload.path : "";
+            if (!/^[^/\0][^\0]{0,254}$/.test(path) || path.split("/").includes("..")) {
+              return void replyTo({ op: "error", code: "bad-path", message: "review.diff needs a root-relative path without .." });
+            }
+            const { stdout } = await gitRead(["diff", "--no-color", "--patch", ...range, "--", path], repoDir, 10_000);
+            const bytes = Buffer.byteLength(stdout, "utf8");
+            const truncated = bytes > MAX_DIFF_BYTES;
+            const text = truncated ? Buffer.from(stdout, "utf8").subarray(0, MAX_DIFF_BYTES).toString("utf8") : stdout;
+            log(`review: ${m.device} diff ${scope} ${path} -> ${bytes}B${truncated ? " (capped at 128KiB)" : ""}`);
+            return void replyTo({ op: "review.diff.result", scope, path, base, text, bytes, truncated });
+          } catch (e) {
+            const err = e instanceof Error ? e : new Error(String(e));
+            const stderr = String(e?.stderr ?? "");
+            const noRepo = /not a git repository/i.test(`${err.message}\n${stderr}`);
+            log(`review: ${m.device} ${op} ${scope} refused: ${err.message}`);
+            return void replyTo({ op: "error", code: noRepo ? "diff.repo" : "review",
+              message: noRepo ? "the plugin directory is not a git repository" : stderr.split("\n")[0] || err.message });
+          }
+        }
+        if (op === "review.send") {
+          // ACT — ship the phone's line comments to the agent. The Pi worker queue
+          // is the one delivery leg that already exists (receipts, wake-on-settle);
+          // the comments ride as a <file-comments> block the agent reads structurally.
+          if (process.env.HERDGATE_PI_WORKER !== "1") {
+            return void replyTo({ op: "error", code: "pi_worker_disabled", message: "host chưa bật Pi worker — review.send cần HERDGATE_PI_WORKER=1" });
+          }
+          if (devices.find((d) => d.id === m.device)?.scope !== "act") {
+            return void replyTo({ op: "error", code: "requires-act", message: "review.send needs an act device" });
+          }
+          const comments = Array.isArray(payload.comments) ? payload.comments : [];
+          if (!comments.length || comments.length > MAX_REVIEW_COMMENTS) {
+            return void replyTo({ op: "error", code: "bad-comments", message: `review.send needs 1..${MAX_REVIEW_COMMENTS} comments` });
+          }
+          for (const c of comments) {
+            const okPath = typeof c?.path === "string" && /^[^/\0][^\0]{0,254}$/.test(c.path) && !c.path.split("/").includes("..");
+            const okLine = Number.isInteger(c?.line) && c.line >= 1 && c.line <= 1e6;
+            const okEnd = c?.endLine === undefined || (Number.isInteger(c.endLine) && c.endLine >= c.line && c.endLine <= 1e6);
+            const okText = typeof c?.text === "string" && c.text.trim().length > 0 && c.text.length <= 500;
+            if (!okPath || !okLine || !okEnd || !okText) {
+              return void replyTo({ op: "error", code: "bad-comment", message: "comment needs { path, line 1..1e6, endLine?, text 1..500 }" });
+            }
+          }
+          const body = comments.map((c) => `${c.path}:${c.line}${c.endLine ? `-${c.endLine}` : ""} — ${c.text}`).join("\n");
+          const prompt = `Xử lý review comments trên diff từ mobile:\n\n<file-comments>\n${body}\n</file-comments>\n\nTừng comment: xem chỗ chỉ dẫn, sửa nếu đúng, chạy test liên quan, commit nếu đạt. Báo lại ngắn gọn từng dòng đã xử lý thế nào.`;
+          const file = jobsFile(workerBase());
+          let jobs;
+          try { jobs = readJobs(file); }
+          catch (e) {
+            return void replyTo({ op: "error", code: "worker-queue", message: `queue unreadable: ${e instanceof Error ? e.message : String(e)}` });
+          }
+          const pending = [...jobs.values()].filter((j) => j.state === "queued" || j.state === "running").length;
+          if (pending >= MAX_PENDING) {
+            return void replyTo({ op: "error", code: "queue-full", message: `worker queue is full (${MAX_PENDING} pending)` });
+          }
+          const jobId = randomUUID();
+          try {
+            appendJob(file, { v: 1, id: jobId, prompt, ts: Date.now(), state: "queued", principal: `device:${m.device}`, kind: "review" });
+          } catch (e) {
+            return void replyTo({ op: "error", code: "worker-queue", message: `queue append failed: ${e instanceof Error ? e.message : String(e)}` });
+          }
+          log(`review: ${m.device} sent ${comments.length} comment(s) as job ${jobId}`);
+          return void replyTo({ op: "review.sent", id: jobId, state: "queued", count: comments.length });
         }
         if (op === "pane.focus") {
           // Focus a pane on the host's Herdr. Fire-and-forget spawn, never awaited:

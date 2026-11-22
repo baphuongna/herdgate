@@ -757,3 +757,45 @@ button.attach {
 .line-no { color: var(--muted, #8b8b8b); min-width: 3.5em; text-align: right; user-select: none; flex-shrink: 0; }
 .file-hit { background: rgb(115 208 255 / 0.35); border-radius: 2px; }
 .file-body .flash { background: rgb(230 180 80 / 0.3); }
+
+/* Review (reviewr mobile): scope chips, change list, line-comment flow */
+.rev-scopes { display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+.rev-chip {
+  background: none; border: 1px solid var(--muted, #8b8b8b); border-radius: 999px;
+  color: inherit; padding: 3px 10px; font-size: 12px; cursor: pointer;
+}
+.rev-chip.active { border-color: var(--accent, #73d0ff); color: var(--accent, #73d0ff); }
+.rev-list { list-style: none; margin: 8px 0; padding: 0; }
+.rev-list li button {
+  display: flex; gap: 8px; align-items: baseline; width: 100%;
+  background: none; border: none; color: inherit; text-align: left;
+  padding: 4px 2px; font: inherit; cursor: pointer;
+}
+.rev-list li button:active { background: var(--hover, rgb(255 255 255 / 0.08)); }
+.rev-stat { margin-left: auto; font-size: 11px; white-space: nowrap; color: var(--muted, #8b8b8b); }
+.rev-stat::first-letter { color: #7fd962; }
+.rev-stat.new { color: #7fd962; }
+.rev-stat.comments { color: #e6b450; margin-left: 6px; }
+.rev-diff .rev-hint { color: var(--muted, #8b8b8b); font-size: 11px; margin-bottom: 4px; }
+.rev-row { display: flex; gap: 10px; }
+.rev-row .rev-text { overflow-wrap: anywhere; }
+.rev-row.dadd { background: rgb(127 217 98 / 0.12); }
+.rev-row.dadd .line-no { color: #7fd962; }
+.rev-row.ddel { background: rgb(240 113 120 / 0.12); }
+.rev-row.ddel .line-no { color: #f07178; }
+.rev-row:not(.dhunk):active { background: var(--hover, rgb(255 255 255 / 0.1)); }
+.rev-row.dhunk { color: #b48eff; margin: 6px 0 2px; }
+.rev-chip-comment {
+  display: flex; gap: 6px; align-items: baseline; margin: 2px 0 6px 3.5em;
+  font-size: 12px; color: #e6b450;
+}
+.rev-chip-comment .link { margin-left: auto; }
+.rev-cbox { display: flex; gap: 6px; align-items: flex-start; margin: 4px 0 8px; flex-wrap: wrap; }
+.rev-cbox textarea { flex: 1; min-width: 160px; }
+.rev-send {
+  display: block; width: 100%; margin: 10px 0; padding: 8px;
+  border: 1px solid var(--accent, #73d0ff); background: none; color: var(--accent, #73d0ff);
+  border-radius: 6px; font: inherit; cursor: pointer;
+}
+.rev-send:disabled { opacity: 0.45; cursor: default; }
+.rev-sent { color: #7fd962; }
