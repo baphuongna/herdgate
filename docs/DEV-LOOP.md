@@ -55,4 +55,10 @@
 
 | Vòng | Ngày | Kết quả | Commit/Tag | Ghi chú nghiệm thu |
 |------|------|---------|------------|--------------------|
-| C1 | 2026-11-22 | 🔄 spec viết xong, đang test-first | — | — |
+| C1 | 2026-11-22 | ✅ xong — v0.9.43 + hotfix v0.9.44 | `f4a86ad` (feat) → tag v0.9.43 → fix staged package.json → tag v0.9.44 | Suite 303/0 (7 test mới/mở rộng). Live: home+laptop roster host.version 0.9.44 thật; laptop update 2 lần qua drive (`herdgate update` — tự học: `herdgate setup update` không tồn tại, chết an toàn ở check). Bug sống bắt thêm: staged release thiếu package.json → pkgVersion "unknown" → fix + test. askFleetOnce retry khi busy (throttle 1/2s đụng thật giữa pane và startup). Probe 5 device đã revoke |
+| C2 | kế tiếp | 🔄 predictive echo enable path | — | spec sẽ viết đầu vòng |
+
+### Bài học C1 (nuôi vòng sau)
+- Drive laptop: lệnh đúng là `herdgate update` (không phải `setup update`); flow transaction của setup-tui chết an toàn ở bước `check` trước khi đụng publisher — đã chứng minh trên máy thật.
+- `$env:...` trong HG_CMD bị bash local expand — escape `\$` hoặc dùng single-quote quanh lệnh PS.
+- Staged release giờ có package.json — mọi helper đọc metadata bản build đều theo đường đó.
