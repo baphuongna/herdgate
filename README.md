@@ -166,6 +166,21 @@ One persistent shell with marker framing replaces exec-per-command; phone keystr
 bounded, coalescing, in-order-acked queue that resyncs instead of replaying; file polls are
 checksum-stamped (`unchanged` costs one word).
 
+### Latency budget (measured 22/11)
+
+Interactive typing (mobile TUI, remote herdr attach) rides the SSH bridge **direct**
+to the host — no CDN hop, feels local. The control/PWA leg goes through the tunnel
+edge (~130ms RTT hairpin from the same LAN; a phone on 4G sees similar). To keep
+that leg smooth the publisher now:
+
+- pushes view snapshots every `HERDGATE_PUBLISH_MS` (default 30s; the home unit sets
+  5s — a settle is visible on the phone within seconds, not half a minute);
+- replays the last snapshot for a `view` op inside `HERDGATE_SNAPSHOT_FRESH_MS`
+  (default 2s) instead of spawning `herdr api snapshot` again — a view op costs ~0
+  server-side work when the cache is warm;
+- coalesces concurrent snapshot demands into one spawn (single-flight), and a cached
+  view no longer resets the change-sig (so it cannot re-wake away phones for nothing).
+
 ## The SSH leg (the Herdr phone app)
 
 The phone app adds machines over SSH. Herdgate terminates SSH at the Gate; use the Gate's reachable SSH

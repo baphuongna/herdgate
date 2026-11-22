@@ -262,6 +262,15 @@ async function publisherLoop() {
   let lastSig = "";
   let devices = [];
   let timer = null;
+  // Push cadence and view-request freshness. The 30s default is gentle on a
+  // battery-powered host; a plugged-in one sets HERDGATE_PUBLISH_MS=5000 so a
+  // phone sees a settle within seconds instead of half a minute. A `view` op
+  // inside the freshness window replays the last snapshot instead of spawning
+  // `herdr api snapshot` again (bimodal view latency: 4ms cached vs 150ms cold).
+  const PUBLISH_MS = Math.max(2_000, Number.parseInt(process.env.HERDGATE_PUBLISH_MS ?? "30000", 10) || 30000);
+  const SNAPSHOT_FRESH_MS = Math.max(0, Number.parseInt(process.env.HERDGATE_SNAPSHOT_FRESH_MS ?? "2000", 10) || 0);
+  let snapshotInflight = null;
+  let snapshotCached = null; // { payload, at }
 
   const snapshotPayload = async () => {
     let snap;
@@ -280,7 +289,18 @@ async function publisherLoop() {
       writeState(D.statePath, { lastPublish: { at: new Date().toISOString(), summary } });
     }
     if (changed) wakeAway(true);
-    return { op: "view", view: { v: 1, source: "herdr", takenAt: new Date().toISOString(), summary } };
+    const payload = { op: "view", view: { v: 1, source: "herdr", takenAt: new Date().toISOString(), summary } };
+    snapshotCached = { payload, at: Date.now() };
+    return payload;
+  };
+
+  /** Single-flight: concurrent demands (interval tick + a device's view op)
+   * share one `herdr api snapshot` spawn instead of stampeding. */
+  const snapshotOnce = () => {
+    if (!snapshotInflight) {
+      snapshotInflight = snapshotPayload().finally(() => { snapshotInflight = null; });
+    }
+    return snapshotInflight;
   };
 
   let wsRef = null;
@@ -380,7 +400,7 @@ async function publisherLoop() {
   });
   const publish = async (ws) => {
     if (ws.readyState !== 1 || devices.length === 0) return;
-    const payload = await snapshotPayload();
+    const payload = await snapshotOnce();
     if (!payload) return;
     for (const d of devices) {
       await sendPayload(ws, d.id, payload);
@@ -485,7 +505,7 @@ async function publisherLoop() {
         backoff = 1_000;
         devices = m.devices ?? [];
         lifecycle?.setConnected(true);
-        log(`connected to ${url}${loopbackPort ? ` via loopback 127.0.0.1:${loopbackPort}` : ""} (room ${m.roomId}, ${devices.length} device(s))`);
+        log(`connected to ${url}${loopbackPort ? ` via loopback 127.0.0.1:${loopbackPort}` : ""} (room ${m.roomId}, ${devices.length} device(s), publish ${PUBLISH_MS}ms)`);
         if (process.env.HERDGATE_PI_RECEIPTS === "1" && !receiptWatch) {
           // Settles push to subscribed devices only. Parent wakes no longer ride
           // this watcher — the child-cooperative design (arm/marker/observer)
@@ -501,7 +521,7 @@ async function publisherLoop() {
         for (const d of devices) flushWatches(d.id);
         void publish(ws);
         if (timer) clearInterval(timer);
-        timer = setInterval(() => void publish(ws), 30_000);
+        timer = setInterval(() => void publish(ws), PUBLISH_MS);
         timer.unref?.();
         return;
       }
@@ -814,7 +834,13 @@ async function publisherLoop() {
           }
         }
         if (op === "view") {
-          // Answer this device now, even if the view has not changed since the last push.
+          // Answer this device now. Inside the freshness window replay the last
+          // snapshot (no spawn, no lastSig reset — so the next full tick cannot
+          // re-detect a "change" and wake away phones for nothing).
+          if (snapshotCached && Date.now() - snapshotCached.at < SNAPSHOT_FRESH_MS) {
+            for (const d of devices) await sendPayload(ws, d.id, snapshotCached.payload);
+            return;
+          }
           lastSig = "";
           return void publish(ws);
         }
