@@ -65,6 +65,13 @@ async function launch({ action, bin, hc, mobile, mobileScope, base, state }) {
   }
   const env = {
     ...process.env,
+    // The TUI publisher is an interactive-machine default (a laptop you are
+    // looking at), not a battery-sipping box: push views every 5s unless the
+    // operator set an explicit cadence. The plugin/systemd default stays 30s.
+    HERDGATE_PUBLISH_MS: process.env.HERDGATE_PUBLISH_MS ?? "5000",
+    // Match the freshness window to the cadence so a view op almost always
+    // replays the last snapshot instead of forcing a fresh spawn.
+    HERDGATE_SNAPSHOT_FRESH_MS: process.env.HERDGATE_SNAPSHOT_FRESH_MS ?? process.env.HERDGATE_PUBLISH_MS ?? "5000",
     HERDGATE_MOBILE_HC_BIN: mobileHcBin,
     HERDGATE_MOBILE_TUI_DEVICE: mobile,
     HERDGATE_MOBILE_TUI_SCOPE: mobileScope,
