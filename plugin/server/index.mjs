@@ -469,7 +469,7 @@ async function publisherLoop() {
       // Advertise honestly: `act` only when the owner's switch allows it.
       let allowAct = false;
       try { allowAct = (JSON.parse(readFileSync(SETTINGS, "utf8")) ?? {}).allowAct === true; } catch { /* no settings yet */ }
-      ws.send(JSON.stringify({ v: 1, t: "hello", roomToken: token, info: { name: NAME, version: "0.1.0", capabilities: ["dev.herdgate.host", allowAct ? "act" : "read-only"] } }));
+      ws.send(JSON.stringify({ v: 1, t: "hello", roomToken: token, info: { name: NAME, version: "0.9.38", capabilities: ["dev.herdgate.host", allowAct ? "act" : "read-only"] } }));
     };
     ws.onmessage = (ev) => {
       void (async () => {
