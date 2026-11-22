@@ -17,6 +17,7 @@ import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, su
 import { gitRead, diffRepoDir } from "./git-safe.mjs";
 import { createSshBridge } from "./ssh.mjs";
 import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
+import { listAttachments, saveAttachment } from "./attachments.mjs";
 import { searchReceipts, sessionRoots as piSessionRoots, findSessionFile } from "./pi-receipt-search.mjs";
 import { usageRollup } from "./pi-usage.mjs";
 import { readAllSpawns } from "./pi-wake.mjs";
@@ -770,6 +771,47 @@ async function publisherLoop() {
           }
           log(`worker: ${m.device} submitted ${jobId} (${prompt.length} chars${workspaceName ? `, ws ${workspaceName}` : ""})`);
           return void replyTo({ op: "worker.submitted", id: jobId, state: "queued", duplicate: false });
+        }
+        if (op === "attachment.upload" || op === "attachment.list") {
+          // Wave C3 — photo/file attachments from the PWA composer (the herdcats
+          // lesson: the upload lands ON THE AGENT MACHINE under the plugin's
+          // private state dir; the reply carries a path hint, and the Pi agent
+          // opens the file with its own read tool — image bytes never ride the
+          // prompt). Client names are never trusted: saveAttachment stores
+          // <uuid>.<ext> with the ext sniffed from magic bytes, inside
+          // stateDir/attachments/<yyyy-mm>/ (0700 per level, file 0600).
+          if (!D.stateDir) {
+            return void replyTo({ op: "error", code: "attachment", message: "no plugin state dir — attachments unavailable" });
+          }
+          if (op === "attachment.list") {
+            const attachments = listAttachments(D.stateDir);
+            log(`attachment: ${m.device} list -> ${attachments.length} file(s)`);
+            return void replyTo({ op: "attachment.list.result", attachments });
+          }
+          const name = typeof payload.name === "string" ? payload.name.trim() : "";
+          const dataBase64 = typeof payload.dataBase64 === "string" ? payload.dataBase64 : "";
+          if (!name || name.length > 255 || !dataBase64) {
+            return void replyTo({ op: "error", code: "attachment", message: "attachment.upload needs a name and base64 data" });
+          }
+          if (!/^[A-Za-z0-9+/]+={0,2}$/.test(dataBase64) || dataBase64.length % 4 !== 0) {
+            log(`attachment: ${m.device} upload refused: bad base64`);
+            return void replyTo({ op: "error", code: "attachment", message: "attachment.upload data is not valid base64" });
+          }
+          let bytes;
+          try { bytes = Buffer.from(dataBase64, "base64"); }
+          catch (e) {
+            return void replyTo({ op: "error", code: "attachment", message: `attachment.upload data is not valid base64 (${e.code ?? "decode"})` });
+          }
+          try {
+            const saved = saveAttachment(D.stateDir, { name, bytes });
+            log(`attachment: ${m.device} uploaded ${name} (${bytes.length}B) -> ${saved.id}`);
+            return void replyTo({ op: "attachment.uploaded", id: saved.id, path: saved.path,
+              hint: `Please open and inspect this image: ${saved.path}` });
+          } catch (e) {
+            const why = e instanceof Error ? e.message : String(e);
+            log(`attachment: ${m.device} upload refused: ${why}`);
+            return void replyTo({ op: "error", code: "attachment", message: `attachment.upload failed: ${why}` });
+          }
         }
         if (op === "view") {
           // Answer this device now, even if the view has not changed since the last push.

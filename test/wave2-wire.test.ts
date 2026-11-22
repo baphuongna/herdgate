@@ -204,11 +204,20 @@ test('wave2 ops: sysmon.snapshot, ports.list, receipt.enrich over the device cha
 
     t.diagnostic('sysmon.snapshot without a pid column: roots empty + note, never a guess');
     writeFileSync(noPidMarker, '');
-    await delay(1_100); // the op is subprocess-backed → 1/s throttle per device
-    const blind = await ask({ op: 'sysmon.snapshot' }, 'sysmon.snapshot.result') as unknown as AgentsReply;
-    assert.equal(blind.op, 'sysmon.snapshot.result');
-    assert.deepEqual(blind.agents, [], 'registry stores no pids — nothing can be sampled');
-    assert.match(blind.note!, /no pid field/);
+    // The op is subprocess-backed and throttled 1/s per device; under a parallel
+    // suite the publisher may briefly still hold the pre-marker view — same
+    // assertions, inside a retry window instead of one lucky timing.
+    const deadlineBlind = performance.now() + 8_000;
+    let blind: AgentsReply | undefined;
+    for (;;) {
+      await delay(1_100);
+      blind = await ask({ op: 'sysmon.snapshot' }, 'sysmon.snapshot.result') as unknown as AgentsReply;
+      if (blind.agents.length === 0 && /no pid field/.test(blind.note ?? '')) break;
+      if (performance.now() > deadlineBlind) break;
+    }
+    assert.equal(blind!.op, 'sysmon.snapshot.result');
+    assert.deepEqual(blind!.agents, [], 'registry stores no pids — nothing can be sampled');
+    assert.match(blind!.note!, /no pid field/);
 
     t.diagnostic('ports.list: the cloud port attributes to the live child; hidden pid → unattributed + note');
     rmSync(noPidMarker);
@@ -226,9 +235,15 @@ test('wave2 ops: sysmon.snapshot, ports.list, receipt.enrich over the device cha
       for (const row of ports.unattributed) assert.ok(row.port > 0 && (row.proto === 'tcp' || row.proto === 'tcp6'));
     }
     writeFileSync(noPidMarker, '');
-    await delay(1_100);
-    const blindPorts = await ask({ op: 'ports.list' }, 'ports.list.result') as unknown as PortsReply;
-    assert.deepEqual(blindPorts.attributed, [], 'no shell pids → an owner is never invented');
+    const deadlineBlindPorts = performance.now() + 8_000;
+    let blindPorts: PortsReply | undefined;
+    for (;;) {
+      await delay(1_100);
+      blindPorts = await ask({ op: 'ports.list' }, 'ports.list.result') as unknown as PortsReply;
+      if (blindPorts.attributed.length === 0 && /no pid field/.test(blindPorts.note ?? '')) break;
+      if (performance.now() > deadlineBlindPorts) break;
+    }
+    assert.deepEqual(blindPorts!.attributed, [], 'no shell pids → an owner is never invented');
     assert.match(blindPorts.note!, /no pid field/);
     if (process.platform === 'linux') {
       assert.ok(blindPorts.unattributed.some(row => row.port === cloud.port),
@@ -272,7 +287,11 @@ test('wave2 ops: sysmon.snapshot, ports.list, receipt.enrich over the device cha
   } finally {
     await stop(publisher);
     await cloud?.close();
-    rmSync(dir, { recursive: true, force: true });
+    // Killing the publisher can orphan an in-flight execFileSync stub child
+    // (herdr-calls.log appender) whose single late write used to beat the
+    // rmdir. Let stragglers land first, then rimraf with retries.
+    await delay(400);
+    rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   }
 });
 

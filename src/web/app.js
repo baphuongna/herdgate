@@ -486,6 +486,18 @@ const WORKER_ERROR_CODES = new Set([
 // Diff/pane refusals are scoped the same way: they fault one view, never the room.
 const DIFF_ERROR_CODES = new Set(["bad-ref", "diff", "diff.ref", "diff.repo"]);
 const PANE_ERROR_CODES = new Set(["pane.focus", "bad-pane"]); // no surface yet — swallow, never blank the room
+// Attachment refusals fault the 📎 pick only — the composer and its draft stay.
+const ATTACH_ERROR_CODES = new Set(["attachment"]);
+
+/** One transient line at the bottom of the screen — upload refusals and reader
+ *  faults say so without blanking any view. Gone on its own after a few seconds. */
+function toast(message) {
+  const el = document.createElement("div");
+  el.className = "toast";
+  el.textContent = message;
+  document.body.append(el);
+  setTimeout(() => el.remove(), 5_000);
+}
 
 // Recap answers "đến lượt ai?" — whose move it is — for every tracked job; Usage
 // rolls the host's receipt journal into daily and per-principal tables.
@@ -1111,10 +1123,55 @@ function renderWorkerBox(box) {
   const submit = document.createElement("button");
   submit.type = "submit";
   submit.textContent = "Submit job";
+  // 📎 — attach a photo from the phone: capped 4MB client-side, read as base64,
+  // uploaded to the AGENT MACHINE (attachment.upload), and the returned hint
+  // ("Please open and inspect this image: <path>") lands in the prompt box so
+  // the user sees — and sends — exactly the instruction the agent will act on.
+  const attach = document.createElement("button");
+  attach.type = "button";
+  attach.className = "attach";
+  attach.textContent = "📎";
+  attach.title = "Đính kèm ảnh (image/*, tối đa 4MB) — tải về máy agent";
+  const attachFile = document.createElement("input");
+  attachFile.type = "file";
+  attachFile.accept = "image/*";
+  attachFile.hidden = true;
+  attach.addEventListener("click", () => attachFile.click());
+  attachFile.addEventListener("change", () => {
+    const picked = attachFile.files && attachFile.files[0];
+    attachFile.value = ""; // allow re-picking the same file
+    if (!picked) return;
+    if (picked.size > 4 * 1024 * 1024) {
+      toast("Ảnh quá lớn — tối đa 4MB");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => toast("Không đọc được ảnh đã chọn");
+    reader.onload = () => {
+      const url = String(reader.result ?? "");
+      const comma = url.indexOf(",");
+      const dataBase64 = comma >= 0 ? url.slice(comma + 1) : "";
+      if (!dataBase64) {
+        toast("Không đọc được ảnh đã chọn");
+        return;
+      }
+      void (async () => {
+        const reply = await opFetch("attachment.upload", "attachment.uploaded",
+          { name: picked.name || "photo", dataBase64 },
+          { key: `attach:${picked.name}:${picked.size}:${picked.lastModified}`, fresh: true, errCodes: ATTACH_ERROR_CODES });
+        if (!reply || reply.op !== "attachment.uploaded" || typeof reply.hint !== "string") {
+          toast((reply && reply.message) || "Không tải được ảnh lên máy agent");
+          return; // nothing is inserted into the prompt
+        }
+        prompt.value = prompt.value ? `${prompt.value.replace(/\s+$/, "")}\n${reply.hint}` : reply.hint;
+      })();
+    };
+    reader.readAsDataURL(picked);
+  });
   const formError = document.createElement("p");
   formError.className = "error small";
   formError.hidden = true;
-  form.append(promptLabel, prompt, wsLabel, workspace, submit, formError);
+  form.append(promptLabel, prompt, wsLabel, workspace, attach, attachFile, submit, formError);
   const jobs = document.createElement("ul");
   jobs.className = "list";
   // Receipt search: BM25 over the host journal (receipt.search op). Metadata

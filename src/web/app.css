@@ -637,3 +637,35 @@ dialog::backdrop {
   background: var(--bg);
   outline: 1px solid var(--accent);
 }
+
+/* ---- Wave C3: composer attachments (📎) ---- */
+
+/* The paperclip sits in the composer row like a sibling action, not a full-width
+   input: same tap target, quieter than the primary Submit. */
+button.attach {
+  width: auto;
+  padding: 11px 14px;
+  background: none;
+  color: var(--fg);
+  border-color: var(--line);
+  font-weight: 500;
+  line-height: 1;
+}
+
+/* One transient refusal line pinned above the fold's bottom — upload errors say
+   themselves, no view blanks behind them. */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  max-width: min(92vw, 480px);
+  background: var(--surface);
+  border: 1px solid var(--bad);
+  color: var(--fg);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  font-size: 13px;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.35);
+  z-index: 40;
+}
