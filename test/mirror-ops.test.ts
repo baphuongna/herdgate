@@ -375,6 +375,42 @@ if (tail === "remote-api-bridge") {
     assert.ok(/pane\.send_text.*stream/.test(bridge), 'the tab runs our stream command');
     assert.match(out, /reconcile xong/);
     t.diagnostic(`watch --once exit ${watchCode}`);
+
+    // C1 F3 — the [[startup]] hook: opt-in only, one-shot, never blocks Herdr.
+    assert.match(readFileSync(join(root, 'plugin/mirror/herdr-plugin.toml'), 'utf8'), /\[\[startup\]\]/, 'the manifest declares the startup hook');
+    const runMirror = (args: string[]) => new Promise<{ code: number; out: string }>((resolve) => {
+      const c = spawn(process.execPath, [join(root, 'plugin/mirror/server/index.mjs'), ...args], {
+        cwd: dir,
+        env: { PATH: process.env.PATH, HOME: dir, HERDR_BIN_PATH: stub, HERDR_PLUGIN_CONFIG_DIR: mcfg },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let o = '';
+      c.stdout!.setEncoding('utf8').on('data', (d: string) => { o += d; });
+      c.stderr!.setEncoding('utf8').on('data', (d: string) => { o += d; });
+      c.on('close', (code) => resolve({ code: code ?? -1, out: o }));
+      setTimeout(() => { try { c.kill(); } catch {} }, 25_000);
+    });
+
+    // Not opted in: exits 0, touches neither the gate lane nor herdr.
+    const bridgeBefore = readFileSync(bridgeLog, 'utf8').length;
+    const off = await runMirror(['startup']);
+    assert.equal(off.code, 0, 'startup without autostart exits 0');
+    assert.equal(readFileSync(bridgeLog, 'utf8').length, bridgeBefore, 'no herdr api calls when not opted in');
+
+    // Opt in: the config records it, status reports it, and startup reconciles once.
+    const on = await runMirror(['autostart', 'on']);
+    assert.equal(on.code, 0);
+    assert.equal(JSON.parse(readFileSync(join(mcfg, 'mirror.json'), 'utf8')).autostart, true);
+    const started = await runMirror(['startup']);
+    assert.equal(started.code, 0, 'startup with autostart reconciles and exits 0');
+    assert.ok(readFileSync(bridgeLog, 'utf8').length > bridgeBefore, 'the reconcile drove herdr');
+    const statusJson = await runMirror(['status']);
+    assert.match(statusJson.out, /"autostart": true/);
+
+    // Opt out again — off must be a real false, not a deleted key.
+    const offCmd = await runMirror(['autostart', 'off']);
+    assert.equal(offCmd.code, 0);
+    assert.equal(JSON.parse(readFileSync(join(mcfg, 'mirror.json'), 'utf8')).autostart, false);
   } finally {
     for (const c of children) c.kill();
     await cloud?.close();

@@ -304,6 +304,19 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
   const send = (ws: WebSocket, msg: Record<string, unknown>): void => sendText(ws, encode(msg));
   const fail = (ws: WebSocket, code: string, message: string): void => send(ws, { t: "error", code, message });
 
+  /** Host hello `info`: strings only, few keys, sane lengths — anything else is
+   *  dropped whole (never partially trusted), keeping the roster honest. */
+  const asHostInfo = (v: unknown): { name?: string; version?: string } | undefined => {
+    if (typeof v !== "object" || v === null) return undefined;
+    const keys = Object.keys(v);
+    if (keys.length > 4) return undefined;
+    const o = v as Record<string, unknown>;
+    for (const k of ["name", "version"]) {
+      if (k in o && !(typeof o[k] === "string" && (o[k] as string).length > 0 && (o[k] as string).length <= 64)) return undefined;
+    }
+    return { name: typeof o.name === "string" ? o.name : undefined, version: typeof o.version === "string" ? o.version : undefined };
+  };
+
   // ---- registry helpers ----
   const deviceViews = (roomId: string): DeviceView[] =>
     state.devicesOfRoom(roomId).map((d) => ({
@@ -410,6 +423,14 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         }
         conn = { ws, room };
         agentByRoom.set(room.id, conn);
+        // Host info: absent key → honest absence (clear stale); present but
+        // invalid → ignored whole (the last valid hello stands).
+        const rawInfo = (m as { info?: unknown }).info;
+        if (rawInfo === undefined) state.setRoomHostInfo(room.id, undefined);
+        else {
+          const parsed = asHostInfo(rawInfo);
+          if (parsed) state.setRoomHostInfo(room.id, parsed);
+        }
         log(`agent ${room.id} (${room.name}) connected`);
         send(ws, { t: "hello", roomId: room.id, roomName: room.name, devices: deviceViews(room.id), resumed: false });
         pushPresence(room.id, true);
@@ -968,6 +989,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       const live = new Set<string>();
       for (const c of deviceConns) if (c.device) live.add(c.device.id);
       return json(res, 200, {
+        host: room.hostInfo ? { name: room.hostInfo.name, version: room.hostInfo.version } : undefined,
         devices: state.devices
           .filter((d) => d.roomId === room.id)
           .map((d) => ({ id: d.id, name: d.name, scope: d.scope, connected: live.has(d.id), keys: (d.sshKeys ?? []).length, created: d.created, push: !!d.push, payload: canPayload(d.push) })),

@@ -123,7 +123,32 @@ async function cmdPair() {
 function cmdStatus() {
   const cfg = readConfig();
   const masked = { ...cfg, secret: cfg.secret ? "••••" : undefined, account: undefined };
-  console.log(JSON.stringify({ config: masked, configured: Boolean(cfg.url && cfg.device && cfg.secret) }, null, 2));
+  console.log(JSON.stringify({ config: masked, configured: Boolean(cfg.url && cfg.device && cfg.secret), autostart: cfg.autostart === true }, null, 2));
+}
+
+/** `autostart on|off` — opt in (or out) of the [[startup]] hook. On: every Herdr
+ *  start restores the mirror workspace with one `watch --once` reconcile. */
+function cmdAutostart(onOff) {
+  const cfg = readConfig();
+  if (!cfg.url || !cfg.device || !cfg.secret) { console.error(`${NAME}: chưa pair`); process.exit(2); }
+  if (onOff !== "on" && onOff !== "off") { console.error(`${NAME}: dùng: autostart on|off`); process.exit(2); }
+  writeConfig({ ...cfg, autostart: onOff === "on" });
+  console.log(onOff === "on"
+    ? `${NAME}: autostart bật — Herdr khởi động sẽ khôi phục workspace mirror (một vòng reconcile)`
+    : `${NAME}: autostart tắt`);
+}
+
+/** The [[startup]] hook — one-shot, opt-in, and never allowed to block or fail
+ *  Herdr's startup: not paired or not opted in → exit silently; reconcile
+ *  errors are logged and swallowed. */
+async function cmdStartup() {
+  const cfg = readConfig();
+  if (cfg.autostart !== true) return; // cheap and silent unless the owner asked
+  try {
+    await cmdWatch(["--once"]);
+  } catch (e) {
+    console.error(`${NAME}: startup reconcile — ${e instanceof Error ? e.message : String(e)} (bỏ qua)`);
+  }
 }
 
 async function cmdPane(once) {
@@ -369,7 +394,10 @@ async function cmdWatch(args) {
 }
 
 async function askFleetOnce(cfg) {
-  return new Promise((resolve, reject) => {
+  // The publisher throttles fleet.detail (1/2s) — a busy reply is a "come back
+  // later", not a failure: the panel and a startup reconcile collide in real
+  // setups. Retry a few times before giving up.
+  const attempt = () => new Promise((resolve, reject) => {
     const ws = new WebSocket(String(cfg.url).replace(/^http/, "ws") + "/v1/device/ws");
     const timer = setTimeout(() => { try { ws.close(); } catch {} reject(new Error("fleet.detail timeout")); }, 10_000);
     ws.onopen = () => ws.send(JSON.stringify({ v: 1, t: "hello", device: cfg.device, deviceSecret: cfg.secret }));
@@ -387,6 +415,12 @@ async function askFleetOnce(cfg) {
     };
     ws.onerror = () => { clearTimeout(timer); reject(new Error("không nối được gate")); };
   });
+  let last;
+  for (let i = 0; i < 4; i++) {
+    try { return await attempt(); }
+    catch (e) { last = e; if (!/throttled|busy/.test(String(e instanceof Error ? e.message : e))) throw e; await sleep(1_200); }
+  }
+  throw last;
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
@@ -420,10 +454,12 @@ if (cmd === "--help" || cmd === "" || cmd === "help") {
   status   JSON: pairing state (secrets masked)
   pane     the fleet sidebar (q đóng · r làm mới; --once vẽ một khung rồi thoát)
   stream   mirror one remote pane: stream <paneId> (typing cần act + HERDGATE_MIRROR_TYPE=1)
-  watch    reconcile workspace 🏠 <room> + tab M:<paneId> per remote pane (--once một vòng; --stop dọn sạch)`);
+  watch    reconcile workspace 🏠 <room> + tab M:<paneId> per remote pane (--once một vòng; --stop dọn sạch)
+  autostart on|off   opt in/out of the startup hook (Herdr mở → khôi phục workspace mirror)
+  startup  the [[startup]] hook — no-op unless autostart on`);
   process.exit(0);
 }
-const commands = { pair: cmdPair, status: cmdStatus, pane: () => cmdPane(arg === "--once"), stream: () => cmdStream(arg), watch: () => cmdWatch(process.argv.slice(3)) };
+const commands = { pair: cmdPair, status: cmdStatus, pane: () => cmdPane(arg === "--once"), stream: () => cmdStream(arg), watch: () => cmdWatch(process.argv.slice(3)), autostart: () => cmdAutostart(arg), startup: cmdStartup };
 try {
   await commands[cmd]?.();
 } catch (e) {

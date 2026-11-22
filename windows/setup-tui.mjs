@@ -1,9 +1,9 @@
 // npm entry point: stage a release before stopping the existing publisher.
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
 const installer = fileURLToPath(new URL("./install-cli.mjs", import.meta.url));
@@ -31,6 +31,26 @@ function writeProfile(path, args) {
   } finally { rmSync(tmp, { force: true }); }
 }
 
+/** The setup lock: one `.setup` directory per root. A run that was killed
+ *  mid-update leaves it orphaned; a retry minutes later must reclaim it
+ *  instead of dying on EEXIST. A lock younger than 60s may still belong to a
+ *  live run — refuse and say so, never stomp a possible concurrent setup. */
+export function acquireSetupLock(root) {
+  const lock = join(root, ".setup");
+  try {
+    mkdirSync(lock);
+  } catch (e) {
+    if (e?.code !== "EEXIST") throw e;
+    let mtimeMs = Date.now();
+    try { mtimeMs = statSync(lock).mtimeMs; } catch { /* vanished: mkdir again below */ }
+    if (mtimeMs > Date.now() - 60_000) throw new Error(`another herdgate setup appears to be running; if you are sure it is not, remove ${lock}`);
+    rmSync(lock, { recursive: true, force: true });
+    mkdirSync(lock); // losing this race is fatal, which is what we want
+  }
+  let released = false;
+  return () => { if (!released) { released = true; rmSync(lock, { force: true, recursive: true }); } };
+}
+
 async function setup() {
   const [cmd, ...options] = process.argv.slice(2);
   const requested = options.filter(flag => flag !== "--no-path");
@@ -42,8 +62,7 @@ async function setup() {
   if (!process.env.LOCALAPPDATA) throw new Error("%LOCALAPPDATA% is required for this installer");
   const root = join(process.env.LOCALAPPDATA, "Herdgate", "cli");
   mkdirSync(root, { recursive: true });
-  const lock = join(root, ".setup");
-  mkdirSync(lock);
+  const releaseLock = acquireSetupLock(root);
   try {
     const link = join(root, "current");
     const releases = join(root, "releases");
@@ -125,8 +144,11 @@ async function setup() {
       }
       throw new Error(`${errorText(cause)}${prior ? "; previous release restored" : ""}`);
     }
-  } finally { rmSync(lock, { force: true, recursive: true }); }
+  } finally { releaseLock(); }
 }
 
-try { await setup(); }
-catch (e) { console.error(`herdgate tui: ${errorText(e)}`); process.exitCode = 1; }
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+if (isMain) {
+  try { await setup(); }
+  catch (e) { console.error(`herdgate tui: ${errorText(e)}`); process.exitCode = 1; }
+}

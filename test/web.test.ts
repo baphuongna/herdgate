@@ -138,6 +138,14 @@ test("client: renders text only, and sends nothing but view", () => {
   assert.ok(!src.includes("navigator.sendBeacon"), "no beacon exfiltration");
 });
 
+test("client: the roster shows the publisher build when the room reports it", () => {
+  const src = codeOnly(readFileSync(join(WEB, "app.js"), "utf8"));
+  // The devices block fetches /v1/devices (account lane, no new op); when the
+  // gate answers with host info, one muted line names the running build.
+  assert.match(src, /host\?\.version/, "the roster line renders host?.version");
+  assert.match(src, /v1\/devices/, "still the same roster fetch — no new wire surface");
+});
+
 test("client: handles the refusal paths honestly", () => {
   const src = readFileSync(join(WEB, "app.js"), "utf8");
   assert.match(src, /4001/, "a refused token signs the device out instead of retrying");

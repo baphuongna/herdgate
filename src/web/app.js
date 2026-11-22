@@ -2257,8 +2257,14 @@ function renderRoomControls(box) {
           headers: { authorization: `Bearer ${state.token}` },
         });
         if (!r.ok) return;
-        const { devices = [] } = await r.json();
+        const rosterJson = await r.json();
+        const devices = rosterJson.devices ?? [];
         roster.replaceChildren();
+        // The publisher's own hello info, when the room reports it: one muted
+        // line — "which build is this machine running" without driving it.
+        if (rosterJson.host?.version) {
+          roster.append(note(`publisher ${rosterJson.host.version}${rosterJson.host.name ? ` · ${rosterJson.host.name}` : ""}`, "muted"));
+        }
         for (const d of devices) {
           const row = document.createElement("div");
           row.className = "keyrow";

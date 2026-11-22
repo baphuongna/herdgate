@@ -25,6 +25,10 @@ export interface RoomRecord {
   name: string;
   tokenHash: string;
   created: string;
+  /** What the room's publisher advertised in its hello (name, build version) —
+   *  the owner's answer to "which machine runs which build". Absent when the
+   *  publisher is older than this field or said nothing. */
+  hostInfo?: { name?: string; version?: string; at: string };
 }
 
 export interface DeviceRecord {
@@ -95,6 +99,24 @@ export class State {
 
   roomsOfAccount(accountId: string): RoomRecord[] {
     return this.rooms.filter((r) => r.accountId === accountId);
+  }
+
+  /** Remember what the room's publisher advertised in its hello. Last valid
+   *  hello wins; an absent `info` clears it (honest absence beats stale data).
+   *  Skips the disk write while the value is unchanged and fresh. */
+  setRoomHostInfo(roomId: string, info: { name?: string; version?: string } | undefined): void {
+    const r = this.rooms.find((x) => x.id === roomId);
+    if (!r) return;
+    if (!info) {
+      if (!r.hostInfo) return;
+      delete r.hostInfo;
+      this.#save();
+      return;
+    }
+    const next = { ...info, at: new Date().toISOString() };
+    if (r.hostInfo && r.hostInfo.name === next.name && r.hostInfo.version === next.version && Date.now() - Date.parse(r.hostInfo.at) < 60_000) return;
+    r.hostInfo = next;
+    this.#save();
   }
 
   addRoom(accountId: string, name: string): { room: RoomRecord; token: string } {

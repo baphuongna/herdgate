@@ -66,6 +66,14 @@ test("manifest: declares what Herdr needs, and only read-only surfaces", () => {
   }
 });
 
+test("plugin: the hello advertises the real package version, not a stale literal", async () => {
+  const { pkgVersion } = (await import(new URL("../plugin/server/common.mjs", import.meta.url).href)) as { pkgVersion: () => string };
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url).pathname, "utf8")) as { version: string };
+  assert.equal(pkgVersion(), pkg.version, "pkgVersion reads the shipped package.json (repo and npm layouts agree)");
+  assert.match(pkgVersion(), /^\d+\.\d+\.\d+$/, "a semver-ish string, not a name or a hash");
+  assert.ok(!readFileSync(INDEX, "utf8").includes('version: "0.9.38"'), "no hard-coded version in the publisher hello");
+});
+
 test("plugin: --help works, and status reports honest, real values", async () => {
   const dir = mkdtempSync(join(tmpdir(), "herdgate-plugin-"));
   try {

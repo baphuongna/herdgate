@@ -7,6 +7,18 @@ import { promisify } from "node:util";
 
 const run = promisify(execFile);
 
+/** The version the hello advertises: the shipped package's own version, read
+ *  from the package.json two levels up (same path in the repo and in the npm
+ *  tarball). Never a hard-coded literal — stale ads are worse than none. */
+export function pkgVersion() {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
+    return typeof pkg.version === "string" && pkg.version.length <= 32 ? pkg.version : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 export function dirs(env = process.env) {
   return {
     pluginId: env.HERDR_PLUGIN_ID ?? "dev.herdgate.host",

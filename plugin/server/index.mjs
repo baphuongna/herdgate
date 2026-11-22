@@ -13,7 +13,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, statSync, r
 import { join, dirname } from "node:path";
 import { hostname, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead } from "./common.mjs";
+import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead, pkgVersion } from "./common.mjs";
 import { gitRead, diffRepoDir } from "./git-safe.mjs";
 import { createSshBridge } from "./ssh.mjs";
 import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
@@ -517,7 +517,7 @@ async function publisherLoop() {
       // Advertise honestly: `act` only when the owner's switch allows it.
       let allowAct = false;
       try { allowAct = (JSON.parse(readFileSync(SETTINGS, "utf8")) ?? {}).allowAct === true; } catch { /* no settings yet */ }
-      ws.send(JSON.stringify({ v: 1, t: "hello", roomToken: token, info: { name: NAME, version: "0.9.38", capabilities: ["dev.herdgate.host", allowAct ? "act" : "read-only"] } }));
+      ws.send(JSON.stringify({ v: 1, t: "hello", roomToken: token, info: { name: NAME, version: pkgVersion(), capabilities: ["dev.herdgate.host", allowAct ? "act" : "read-only"] } }));
     };
     ws.onmessage = (ev) => {
       void (async () => {

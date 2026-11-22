@@ -63,6 +63,39 @@ test("devices: roster lists pairs; revoke kills access and the socket", async ()
     const noAuth = await fetch(`${base}/v1/devices?room=${roomId}`);
     assert.equal(noAuth.status, 401);
 
+    // The roster also carries the publisher's hello info — the owner can see
+    // which build a machine runs without driving it. This agent advertised
+    // { name: "roster-host", version: "0" } through its adapter.
+    const withHost = (await (await fetch(`${base}/v1/devices?room=${roomId}`, { headers: { authorization: `Bearer ${ACCOUNT}` } })).json()) as { host?: { name?: string; version?: string } };
+    assert.equal(withHost.host?.name, "roster-host");
+    assert.equal(withHost.host?.version, "0");
+
+    // A hello without info (an old publisher) leaves the field out — the last
+    // valid hello wins, superseded sockets do not erase it, and garbage info
+    // (over-long strings) is ignored whole, not partially trusted.
+    const agentWs = (info?: unknown) => new Promise<WebSocket>((resolve, reject) => {
+      const ws = new WebSocket(base.replace("http", "ws") + "/v1/agent/ws");
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ v: 1, t: "hello", roomToken: status.roomToken, ...(info !== undefined ? { info } : {}) }));
+        setTimeout(() => resolve(ws), 250);
+      };
+      ws.onerror = () => reject(new Error("agent ws failed"));
+    });
+    const noInfo = await agentWs();
+    const without = (await (await fetch(`${base}/v1/devices?room=${roomId}`, { headers: { authorization: `Bearer ${ACCOUNT}` } })).json()) as { host?: unknown };
+    assert.equal(without.host, undefined, "a no-info hello clears stale info — honest absence, not stale data");
+    noInfo.close();
+
+    const withInfo = await agentWs({ name: "new-build", version: "9.9.9" });
+    const replaced = (await (await fetch(`${base}/v1/devices?room=${roomId}`, { headers: { authorization: `Bearer ${ACCOUNT}` } })).json()) as { host?: { name?: string; version?: string } };
+    assert.equal(replaced.host?.version, "9.9.9");
+    assert.equal(replaced.host?.name, "new-build");
+    const garbage = await agentWs({ name: "x".repeat(100), version: "1.2.3" });
+    const kept = (await (await fetch(`${base}/v1/devices?room=${roomId}`, { headers: { authorization: `Bearer ${ACCOUNT}` } })).json()) as { host?: { version?: string } };
+    assert.equal(kept.host?.version, "9.9.9", "invalid info is ignored whole; the last valid one stands");
+    withInfo.close();
+    garbage.close();
+
     // Revoke the act device: its socket closes, its credentials stop working.
     const rev = await fetch(`${base}/v1/device/revoke`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${ACCOUNT}` }, body: JSON.stringify({ device: act.device.id }) });
     assert.equal(rev.status, 200);
