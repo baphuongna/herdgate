@@ -17,6 +17,7 @@ import { DeviceSock } from './util2.ts';
 import { herdrRead } from '../plugin/server/common.mjs';
 import { PredEcho, CONFIRM_THRESHOLD, ECHO_TIMEOUT_MS, MAX_PENDING, looksFullScreen } from '../plugin/mirror/server/predict.mjs';
 import { drawFleet, sanitizeFleet } from '../plugin/mirror/server/panel.mjs';
+import { planMirrors, mirrorWorkspaceLabel, streamCommandLine, MIRROR_TAB_PREFIX, MIRROR_CAP } from '../plugin/mirror/server/reconcile.mjs';
 
 const root = new URL('..', import.meta.url).pathname;
 const hasGit = await new Promise<boolean>((resolve) => execFile('git', ['--version'], (err) => resolve(!err)));
@@ -237,6 +238,146 @@ test('herdrRead: agent panes via agent read, plain panes fall back to pane read'
     chmodSync(stub2, 0o755);
     await assert.rejects(() => herdrRead(stub2, 'w1:p1', 40, 5_000), /pane_busy/);
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('reconcile planner: agent panes first, ownership by label, cap enforced', () => {
+  const panes = [
+    { id: 'w2:pE', status: 'unknown' },              // plain terminal — last
+    { id: 'w1:p1', agent: 'pi', status: 'working' }, // first
+    { id: 'w3:p2', agent: 'codex', status: 'idle' }, // agent, not working
+    { id: 'w4:p1', agent: 'pi', status: 'blocked' }, // agent in trouble — second
+  ];
+  // Nothing local yet: cap-limited want-list, agents ranked before terminals.
+  const empty = planMirrors({ panes }, []);
+  assert.deepEqual(empty.create, ['w1:p1', 'w4:p1', 'w3:p2', 'w2:pE']);
+  assert.deepEqual(empty.close, []);
+  // A tab already mirrors w1:p1 → keep, no duplicate.
+  const one = planMirrors({ panes }, [{ tabId: 't1', label: MIRROR_TAB_PREFIX + 'w1:p1' }]);
+  assert.deepEqual(one.create, ['w4:p1', 'w3:p2', 'w2:pE']);
+  assert.deepEqual(one.keep, ['w1:p1']);
+  // The remote pane vanished → its tab closes; foreign tabs are untouchable.
+  const gone = planMirrors({ panes: panes.filter((p) => p.id !== 'w1:p1') }, [
+    { tabId: 't1', label: MIRROR_TAB_PREFIX + 'w1:p1' },
+    { tabId: 'tX', label: 'của user' },
+  ]);
+  assert.deepEqual(gone.close, [{ tabId: 't1', paneId: 'w1:p1' }]);
+  assert.ok(!JSON.stringify(gone.close).includes('tX'));
+  // The cap holds under a flood.
+  const flood = planMirrors({ panes: Array.from({ length: 20 }, (_, i) => ({ id: `w:p${i}` })) }, []);
+  assert.ok(flood.create.length <= MIRROR_CAP);
+  assert.equal(mirrorWorkspaceLabel('r_8bf9e457'), '🏠 r_8bf9e457');
+  const cmd = streamCommandLine('/cfg dir', '/self dir', 'w1:p1');
+  assert.match(cmd, /HERDR_PLUGIN_CONFIG_DIR='\/cfg dir'/);
+  assert.match(cmd, /stream 'w1:p1'/);
+});
+
+test('mirror watch --once: creates the workspace, tabs and stream commands through the bridge', { skip: !hasGit && 'git is required' }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'hg-watch-'));
+  const children: ChildProcess[] = [];
+  let cloud: Awaited<ReturnType<typeof startCloud>> | undefined;
+  try {
+    const repo = join(dir, 'repo');
+    mkdirSync(repo, { recursive: true });
+    await run('git', ['-C', repo, 'init', '-q']);
+    await run('git', ['-C', repo, 'config', 'user.email', 'w@test']);
+    await run('git', ['-C', repo, 'config', 'user.name', 'w']);
+    writeFileSync(join(repo, 'a.txt'), 'x\n');
+    await run('git', ['-C', repo, 'add', '.']);
+    await run('git', ['-C', repo, 'commit', '-qm', 'one']);
+
+    // Node stub herdr: plugin CLI shapes AND the api-bridge JSON-RPC loop,
+    // recording every bridge call for the assertions.
+    const bridgeLog = join(dir, 'bridge.log');
+    const stub = join(dir, 'herdr-stub.mjs');
+    writeFileSync(stub, `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+const log = ${JSON.stringify(bridgeLog)};
+const args = process.argv.slice(2).filter((a) => a !== "--session" && a !== "default" && !a.startsWith("--"));
+const tail = args.join(" ");
+if (tail === "remote-api-bridge") {
+  let buf = "";
+  process.stdin.setEncoding("utf8").on("data", (d) => { buf += d; });
+  process.stdin.on("end", () => {
+    for (const line of buf.split("\\n")) {
+      if (!line.trim()) continue;
+      const req = JSON.parse(line);
+      appendFileSync(log, req.method + " " + JSON.stringify(req.params) + "\\n");
+      let result = { type: "ok" };
+      if (req.method === "workspace.list") result = { workspaces: [] };
+      if (req.method === "workspace.create") result = { workspace: { workspace_id: "wM" }, tab: { tab_id: "wM:t1" }, root_pane: { pane_id: "wM:p0" } };
+      if (req.method === "tab.list") result = { tabs: [] };
+      if (req.method === "tab.create") result = { tab: { tab_id: "wM:t2" }, root_pane: { pane_id: "wM:p9" } };
+      process.stdout.write(JSON.stringify({ id: req.id, result }) + "\\n");
+    }
+    process.exit(0);
+  });
+} else if (tail === "api snapshot") {
+  process.stdout.write(JSON.stringify({ result: { snapshot: { version: "9.9.9", protocol: 22, agents: [{ agent: "pi", agent_status: "working", pane_id: "w1:p1", terminal_title_stripped: "pi", cwd: "/w" }], workspaces: [] } } }));
+} else if (tail === "pane list") {
+  process.stdout.write(JSON.stringify({ result: { panes: [{ pane_id: "w1:p1", workspace_id: "w1", agent: "pi", agent_status: "working", cwd: "/w", terminal_title_stripped: "pi" }] } }));
+} else if (tail === "pane --help" || tail === "tab --help") {
+  process.stdout.write("Usage: list focus\\n");
+  process.exit(0);
+}
+`);
+    chmodSync(stub, 0o755);
+
+    const accountToken = 'watch-owner';
+    const statePath = join(dir, 'state.json');
+    const state = new State([{ id: 'a1', name: 'test', token: accountToken }], statePath);
+    const { room, token } = state.addRoom('a1', 'watch-host');
+    const mirrorDev = state.addDevice(room, 'mirror-watch', 'read');
+    cloud = await startCloud({ accounts: [{ id: 'a1', name: 'test', token: accountToken }], statePath, log: () => {} });
+    const gate = `http://127.0.0.1:${cloud.port}`;
+
+    const config = join(dir, 'publisher');
+    mkdirSync(config, { recursive: true });
+    writeFileSync(join(config, 'herdgate.env'), `HERDGATE_URL=${gate}\nHERDGATE_ROOM_TOKEN=${token}\n`, { mode: 0o600 });
+    const log: string[] = [];
+    const child = spawn(process.execPath, [join(root, 'plugin/server/index.mjs'), 'serve'], {
+      cwd: dir,
+      env: {
+        PATH: process.env.PATH, HOME: dir,
+        HERDR_BIN_PATH: stub, HERDR_PLUGIN_ID: 'dev.herdgate.host',
+        HERDR_PLUGIN_CONFIG_DIR: config, HERDR_PLUGIN_STATE_DIR: config,
+        HERDGATE_PUBLISHER_CHILD: '1', HERDGATE_TUI_ONLY: '1',
+        HERDGATE_DIFF_REPO_DIR: repo,
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    child.stderr!.setEncoding('utf8').on('data', (chunk: string) => log.push(chunk));
+    children.push(child);
+    const deadline = performance.now() + 15_000;
+    while (!log.join('').includes('herdgate: connected to')) {
+      if (performance.now() > deadline) throw new Error(`publisher did not connect:\n${log.join('')}`);
+      await delay(60);
+    }
+
+    // The mirror side: paired config + watch --once through the same stub herdr.
+    const mcfg = join(dir, 'mirror-cfg');
+    mkdirSync(mcfg, { recursive: true });
+    writeFileSync(join(mcfg, 'mirror.json'), JSON.stringify({ v: 1, url: gate, roomId: room, device: mirrorDev.device.id, secret: mirrorDev.secret, scope: 'read', name: 'watch' }));
+    const watch = spawn(process.execPath, [join(root, 'plugin/mirror/server/index.mjs'), 'watch', '--once'], {
+      cwd: dir,
+      env: { PATH: process.env.PATH, HOME: dir, HERDR_BIN_PATH: stub, HERDR_PLUGIN_CONFIG_DIR: mcfg },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    watch.stdout!.setEncoding('utf8').on('data', (d) => { out += d; });
+    watch.stderr!.setEncoding('utf8').on('data', (d) => { out += d; });
+    const watchCode = await new Promise<number>((resolve) => { watch.on('close', resolve); setTimeout(() => { try { watch.kill(); } catch {} resolve(-1); }, 20_000); });
+    const bridge = readFileSync(bridgeLog, 'utf8');
+    assert.ok(bridge.includes('workspace.create'), 'the mirror workspace is created');
+    assert.ok(bridge.includes('workspace.rename'), '…and branded 🏠 <room>');
+    assert.ok(/tab\.create.*w1:p1/.test(bridge), 'one tab per mirrored pane, labeled M:<paneId>');
+    assert.ok(/pane\.send_text.*stream/.test(bridge), 'the tab runs our stream command');
+    assert.match(out, /reconcile xong/);
+    t.diagnostic(`watch --once exit ${watchCode}`);
+  } finally {
+    for (const c of children) c.kill();
+    await cloud?.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -6,12 +6,13 @@
 // confirmed it twice — predict.mjs carries those rules).
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { hostname, homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { drawFleet, sanitizeFleet } from "./panel.mjs";
 import { PredEcho, looksFullScreen } from "./predict.mjs";
+import { mirrorWorkspaceLabel, planMirrors, streamCommandLine, MIRROR_TAB_PREFIX } from "./reconcile.mjs";
 
 const run = promisify(execFile);
 const NAME = "herdgate-mirror";
@@ -243,6 +244,151 @@ async function cmdStream(target) {
   function stripAnsi(s) { return String(s).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\x1b[()][B0]/g, ""); }
 }
 
+
+/** One api-bridge call: one process, one JSON request on stdin (the pattern
+ *  the pane-driver proved on both platforms). */
+async function herdrApi(method, params) {
+  const bin = process.env.HERDR_BIN_PATH || "herdr";
+  const session = process.env.HERDGATE_MIRROR_SESSION || "default";
+  const id = "m" + Math.random().toString(36).slice(2, 8);
+  // A .mjs stub (tests) is not executable on its own — it rides the node binary.
+  const argv = ["--session", session, "remote-api-bridge"];
+  const child = bin.endsWith(".mjs")
+    ? spawn(process.execPath, [bin, ...argv], { stdio: ["pipe", "pipe", "pipe"] })
+    : spawn(bin, argv, { stdio: ["pipe", "pipe", "pipe"] });
+  return new Promise((resolve, reject) => {
+    let out = "";
+    const timer = setTimeout(() => { try { child.kill(); } catch {} reject(new Error(`api ${method} timeout`)); }, 8_000);
+    child.stdout.setEncoding("utf8").on("data", (d) => {
+      out += d;
+      for (const line of out.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const m = JSON.parse(line);
+          if (m.id === id) { clearTimeout(timer); try { child.kill(); } catch {} resolve(m); return; }
+        } catch { /* partial line */ }
+      }
+    });
+    child.stderr.setEncoding("utf8").on("data", () => {});
+    child.on("error", (e) => { clearTimeout(timer); reject(e); });
+    child.stdin.write(JSON.stringify({ id, method, params }) + "\n");
+    child.stdin.end();
+  });
+}
+
+/** The watch loop: poll fleet.detail, reconcile the mirror workspace's tabs.
+ *  Ownership is by label — our workspace (🏠 <room>), our tabs (M:<paneId>) —
+ *  nothing else on this Herdr is ever touched. */
+async function cmdWatch(args) {
+  const cfg = readConfig();
+  if (!cfg.url || !cfg.device || !cfg.secret) { console.error(`${NAME}: chưa pair`); process.exit(2); }
+  if (args.includes("--stop")) {
+    const label = mirrorWorkspaceLabel(cfg.roomId);
+    const listed = await herdrApi("workspace.list", {});
+    const ours = (listed?.result?.workspaces ?? listed?.result ?? []).find?.((w) => w?.label === label);
+    if (!ours) { console.log(`${NAME}: không có workspace mirror để dọn`); return; }
+    const closed = await herdrApi("workspace.close", { workspace_id: ours.workspace_id });
+    console.log(`${NAME}: đã đóng ${ours.workspace_id} (${JSON.stringify(closed?.result ?? closed?.error).slice(0, 80)})`);
+    return;
+  }
+  const once = args.includes("--once");
+  const selfDir = new URL(".", import.meta.url).pathname.replace(/\/$/, "");
+  const label = mirrorWorkspaceLabel(cfg.roomId);
+  let wsId = null;
+  const tabsByLabel = async () => {
+    const listed = await herdrApi("tab.list", {});
+    const tabs = (listed?.result?.tabs ?? []).filter((t) => typeof t?.tab_id === "string" && t.workspace_id === wsId);
+    return tabs.map((t) => ({ tabId: t.tab_id, label: typeof t.label === "string" ? t.label : "" }));
+  };
+  const ensureWorkspace = async () => {
+    const listed = await herdrApi("workspace.list", {});
+    const all = listed?.result?.workspaces ?? [];
+    const found = all.find((w) => w?.label === label);
+    if (found) return found.workspace_id;
+    const created = await herdrApi("workspace.create", {});
+    const id = created?.result?.workspace?.workspace_id;
+    if (!id) throw new Error("workspace.create: " + JSON.stringify(created).slice(0, 120));
+    await herdrApi("workspace.rename", { workspace_id: id, label });
+    return id;
+  };
+  const reconcile = async (fleet) => {
+    wsId = wsId ?? (await ensureWorkspace());
+    const plan = planMirrors(fleet, await tabsByLabel());
+    for (const tab of plan.close) {
+      await herdrApi("tab.close", { tab_id: tab.tabId });
+      console.log(`${NAME}: − ${tab.paneId} (pane remote biến mất)`);
+    }
+    for (const paneId of plan.create) {
+      const created = await herdrApi("tab.create", { workspace_id: wsId, label: MIRROR_TAB_PREFIX + paneId });
+      const pane = created?.result?.root_pane?.pane_id;
+      if (!pane) { console.error(`${NAME}: tab.create lỗi cho ${paneId}`); continue; }
+      // The tab's shell has none of our env — the command carries its own.
+      await herdrApi("pane.send_text", { pane_id: pane, text: streamCommandLine(configDir(), selfDir, paneId) + "\r" });
+      console.log(`${NAME}: + ${paneId} → tab ${created?.result?.tab?.tab_id}`);
+    }
+    return plan;
+  };
+  if (once) {
+    const fleet = await askFleetOnce(cfg);
+    const plan = await reconcile(fleet);
+    console.log(`${NAME}: reconcile xong — giữ ${plan.keep.length}, tạo ${plan.create.length}, đóng ${plan.close.length}`);
+    return;
+  }
+  // Long watch: fleet WS in the foreground, reconcile each answer.
+  let stopped = false;
+  keyToClose(() => { stopped = true; });
+  let ws;
+  const intervalMs = Number(process.env.HERDGATE_MIRROR_MS) || 5_000;
+  while (!stopped) {
+    await new Promise((resolve) => {
+      ws = new WebSocket(String(cfg.url).replace(/^http/, "ws") + "/v1/device/ws");
+      let lastFrame = 0;
+      ws.onopen = () => ws.send(JSON.stringify({ v: 1, t: "hello", device: cfg.device, deviceSecret: cfg.secret }));
+      ws.onmessage = async (event) => {
+        let m;
+        try { m = JSON.parse(String(event.data)); } catch { return; }
+        if (m.t !== "frame" || !m.payload || typeof m.payload !== "object") return;
+        lastFrame = Date.now();
+        const p = m.payload;
+        if (p.op === "fleet.detail.result") {
+          try { await reconcile(sanitizeFleet(p)); } catch (e) { console.error(`${NAME}: reconcile — ${e instanceof Error ? e.message : String(e)}`); }
+          if (once) { try { ws.close(); } catch {} }
+        }
+      };
+      ws.onclose = () => resolve();
+      ws.onerror = () => {};
+      const ask = () => { if (ws.readyState === 1) ws.send(JSON.stringify({ v: 1, t: "frame", payload: { op: "fleet.detail" } })); };
+      setTimeout(ask, 150);
+      const iv = setInterval(() => { if (stopped || Date.now() - lastFrame > 30_000) { clearInterval(iv); try { ws.close(); } catch {} } else ask(); }, intervalMs);
+      if (iv.unref) iv.unref();
+    });
+    if (stopped) break;
+    console.log(`${NAME}: mất kết nối gate — 3s nữa thử lại`);
+    await sleep(3_000);
+  }
+}
+
+async function askFleetOnce(cfg) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(String(cfg.url).replace(/^http/, "ws") + "/v1/device/ws");
+    const timer = setTimeout(() => { try { ws.close(); } catch {} reject(new Error("fleet.detail timeout")); }, 10_000);
+    ws.onopen = () => ws.send(JSON.stringify({ v: 1, t: "hello", device: cfg.device, deviceSecret: cfg.secret }));
+    ws.onmessage = (event) => {
+      let m;
+      try { m = JSON.parse(String(event.data)); } catch { return; }
+      if (m.t === "hello") {
+        // The public gate's TLS handshake can outlast any fixed delay — ask
+        // only once the room has answered the hello.
+        ws.send(JSON.stringify({ v: 1, t: "frame", payload: { op: "fleet.detail" } }));
+        return;
+      }
+      if (m.t === "frame" && m.payload?.op === "fleet.detail.result") { clearTimeout(timer); ws.close(); resolve(sanitizeFleet(m.payload)); }
+      if (m.t === "frame" && m.payload?.op === "error") { clearTimeout(timer); ws.close(); reject(new Error(m.payload.message ?? m.payload.code)); }
+    };
+    ws.onerror = () => { clearTimeout(timer); reject(new Error("không nối được gate")); };
+  });
+}
+
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 /** Raw-mode key watching: any handler may call stop; returns {stop}. */
@@ -273,10 +419,11 @@ if (cmd === "--help" || cmd === "" || cmd === "help") {
   pair     pair into a room (env: HERDGATE_MIRROR_URL, HERDGATE_MIRROR_ROOM, HERDGATE_ACCOUNT_TOKEN|HERDGATE_MIRROR_TOKEN, HERDGATE_MIRROR_SCOPE=read|act)
   status   JSON: pairing state (secrets masked)
   pane     the fleet sidebar (q đóng · r làm mới; --once vẽ một khung rồi thoát)
-  stream   mirror one remote pane: stream <paneId> (typing cần act + HERDGATE_MIRROR_TYPE=1)`);
+  stream   mirror one remote pane: stream <paneId> (typing cần act + HERDGATE_MIRROR_TYPE=1)
+  watch    reconcile workspace 🏠 <room> + tab M:<paneId> per remote pane (--once một vòng; --stop dọn sạch)`);
   process.exit(0);
 }
-const commands = { pair: cmdPair, status: cmdStatus, pane: () => cmdPane(arg === "--once"), stream: () => cmdStream(arg) };
+const commands = { pair: cmdPair, status: cmdStatus, pane: () => cmdPane(arg === "--once"), stream: () => cmdStream(arg), watch: () => cmdWatch(process.argv.slice(3)) };
 try {
   await commands[cmd]?.();
 } catch (e) {
