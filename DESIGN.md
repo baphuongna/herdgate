@@ -219,3 +219,31 @@ bridge-side. herdgate: the cloud in the middle, own identity, host renders, clou
 ideas kept: hello-first auth, hashed tokens, scope-aware routing, single-use artifacts, rate limits everywhere.
 The parts dropped: mod sandboxing (the host is trusted code on its own machine), tree recording (the host owns
 its UI), Tailscale (public via cloudflared).
+
+
+## Wake by herdr event (2026-11-22)
+
+Settles and pane deaths are **herdr's observations**, not the child's. The plugin manifest
+hooks `pane.agent_status_changed`, `pane.exited`, `pane.closed` into
+`plugin/server/wake-event.mjs` — a short-lived process per event:
+
+```
+herdr event ─▶ wake-event.mjs ─▶ registry lookup (spawn children only)
+                                 ├─ settle (idle|done, revision-stable) ─▶ 🔔 frame → parent pane
+                                 └─ death (no final receipt, not closedBy parent) ─▶ DIED frame (once)
+```
+
+Discipline layered from live incidents and the herdr-pings/sidebar/cats deep research:
+flock try_lock per event (burst dedup) · heartbeat liveness (>20s stale revision =
+corpse echo, dropped) · generation tokens on every frame (`gen=<revision>`) ·
+stamp-and-byte-verify sidecar writes · parent quiet-wait before typing (pane run,
+never the RPC channel) · `parentPaneId` recorded at spawn beats session-file lookup.
+The publisher keeps receipts purely as evidence (device push); it no longer wakes.
+
+## State discipline (2026-11-22)
+
+Spawn registry and receipt-adjacent state follow herdr-portfwd's rules: a damaged file
+throws WITH ITS NAME (never reads as empty), writes are O_EXCL temp + rename with a
+stable sort (byte-stable files), and a state directory writable by group/other is
+refused outright. `startCloud` resolves only after the sshd has bound (a Cloud whose
+`.ssh.port` is still zero made ssh2 silently dial :22 — a live flake).

@@ -8,10 +8,55 @@
 | `query.mjs` | `node experiments/pi-receipt/query.mjs --gate ... --device d --secret s --id <uuid> --wait` | Nhận receipt / body qua Gate từ xa (`--wait` chờ push, `--search` tìm BM25). |
 | `usage.mjs` | `node experiments/pi-receipt/usage.mjs --days 7` | Tổng hợp usage theo ngày/principal. |
 | `dag.mjs` | `node experiments/pi-spawn/dag.mjs` | Cây agent + trạng thái checked. |
-| `spawn.mjs` | `node experiments/pi-spawn/spawn.mjs spawn reviewer` | Spawn/arm/restore agent one-id (`list`, `restore <name-or-id>`). |
+| `spawn.mjs` | `node experiments/pi-spawn/spawn.mjs spawn reviewer` | Spawn/arm/restore agent one-id (`list`, `restore <name-or-id>`, `revive`, `close`). |
+| `task.mjs` | `node experiments/pi-spawn/task.mjs start <n> <file>` | **Đường chuẩn một lệnh**: spawn+arm+prompt marker-safe (`continue`/`status`/`close`). |
+| `gc.mjs` | `node experiments/pi-receipt/gc.mjs [--days 90] [--apply]` | Dọn journal/body cũ — dry-run mặc định, **giữ mọi `unknown`**, bỏ qua cursor còn tham chiếu. |
 
 Đã thử với Pi **1.5.2**. Extension nằm ngoài thư mục tự nạp và ngoài gói npm/ZIP;
 không có lệnh cài, không bật integration hoặc mở API. Chỉ dùng ở **pane thử**.
+
+## Receipt v2 — delivery, phase, counters (21–22/11)
+
+Ngoài status/reason/usage truyền thống, entry (tùy chọn, back-compat) mang thêm:
+
+- `delivery`: `delivered | stalled | unverified` — đường gửi không còn "blind success"
+  (bài học herdrchat; legacy map theo có responseEntryId).
+- `phase`: `dispatch | settled | failed_before_dispatch` — request chết trước khi tới
+  provider là một loài khác với chạy rồi mới fail (bài học herdr-mobile-relay).
+  `error {code,args}` chỉ đi kèm khi code machine-readable — không bịa code.
+- `turns` + `lastActivityAt`: đo từ transcript lúc settle (đếm + timestamp, không nội
+  dung); `isStale(entry, now, 30m)` chỉ khẳng định khi CÓ dữ liệu quan sát.
+- Watcher giờ là **mailbox**: mỗi sweep sort theo (id, ts), mỗi id chỉ emit bản mới nhất
+  MỘT lần (newer-of-two-copies — bài học herdr-agent-usage).
+
+`publicReceipt` lộ delivery + phase (metadata), KHÔNG lộ error. Chi tiết ngữ nghĩa:
+`plugin/server/pi-receipts.mjs`, test `test/pi-receipts2.test.ts`.
+
+## Attachments — ảnh từ điện thoại tới đĩa của agent
+
+`attachment.upload {name, dataBase64}` (op device-channel) → validate **magic bytes**
+(PNG/JPEG/WebP/GIF — tên client chỉ là trang trí), cap 4MB, lưu `attachments/<yyyy-mm>/`
+tạo từng cấp 0700, refuse symlink, tên `<uuid>.<ext>` O_EXCL 0600 — trên **máy agent**
+(publisher state). Reply kèm hint nguyên văn herdcats: `Please open and inspect this
+image: <path>` — composer PWA chèn vào prompt. `attachment.list` + `gcAttachments`
+(14 ngày, dry-run mặc định). Live-proved: agent đọc PNG đỏ trả lời `COLOR đỏ`.
+
+## Observers — sysmon · transcript · ports (op cho PWA)
+
+- `sysmon.snapshot`: sampler /proc một-pass torn-safe, ppid map cycle-guard, subtree
+  jiffies + **cutime/cstime 3-case** (test build hết CPU vẫn được tính), CPU là share
+  toàn máy ≤100%. Chờ herdr lộ `pid` trong pane list để có roots (đã sẵn code).
+- `ports.list`: listening → inode → fd → pid → ppid walk về pane shell_pid; không
+  gán được → `unattributed` trung thực (bài học herdr-portfwd).
+- `receipt.enrich {id}`: parser transcript Pi (tail 8MB line-aligned, active-branch,
+  model sau `model_change`, context sau `compaction`, usage tổng) — không cần API nào.
+
+## Git an toàn cho mọi op đọc git
+
+`plugin/server/git-safe.mjs`: execFile + `--no-ext-diff --no-textconv -c
+core.fsmonitor=false -c core.hooksPath=` + env scrub (chỉ PATH/HOME/LANG +
+`GIT_OPTIONAL_LOCKS=0`) + whitelist ref (có `~ ^`). `diff.get` và pipeline reviewer
+cùng đi một đường. Bài học herdr-file-viewer (`git.rs:588`) + herdr-sidebar.
 
 ## Principal contract (herdr-sched §3.1)
 

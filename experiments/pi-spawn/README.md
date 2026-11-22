@@ -1,57 +1,71 @@
-# Pi spawn registry — cha/con và vòng đời agent (thử nghiệm)
+# pi-spawn — the subagent lifecycle
 
-Herdr không có registry quan hệ controller→agent, và binding session của Pi chỉ biết được
-*sau khi* detection chạy. Helper này lấp hai lỗ đó bằng một nguyên tắc: **một UUID làm cả
-receipt request id lẫn `pi --session-id`** — session của agent con được biết ngay tại lúc
-spawn, và mở lại sau khi pane chết chỉ là gọi lại cùng một cờ.
+One-id children of a Pi controller, in visible Herdr panes, with receipts, herdr-event wakes
+and a bounded registry that survives reboots.
 
-## Dùng
+```
+task.mjs start ─▶ spawn (own tab) ─▶ arm (ack-file handshake) ─▶ prompt (marker line 1)
+      │                                                                    │
+      │                                     herdr pane events ─▶ wake-event.mjs ─▶ 🔔 frame
+      │                                     (agent_status_changed / exited / closed)
+      ▼
+ close (3-layer retire) ─▶ record kept ─▶ restore/revive reopen the SAME session id
+```
+
+## Commands
 
 ```sh
-node experiments/pi-spawn/spawn.mjs spawn reviewer --cwd /home/bom/source [-- model ...]
-node experiments/pi-spawn/spawn.mjs self --parent <session-id> --name <n> [--cwd DIR] [--id UUID]
+# The standard path — one command, marker-safe, failure reported per step:
+node experiments/pi-spawn/task.mjs start <name> <taskfile> [--cwd DIR] [--tab] [--body]
+node experiments/pi-spawn/task.mjs continue <name> <text|file>   # envelope-wrapped re-prompt
+node experiments/pi-spawn/task.mjs status [name]                 # recent-first, receipt-aware
+node experiments/pi-spawn/task.mjs close <name>
+
+# The raw verbs (task.mjs delegates where it can):
+node experiments/pi-spawn/spawn.mjs spawn <name> [--cwd DIR] [--tab] [-- parent-session ID]
+node experiments/pi-spawn/spawn.mjs arm   <name-or-id> [--body]  # /herdgate-arm + ack poll
+node experiments/pi-spawn/spawn.mjs close <name-or-id>           # preflight + generation check
+node experiments/pi-spawn/spawn.mjs restore <name-or-id>         # reopen the exact session
+node experiments/pi-spawn/spawn.mjs revive [--name N] [--dry-run]# post-reboot bulk restore
 node experiments/pi-spawn/spawn.mjs list
-node experiments/pi-spawn/spawn.mjs restore reviewer   # hoặc <request-id>
-``n
-- `spawn`: tách sibling pane (tự tìm pane gọi khi chạy trong Herdr), `herdr agent start … --
-  --session-id <uuid>` (idempotent: có session thì mở, không thì tạo), xác minh binding
-  (`agent_session` khớp id), ghi `spawns.jsonl` cạnh journal receipt cùng scope.
-- `self`: **agent tự khai sinh cha** (ownership edge kiểu pi-durable, nhưng bằng cơ chế
-  herdgate): một agent không do controller pane-split — job của pi-worker, con do SDK
-  sinh — tự ghi `{id = sessionId, parentSessionId, name, cwd, sessionFile}` vào scope
-  workspace của nó. Worker `--real` lẫn fixture đều tự đăng ký mỗi job; bản ghi cập nhật
-  trạng thái theo verdict (replied/failed/…).
-- `list`: các agent con của workspace này + pane còn attached hay không (`self` cho con
-  không pane), kèm trạng thái receipt.
-- `restore`: mở lại **đúng session đó**: ưu tiên `--session <file>` theo đường dẫn
-  transcript ghi trong bản ghi (session của worker nằm ngoài storage mặc định của Pi —
-  `--session-id` trần sẽ âm thầm tạo session rỗng trùng id), fallback `--session-id`
-  cho con do TUI spawn.
 
-Registry `<base>/<scope>/spawns.jsonl` (0600): `{id, sessionId, paneId?, name,
-parentSessionId, cwd, sessionFile?, self?, ts, status}` — chỉ id/panes/trạng thái,
-**không có prompt/answer**; bound như journal (giữ ~200–300 bản ghi mới nhất). Dùng
-chung `HERDGATE_PI_RECEIPT_DIR` override và `scopeFor(realpath)` với journal.
-Cha-con có hai nguồn: controller ghi khi `spawn`, và **agent tự khai sinh cha** qua
-`self` (job pi-worker là khách hàng đầu tiên — mỗi job SDK tự đăng ký, id session
-dược chỉ định bằng `SessionManager.create(…, {id: job.id})` nên một id chạy trọn
-chuỗi receipt → session → restore).
+# The tree, and the governed pipeline:
+node experiments/pi-spawn/dag.mjs [--json]                       # spawn tree + receipt status
+node experiments/pi-spawn/pipeline.mjs run <task.md> [--fake]    # worktree→agent→test→retry→reviewer
+node experiments/pi-spawn/pipeline.mjs clean <id> --approved
+```
 
-## Vì sao `--session-id`
+## Semantics worth knowing
 
-`pi --resume` là menu tương tác, không nhận id; `pi --session <id|path>` mở một session có
-sẵn. `--session-id <id>` gán/xài id ngay từ đầu — đúng cho cả spawn lẫn restore, và là
-forensic link tự nhiên tới receipt (`receipt.get <id>`), body (`responses/<id>.md`) và
-watch push cùng một id.
+- **Identity**: `spawn:<uuid>` is the citizen; pane/session are carriers (`entwurf`'s rule).
+  Duplicate names resolve to the LIVE record first (an orphan half-spawn can't shadow a child).
+- **Arm handshake**: `arm` is only real once the child's observer writes `<id>.armed.json`;
+  arm polls it (15s) instead of sleeping — the prompt can never precede the baseline.
+- **Marker**: `[herdr-request:<id>]` owns the start of the prompt; a newline **or one space**
+  may follow. `task.mjs` builds it — don't hand-assemble.
+- **Close is a 3-layer retire**: explicit target → working/blocked preflight refusal → generation
+  check (the pane's current session must still match the record; a reused pane is never closed).
+- **Wake** comes from herdr's own events (see `plugin/server/wake-event.mjs`), not from the
+  child's cooperation: settle frames carry `via=herdr-event`, `gen=<revision>`, title/tokens
+  when the receipt journal has them. Death without a settle fires one `DIED` frame
+  (`closedBy: parent` closes are silent).
+- **Revive**: after a reboot, records that are not closed, not died, have no live pane and still
+  have their transcript are reopened on the exact session — never "the latest jsonl".
+- **Registry discipline** (`registry.mjs`): damaged files throw WITH the file name (never an
+  empty read), writes are O_EXCL temp + rename with a stable sort (byte-stable output),
+  and a state dir writable by group/other is refused outright.
 
-## Đã nghiệm thu
+## Worktree rule (conflict avoidance)
 
-- Unit (`test/pi-spawn.test.ts`): ghi/ghi-đè cùng id, patch restore, bound 200–300, invalid
-  fail-closed, không lộ text prompt.
-- Live trên máy nhà: spawn `demo-child` → `bound:true`, parent = session controller; đóng
-  pane; `restore demo-child` → cùng session id ở pane mới, `bound:true`.
-- Live Windows (2026-11-21): job `--real` của pi-worker (glm-5.3, NTFS) →
-  `restore job-<id>` từ PowerShell mở **đúng transcript** trong tab riêng qua
-  `--session <file>` (herdr 0.9.4-preview) — prompt + reply hiển thị, counter token
-  thật, `bound:true`. Con `self` restore vào tab riêng `hg-<name>` (không mượn pane
-  caller).
+Direct on the open branch only when exactly one writer per file set (controller alone, or
+subagents with fully disjoint whitelists). A dedicated `herdr worktree create` is mandatory for
+parallel agents touching the same files, long tasks that may collide with the human, or
+experiments. Whitelist first, worktree second; merging is the controller's job on the main
+checkout after every child settles. `pipeline.mjs` bootstraps its own worktrees (env copy +
+deps install) and never merges by itself.
+
+## Tests
+
+`test/pi-spawn.test.ts` (registry), `test/pi-task.test.ts` (one-command flow, marker shape,
+failure reporting, argv-recording seam), `test/pi-revive.test.ts`, `test/pi-state-hard.test.ts`
+(damaged/ownership/byte-stable/generation), `test/pi-pipeline.test.ts` (fake-provider e2e).

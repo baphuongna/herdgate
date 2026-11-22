@@ -38,9 +38,16 @@ src/cloud/      the gateway: stores, pairing, routing, HTTP/WS, CLI (main.ts)
 src/agent/      HerdGateAgent SDK + AgentAdapter (what a host app implements)
 src/host/       standalone host CLI (no Herdr needed) + the `herdr api snapshot` adapter
 plugin/         the Herdr TUI plugin: herdr-plugin.toml + server/ (what `herdr plugin link` loads)
+                — op table, wake-event hooks, receipts/observers/attachments modules
+experiments/    host-local CLIs + SDK pieces the controller drives by hand:
+                pi-spawn (task.mjs lifecycle, registry, pipeline, dag),
+                pi-receipt (observer that runs INSIDE children, query/search/usage/gc),
+                pi-worker (run-jobs, scheduler, MCP, durable probes)
+docs/research/  two-tier deep research on 12 herdr plugins (2,426 lines, file:line-sourced)
 app-mod/        the Herdr app mod: mods/herdgate/ (what `herdr-app check` validates)
 src/web/        the PWA a device opens — served by the cloud, same origin as the WS legs
-test/           e2e relay, the adapter, and the plugin's own commands
+test/           57 files / 275 tests: relay e2e, plugin ops over the device channel,
+                wake-event semantics, spawn lifecycle, sysmon/port fixtures, web assets
 ```
 
 ## Self-hosted release
@@ -111,6 +118,53 @@ HERDGATE_URL=https://herd.example.com HERDGATE_ROOM_TOKEN=… npm run host
 ```
 
 Devices pair into the room and ask for `{op:"view"}`; the host answers with the current Herdr metadata.
+
+## The subagent fleet (receipts · wake · observers)
+
+Beyond relaying, the Herdr plugin runs a full **subagent observability and lifecycle stack**.
+Everything below is local-first (append-only JSONL + registry under XDG state dirs), fail-closed,
+and testable — 275 tests cover it.
+
+### Identity and evidence — receipts
+Every spawned child gets a **one-id** (`spawn:<uuid>`) recorded in a bounded registry; panes and
+session files are carriers, never the address. The arm→prompt handshake acknowledges via an ack
+file (no sleep-and-hope). Each marked request becomes a **receipt**: status/reason, usage tokens/$,
+`turns`/`lastActivityAt`, a leak-safe title, delivery state (`delivered|stalled|unverified`), a
+failure **phase** (`failed_before_dispatch` vs post-dispatch), and an optional gated body archive.
+Search is BM25 (diacritic-folded) over bodies+transcripts; devices see publicReceipt shapes only.
+A journal GC (dry-run default) never deletes `unknown` — unresolved evidence stays.
+
+### Wake — herdr is the observer
+Settles no longer depend on child cooperation: the plugin manifest hooks herdr's own events
+(`pane.agent_status_changed`, `pane.exited`, `pane.closed`) into `server/wake-event.mjs`, a
+short-lived process per event. A child's closed turn (or death without a settle) becomes a
+`🔔 WAKE` frame typed into the parent pane — after revision-stability quiet-wait, deduped by
+generation, guarded against event bursts (flock) and corpse echoes (heartbeats), with title/tokens
+enriched from the receipt journal when present. Receipts are evidence; **herdr is the trigger**.
+
+### Lifecycle — one command per verb
+```sh
+node experiments/pi-spawn/task.mjs start <name> <taskfile> --tab    # spawn+arm+prompt, marker-safe
+node experiments/pi-spawn/task.mjs continue <name> <text|file>      # self-describing re-prompt
+node experiments/pi-spawn/task.mjs status [name]                    # recent-first, receipt-aware
+node experiments/pi-spawn/spawn.mjs close <id>                      # 3-layer retire + generation check
+node experiments/pi-spawn/spawn.mjs revive [--dry-run]             # after a reboot: exact sessions back
+node experiments/pi-spawn/pipeline.mjs run <task.md> --fake        # worktree→agent→test→retry→reviewer
+```
+See `.agents/skills/herdr/SKILL.md` for the operating protocol (in-turn wake handling, the
+no-accumulation close rule, worktree-vs-main-branch whitelists).
+
+### Device-channel ops (the PWA's vocabulary)
+`view` · `receipt.query/search/body/ack` · `receipt.enrich` (model/context/usage from the transcript)
+· `usage.rollup` · `diff.get` (hardened git: hooks off, env scrubbed, `~ ^` refs)
+· `sysmon.snapshot` (per-agent CPU/RAM from /proc, cutime-aware) · `ports.list` (listeners attributed
+by process ancestry; unattributed stay honest) · `attachment.upload/list` (magic-byte photos from
+the phone to the agent's own disk, 0700/0600, uuid names) — plus the SSH/mobile leg below.
+
+### Mobile transport
+One persistent shell with marker framing replaces exec-per-command; phone keystrokes enter a
+bounded, coalescing, in-order-acked queue that resyncs instead of replaying; file polls are
+checksum-stamped (`unchanged` costs one word).
 
 ## The SSH leg (the Herdr phone app)
 
