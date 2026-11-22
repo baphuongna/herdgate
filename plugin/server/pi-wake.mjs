@@ -9,7 +9,7 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { readSpawns } from '../../experiments/pi-spawn/registry.mjs';
+import { readSpawns } from './spawn-registry.mjs';
 import { findReceipt } from './pi-receipts.mjs';
 
 const note = (line) => console.error(`herdgate pi-wake: ${line}`);
