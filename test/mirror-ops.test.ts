@@ -191,6 +191,58 @@ test('predictive echo: ghosts expire, the pending ring is capped, full-screen st
   assert.equal(looksFullScreen('plain text', 'bash'), false);
 });
 
+test('predictive echo: WAN grace — a stale frame past 150ms is not a contradiction', () => {
+  let t = 10_000;
+  const p = new PredEcho({ now: () => t, graceMs: 900 });
+  p.key('a');
+  // +600ms: over the 150ms default grace, inside the poll-shaped 900ms — pending, no punishment.
+  t = 10_600;
+  const stale = p.confirm('shell$');
+  assert.equal(stale.mismatch, false);
+  assert.equal(stale.enabled, false);
+  assert.equal(p.pendingView(), 'a', 'the prediction survives a frame that predates it');
+  // +400ms more with the echo present: first confirm.
+  t = 11_000;
+  assert.equal(p.confirm('shell$ a').matched, 1);
+  // A frame 1000ms after a key (past grace, inside timeout) that lacks it: contradiction.
+  p.key('z');
+  t = 12_000;
+  assert.equal(p.confirm('shell$ a').mismatch, true, 'past the WAN grace a missing prediction is a contradiction');
+  assert.equal(p.enabled, false);
+});
+
+test('predictive echo: evidence() reports the trust meter for the header', () => {
+  let t = 100;
+  const p = new PredEcho({ now: () => t });
+  assert.deepEqual(p.evidence(), { enabled: false, confirms: 0, threshold: CONFIRM_THRESHOLD, pending: 0 });
+  p.key('a');
+  assert.equal(p.evidence().pending, 1);
+  t = 200;
+  p.confirm('shell$ a');
+  assert.equal(p.evidence().confirms, 1);
+  p.key('b');
+  t = 300;
+  p.confirm('shell$ ab');
+  assert.equal(p.evidence().enabled, true, 'evidence() flips with the threshold');
+});
+
+test('ask scheduler: flush-triggered frame requests respect the publisher throttle', async () => {
+  const { AskScheduler } = await import('../plugin/mirror/server/wire.mjs');
+  let t = 1_000_000;
+  const s = new AskScheduler({ minIntervalMs: 1_000, now: () => t });
+  assert.equal(s.nextDelayMs(), 0, 'the first ask is immediate');
+  s.mark();
+  assert.ok(s.nextDelayMs() > 0, 'an ask inside the throttle window must wait');
+  t += 600;
+  assert.equal(s.nextDelayMs(), 400);
+  t += 400;
+  assert.equal(s.nextDelayMs(), 0, 'the slot reopens after the interval');
+  s.mark();
+  // A flush while throttled schedules exactly the remaining time — never 0, never stacking.
+  t += 100;
+  assert.equal(s.nextDelayMs(), 900);
+});
+
 test('fleet panel: pure renderer, wire shapes sanitized', () => {
   const fleet = sanitizeFleet({
     herdr: '9.9.9 (protocol 22)',

@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { drawFleet, sanitizeFleet } from "./panel.mjs";
 import { PredEcho, looksFullScreen } from "./predict.mjs";
+import { AskScheduler } from "./wire.mjs";
 import { mirrorWorkspaceLabel, planMirrors, streamCommandLine, MIRROR_TAB_PREFIX } from "./reconcile.mjs";
 
 const run = promisify(execFile);
@@ -205,7 +206,12 @@ async function cmdStream(target) {
   if (!cfg.url || !cfg.device || !cfg.secret) { console.error(`${NAME}: chưa pair`); process.exit(2); }
   if (!/^[A-Za-z0-9_:.-]{1,64}$/.test(String(target ?? ""))) { console.error(`${NAME}: pane id không hợp lệ`); process.exit(2); }
   const typing = process.env.HERDGATE_MIRROR_TYPE === "1" && cfg.scope === "act";
-  const predict = new PredEcho();
+  // Poll-shaped trust: a frame over the WAN arrives 300ms–1s after the key it
+  // should confirm — the port's 150ms LAN grace would read every honest frame
+  // as a contradiction and echo could never earn trust. 900ms covers the flush
+  // (150ms) + publisher throttle + one gate round trip.
+  const graceMs = Number(process.env.HERDGATE_MIRROR_GRACE_MS) || 900;
+  const predict = new PredEcho({ graceMs });
   const url = String(cfg.url).replace(/^http/, "ws") + "/v1/device/ws";
   const ws = new WebSocket(url);
   const send = (payload) => { if (ws.readyState === 1) ws.send(JSON.stringify({ v: 1, t: "frame", payload })); };
@@ -229,19 +235,29 @@ async function cmdStream(target) {
     }
   };
   let stopped = false;
-  const ask = () => send({ op: "term.read", target, lines: 40 });
+  const sched = new AskScheduler({ minIntervalMs: 1_000 });
+  const ask = () => { sched.mark(); send({ op: "term.read", target, lines: 40 }); };
+  const askIfDue = () => { if (!stopped && sched.nextDelayMs() === 0) ask(); };
   ws.onclose = () => { if (!stopped) { screen = "mất kết nối gate — thoát (q)"; paintStream(); } };
-  const poll = setInterval(ask, 1600);
+  const poll = setInterval(askIfDue, 1600);
   if (poll.unref) poll.unref();
-  setTimeout(ask, 150);
+  setTimeout(askIfDue, 150);
 
   const buffer = []; // typed chars awaiting a batch send (150ms)
   let flushTimer = 0;
+  let askTimer = 0;
   const flush = () => {
     flushTimer = 0;
     if (!buffer.length) return;
     const text = buffer.splice(0).join("");
     send({ op: "term.send", target, text });
+    // The confirmation frame should follow the keys, not the poll clock:
+    // ask as soon as the publisher's 1/s throttle allows.
+    if (!askTimer) {
+      const delay = sched.nextDelayMs();
+      askTimer = setTimeout(() => { askTimer = 0; askIfDue(); }, delay);
+      if (askTimer.unref) askTimer.unref();
+    }
   };
   keyToClose(() => { stopped = true; clearInterval(poll); try { ws.close(); } catch {} process.exit(0); }, (k) => {
     if (!typing) return;
@@ -263,7 +279,9 @@ async function cmdStream(target) {
   function paintStream() {
     const lines = String(screen).split("\n");
     const overlay = typing ? predict.pendingView() : "";
-    const head = `⌨ ${target}${typing ? " (act, echo " + (predict.enabled ? "on" : "off") + ")" : " (đọc)"}`;
+    const ev = predict.evidence();
+    const trust = typing ? `, echo ${ev.enabled ? "on" : `off ${ev.confirms}/${ev.threshold}`}` : "";
+    const head = `⌨ ${target}${typing ? ` (act${trust})` : " (đọc)"}`;
     paint([head, ...lines.slice(0, 38)].concat(overlay ? ["", "\x1b[2m" + overlay + "\x1b[0m"] : []));
   }
   function stripAnsi(s) { return String(s).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\x1b[()][B0]/g, ""); }

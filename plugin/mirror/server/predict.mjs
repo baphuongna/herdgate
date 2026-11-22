@@ -12,9 +12,11 @@ export const ECHO_TIMEOUT_MS = 1200;
 export const MAX_PENDING = 32;
 
 export class PredEcho {
-  /** @param {{now?: () => number}} [opts] clock injection for tests */
-  constructor({ now = () => Date.now() } = {}) {
+  /** @param {{now?: () => number, graceMs?: number}} [opts] clock injection for tests;
+   *  graceMs widens the no-punishment window for poll-shaped mirrors (WAN). */
+  constructor({ now = () => Date.now(), graceMs = CONFIRM_GRACE_MS } = {}) {
     this.now = now;
+    this.graceMs = graceMs;
     this.enabled = false;
     this.confirms = 0;
     /** @type {{text: string, at: number}[]} */
@@ -50,8 +52,8 @@ export class PredEcho {
     }
     const ghosts = unmatched.filter((p) => now - p.at > ECHO_TIMEOUT_MS);
     const live = unmatched.filter((p) => now - p.at <= ECHO_TIMEOUT_MS);
-    const contradictions = live.filter((p) => now - p.at > CONFIRM_GRACE_MS);
-    const stillPending = live.filter((p) => now - p.at <= CONFIRM_GRACE_MS);
+    const contradictions = live.filter((p) => now - p.at > this.graceMs);
+    const stillPending = live.filter((p) => now - p.at <= this.graceMs);
     if (text && contradictions.length) {
       this.enabled = false;
       this.confirms = 0;
@@ -72,6 +74,11 @@ export class PredEcho {
     this.enabled = false;
     this.confirms = 0;
     this.pending = [];
+  }
+
+  /** The trust meter for a header line: how much evidence, how much pending. */
+  evidence() {
+    return { enabled: this.enabled, confirms: this.confirms, threshold: CONFIRM_THRESHOLD, pending: this.pending.length };
   }
 
   /** The predicted-but-unconfirmed suffix, for a dim overlay while echoing. */
