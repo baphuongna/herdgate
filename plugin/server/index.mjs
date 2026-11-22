@@ -979,7 +979,7 @@ async function publisherLoop() {
               text = text.slice(0, Math.floor(text.length * 0.8));
             }
             const lines = text.length ? text.split("\n").length : 0;
-            return void replyTo({ op: "file.read.result", path, text, lines, bytes: st.size, truncated: truncated || text.length < Math.min(st.size, MAX_FILE_BYTES) });
+            return void replyTo({ op: "file.read.result", path, text, lines, bytes: st.size, truncated: truncated || Buffer.byteLength(text) < Math.min(st.size, MAX_FILE_BYTES) });
           } catch (e) {
             const err = e instanceof Error ? e : new Error(String(e));
             log(`files: ${m.device} read ${path} refused: ${err.message}`);
