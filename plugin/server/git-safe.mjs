@@ -57,7 +57,7 @@ export function scrubEnv() {
 }
 
 /** Args must be short printable words: refs, hashes, paths, allowed flags. */
-const ARG_RE = /^[A-Za-z0-9._/:-]{1,128}$/;
+const ARG_RE = /^[A-Za-z0-9._/::~^-]{1,128}$/;
 /** Flags a read may carry. Anything else option-looking is refused. */
 const ALLOWED_FLAGS = new Set(["-C", "--no-color", "--stat", "--patch", "--no-ext-diff", "--no-textconv"]);
 /** Subcommands that produce diffs — the only ones that take --no-ext-diff/--no-textconv. */

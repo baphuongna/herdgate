@@ -858,7 +858,7 @@ async function publisherLoop() {
           // fsmonitor/hooks neutralized, no payload-chosen cwd — so hostile repo
           // config can never execute through this op.
           const ref = typeof payload.ref === "string" ? payload.ref : "";
-          if (!/^[A-Za-z0-9._\/-]{1,64}$/.test(ref)) {
+          if (!/^[A-Za-z0-9._/~^-]{1,64}$/.test(ref)) {
             return void replyTo({ op: "error", code: "bad-ref", message: "diff.get needs a git ref of [A-Za-z0-9._/-], 1..64 chars" });
           }
           const repoDir = diffRepoDir();
