@@ -126,6 +126,24 @@ fs.writeFileSync(path.join(bin, 'herdgate.mjs'), 'console.log(JSON.stringify(pro
   }
 });
 
+test("the staged release carries package.json so the publisher can advertise its real version", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "herdgate stage "));
+  const source = join(tmp, "bundle");
+  try {
+    for (const dir of ["plugin", "windows"]) cpSync(join(repo, dir), join(source, dir), { recursive: true });
+    writeFileSync(join(source, "package.json"), JSON.stringify({ name: "@bom0792/herdgate", version: "9.9.9-fixture" }) + "\n");
+    const out = execFileSync(process.execPath, [join(source, "windows", "install-cli.mjs"), "--root", join(tmp, "Herdgate", "cli"), "--stage"], { env: { ...process.env, LOCALAPPDATA: tmp }, encoding: "utf8" }).trim();
+    assert.match(out, /^tui-[a-f0-9]{16}$/);
+    const staged = JSON.parse(readFileSync(join(tmp, "Herdgate", "cli", "releases", out, "package.json"), "utf8")) as { version: string };
+    assert.equal(staged.version, "9.9.9-fixture");
+    // And the shipped helper reads it from inside the staged release.
+    const v = execFileSync(process.execPath, ["-e", "import('./plugin/server/common.mjs').then((c) => console.log(c.pkgVersion()))"], { cwd: join(tmp, "Herdgate", "cli", "releases", out), encoding: "utf8" }).trim();
+    assert.equal(v, "9.9.9-fixture", "pkgVersion resolves ../../package.json inside a staged release");
+  } finally {
+    rmSync(tmp, { force: true, recursive: true });
+  }
+});
+
 test("npm CLI stages, updates and rolls back the publisher while retaining the explicit Mobile mode", () => {
   const tmp = mkdtempSync(join(tmpdir(), "herdgate setup "));
   const source = join(tmp, "bundle");

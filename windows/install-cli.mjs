@@ -27,6 +27,10 @@ async function inputs() {
   // ZIPs built before the standalone command do not contain these npm assets.
   for (const dir of ["bin", "app-mod", "templates"]) if (stat(join(source, dir))?.isDirectory()) runtime.push(dir);
   const assets = runtime.flatMap(files);
+  // The publisher advertises its build via pkgVersion(), which reads the
+  // package's own package.json — a staged release must carry it (npm layouts
+  // have it; older ZIP bundles may not, hence the guard).
+  if (stat(join(source, "package.json"))?.isFile()) assets.push("package.json");
   if (stat(join(source, ".agents", "skills"))?.isDirectory()) {
     const { piSkillFiles } = await import("../bin/pi-skills.mjs");
     assets.push(...piSkillFiles.map(name => `.agents/skills/${name}`));
