@@ -14,6 +14,7 @@ import { join, dirname } from "node:path";
 import { hostname, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead } from "./common.mjs";
+import { gitRead, diffRepoDir } from "./git-safe.mjs";
 import { createSshBridge } from "./ssh.mjs";
 import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
 import { searchReceipts, sessionRoots as piSessionRoots } from "./pi-receipt-search.mjs";
@@ -25,7 +26,6 @@ import { HostChannel, b64d, b64e, fingerprint, generateKeyPair } from "./e2e.mjs
 
 const D = dirs();
 const execFile = promisify(execFileCb);
-const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url));
 /** diff.get ships at most 128 KiB of `git show` output, marked truncated beyond. */
 const MAX_DIFF_BYTES = 128 * 1024;
 const NAME = process.env.HERDGATE_HOST_NAME || hostname();
@@ -665,16 +665,17 @@ async function publisherLoop() {
         if (op === "diff.get") {
           // READ-ONLY code archeology: one `git show --stat --patch` of a host-local
           // ref (hash/branch/tag) in the plugin's repo dir (HERDGATE_DIFF_REPO_DIR
-          // lets a test point elsewhere). execFile never shells out and the ref is
-          // whitelisted hard — a `;`, a space or `$()` never reaches git at all.
+          // lets a test point elsewhere). The ref is whitelisted hard and the git
+          // call itself goes through gitRead — scrubbed env, no ext-diff/textconv,
+          // fsmonitor/hooks neutralized, no payload-chosen cwd — so hostile repo
+          // config can never execute through this op.
           const ref = typeof payload.ref === "string" ? payload.ref : "";
           if (!/^[A-Za-z0-9._\/-]{1,64}$/.test(ref)) {
             return void replyTo({ op: "error", code: "bad-ref", message: "diff.get needs a git ref of [A-Za-z0-9._/-], 1..64 chars" });
           }
-          const repoDir = process.env.HERDGATE_DIFF_REPO_DIR || PLUGIN_DIR;
+          const repoDir = diffRepoDir();
           try {
-            const { stdout } = await execFile("git", ["show", "--no-color", "--stat", "--patch", ref],
-              { cwd: repoDir, timeout: 10_000, maxBuffer: 8 << 20 });
+            const { stdout } = await gitRead(["show", "--no-color", "--stat", "--patch", ref], repoDir, 10_000);
             const bytes = Buffer.byteLength(stdout, "utf8");
             const truncated = bytes > MAX_DIFF_BYTES;
             const text = truncated ? Buffer.from(stdout, "utf8").subarray(0, MAX_DIFF_BYTES).toString("utf8") : stdout;

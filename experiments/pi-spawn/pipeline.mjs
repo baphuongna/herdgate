@@ -37,6 +37,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { recordSpawn, spawnBase } from './registry.mjs';
+import { gitRead, scrubEnv } from '../../plugin/server/git-safe.mjs';
 
 const execFile = promisify(execFileCb);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -61,7 +62,10 @@ const runSafe = (...a) => {
   try { return { ok: true, out: run(...a) }; }
   catch (error) { return { ok: false, error: String(error?.message ?? error).slice(0, 300) }; }
 };
-const git = (cwd, ...a) => execFileSync('git', ['-C', cwd, ...a], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+// Git writes (worktree add/remove, branch -D) keep their plain argv and sync
+// spawn, but run with git-safe's scrubbed env: no GIT_* inherited from this
+// process's environment can redirect which repository gets written.
+const git = (cwd, ...a) => execFileSync('git', ['-C', cwd, ...a], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, env: scrubEnv() });
 
 const agentStatus = paneId => {
   const res = runSafe('agent', 'get', paneId);
@@ -240,11 +244,25 @@ async function runPipeline() {
     log('test', { attempt, exit: test.code });
   }
 
-  // B6 — reviewer: a second one-id agent in the same worktree
+  // B6 — reviewer: a second one-id agent in the same worktree. The pipeline
+  // itself reads the uncommitted diff through the plugin's hardened gitRead
+  // (scrubbed env, no ext-diff/textconv, hooks/fsmonitor neutralized) — git is
+  // pinned to a safe start dir and re-pointed with -C, the filev pattern — so
+  // the brief and report carry a stat that hostile repo config cannot fake.
+  let diffStat = '';
+  try {
+    diffStat = (await gitRead(['-C', worktree, 'diff', '--stat'])).stdout.trim().slice(0, 4096);
+    log('review-diff', { phase: 'read', statBytes: Buffer.byteLength(diffStat) });
+  } catch (error) {
+    // Fail-closed on the read itself, fail-open for the pipeline: the reviewer
+    // still inspects the worktree, the report just lacks the pipeline's stat.
+    log('review-diff', { phase: 'failed', error: String(error?.message ?? error).slice(0, 200) });
+  }
   const reviewer = spawnAgent({ name: `pipe-${id}-rev`, cwd: worktree, env: tabEnv, extraPiArgs: piArgs });
   log('agent-spawn', { role: 'reviewer', id: reviewer.id, pane: reviewer.paneId, name: reviewer.name, bound: reviewer.bound });
   const reviewBrief = `${marker}\n\nYou are the REVIEWER for pipeline ${id}. Your cwd is the worktree ${worktree}.\n`
     + `Inspect the uncommitted changes:\n  git diff --stat\n  git diff\n\n`
+    + (diffStat ? `The pipeline's hardened stat read of the worktree:\n${diffStat}\n\n` : '')
     + `The task was:\n${task}\n\nReply with a short review. The FINAL line must be exactly:\nREVIEW: PASS\nor\nREVIEW: FAIL <one-line reason>`;
   {
     const res = runSafe('agent', 'prompt', reviewer.paneId, reviewBrief);
@@ -261,7 +279,7 @@ async function runPipeline() {
       worker: { id: worker.id, name: worker.name, pane: worker.paneId, bound: worker.bound },
       reviewer: { id: reviewer.id, name: reviewer.name, pane: reviewer.paneId, bound: reviewer.bound },
     },
-    attempts: attempt, retries, testCmd, testExit: test.code, review,
+    attempts: attempt, retries, testCmd, testExit: test.code, diffStat, review,
     fixtureDir: fake ? fixtureDir : null,
     nextAction: 'human-approval',
   };
