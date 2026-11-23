@@ -371,6 +371,7 @@ async function cmdEvent() {
     log(`auto-resume: watched file changed — ${basename(changed)}`);
     // falls through: the resumed loop obeys the normal nudge rules below
     // (maxCycles, cooldown) exactly like an un-paused settle would.
+  }
   if (s.auditHold) { log(`audit hold ${s.auditHold.rules.join(",")} — no nudge until the owner resumes`); process.exit(0); }
 
   // Cycle audit (C18): the guardrails as a mechanism, not a promise. The
