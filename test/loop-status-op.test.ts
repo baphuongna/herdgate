@@ -208,3 +208,29 @@ test("loop.status: a log line longer than 200 chars is cut, not dropped", async 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("loop.status: deferredUntil surfaces additively (C23) — epoch ms when scheduled, null when not", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hg-c23-"));
+  const loopBase = join(dir, "loop");
+  writeLoopState(loopBase, {
+    paneId: "w3:p1", status: "running", cycles: 2, lastNudgeAt: 1_700_000_000_000,
+    deferredUntil: 1_900_000_000_000, deferredId: "c23a0001-0000-4000-8000-000000000001",
+  });
+  const gate = await fakeGate(dir, { HERDGATE_LOOP_STATE_DIR: loopBase });
+  try {
+    const payload = await gate.ask("loop.status") as { loop: Record<string, unknown> };
+    const loop = payload.loop;
+    assert.equal(loop.ok, true);
+    assert.equal(loop.deferredUntil, 1_900_000_000_000, "when the deferred nudge fires is visible from a phone");
+    assert.equal(loop.status, "running");
+    assert.equal(loop.lastNudgeAt, 1_700_000_000_000, "the old fields are unchanged (additive only)");
+
+    // No schedule in state: null, never undefined/absent-key drift.
+    writeLoopState(loopBase, { paneId: "w3:p1", status: "running", cycles: 2, lastNudgeAt: 1_700_000_000_000 });
+    const again = await gate.ask("loop.status") as { loop: Record<string, unknown> };
+    assert.equal((again.loop).deferredUntil, null);
+  } finally {
+    await gate.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

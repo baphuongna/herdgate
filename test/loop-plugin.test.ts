@@ -877,3 +877,282 @@ test("loop config: watchFiles fails closed on relative, missing, directory, empt
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+// ---- C23: the cooldown must DEFER the nudge, never drop it -----------------
+
+// A settle landing inside the cooldown used to be consumed with nothing
+// scheduled (live stall 16:25Z): the loop looked running but never advanced.
+// The contract: exactly one deferred nudge at lastNudgeAt+cooldownMs, run by
+// one short-lived detached process, re-validating the fences only (the
+// bookkeeping ran once, at the settle). Every test here drives the REAL
+// plugin through `run()`; the spawned runners wake on their own and exit
+// silently once their state dir is gone — the suite never waits for them.
+const c23Id = "c23a0001-0000-4000-8000-000000000001";
+
+const c23State = (over = {}) => ({
+  paneId: "wA:p1", status: "running", armed: true, cycles: 1, noopStreak: 0,
+  lastNudgeAt: Date.now(), startedAt: Date.now() - 120_000, ...over,
+});
+
+const paneIdle = { "pane.list": { result: { panes: [{ pane_id: "wA:p1", agent_status: "idle" }] } } };
+
+const noSchedule = (st: Record<string, unknown>) => !("deferredUntil" in st) && !("deferredId" in st);
+
+test("c23 T1: a settle inside the cooldown schedules exactly one deferred nudge", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const lastNudgeAt = Date.now();
+    const r = run(dir, { cmd: ["event"] }, {
+      config: goodConfig(dir),
+      state: c23State({ lastNudgeAt }),
+      event: idleEvent,
+    });
+    assert.equal(r.code, 0);
+    assert.deepEqual(r.calls, [], "the settle schedules — it must not nudge");
+    const st = readState(dir);
+    const due = lastNudgeAt + 10_000; // goodConfig cooldownMs
+    assert.ok(Math.abs((st.deferredUntil ?? 0) - due) <= 250, `deferredUntil ≈ lastNudgeAt+cooldown (got ${st.deferredUntil}, want ${due})`);
+    assert.ok(typeof st.deferredId === "string" && st.deferredId.length >= 8, "a deferredId is minted");
+    assert.match(readLog(dir), /nudge suppressed \(cooldown 10000ms\)/, "the old honest line stays");
+    assert.match(readLog(dir), new RegExp(`deferred nudge scheduled in \\d+s \\(id ${st.deferredId.slice(0, 8)}\\)`));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c23 T2: two settles in one cooldown window keep a single schedule (F1)", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const base = { config: goodConfig(dir), event: idleEvent };
+    const a = run(dir, { cmd: ["event"] }, { ...base, state: c23State() });
+    assert.equal(a.code, 0);
+    assert.deepEqual(a.calls, []);
+    const st1 = readState(dir);
+    const b = run(dir, { cmd: ["event"] }, { ...base, state: st1 });
+    assert.equal(b.code, 0);
+    assert.deepEqual(b.calls, []);
+    const st2 = readState(dir);
+    assert.equal(st2.deferredId, st1.deferredId, "no second id minted inside the window");
+    assert.equal(st2.deferredUntil, st1.deferredUntil, "the due time does not drift");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c23 T3: the deferred nudge fires once at due time and clears the schedule in the same write", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const r = run(dir, { cmd: ["deferred-nudge", "--id", c23Id], stubReplies: { ...paneIdle, ...nudgeReply } }, {
+      config: goodConfig(dir),
+      // deferredUntil already past: deterministic — no waiting for a timer.
+      state: c23State({ cycles: 3, lastNudgeAt: Date.now() - 60_000, deferredUntil: Date.now() - 500, deferredId: c23Id }),
+    });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.calls.filter((c) => c.startsWith("pane.send_text")).length, 1, "exactly one nudge");
+    assert.equal(r.calls.filter((c) => c.startsWith("pane.list")).length, 1, "one pane observation before the nudge");
+    const st = readState(dir);
+    assert.ok(noSchedule(st), "schedule cleared in the same write as the nudge (F14)");
+    assert.equal(st.cycles, 4, "the deferred nudge counts as a cycle");
+    assert.ok(st.lastNudgeAt > Date.now() - 10_000, "lastNudgeAt updated");
+    assert.match(readLog(dir), new RegExp(`deferred nudge: firing \\(id ${c23Id.slice(0, 8)}\\)`));
+    assert.match(readLog(dir), /nudge #4 rc=ok/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c23 T4: a foreign or missing schedule wakes nothing — silent, zero bridge calls", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const foreign = run(dir, { cmd: ["deferred-nudge", "--id", "c23b0002-0000-4000-8000-000000000002"] }, {
+      config: goodConfig(dir),
+      state: c23State({ cycles: 3, lastNudgeAt: Date.now() - 60_000, deferredUntil: Date.now() - 500, deferredId: c23Id }),
+    });
+    assert.equal(foreign.code, 0);
+    assert.deepEqual(foreign.calls, [], "0 herdr calls for a foreign id");
+    assert.equal(readState(dir).cycles, 3, "no nudge");
+    assert.ok(!existsSync(join(dir, "state", "loop.log")), "silent: no log line, no mkdir (F4)");
+
+    const gone = run(dir, { cmd: ["deferred-nudge", "--id", c23Id] }, { config: goodConfig(dir) });
+    assert.equal(gone.code, 0, "a missing state file is a silent no-op too");
+    assert.deepEqual(gone.calls, []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c23 T5: pane working / pane gone at wake — dropped, lifecycle untouched", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const st = c23State({ cycles: 3, lastNudgeAt: Date.now() - 60_000, deferredUntil: Date.now() - 500, deferredId: c23Id });
+    const w = run(dir, { cmd: ["deferred-nudge", "--id", c23Id], stubReplies: { "pane.list": { result: { panes: [{ pane_id: "wA:p1", agent_status: "working" }] } } } },
+      { config: goodConfig(dir), state: st });
+    assert.equal(w.code, 0);
+    assert.deepEqual(w.calls.filter((c) => c.startsWith("pane.send_text")), [], "no typing over a busy agent");
+    let after = readState(dir);
+    assert.equal(after.status, "running", "status untouched");
+    assert.ok(noSchedule(after), "the schedule is cleared");
+    assert.match(readLog(dir), /deferred nudge dropped: pane working/);
+
+    const g = run(dir, { cmd: ["deferred-nudge", "--id", c23Id], stubReplies: { "pane.list": { result: { panes: [] } } } },
+      { config: goodConfig(dir), state: st });
+    assert.equal(g.code, 0);
+    assert.deepEqual(g.calls.filter((c) => c.startsWith("pane.send_text")), []);
+    after = readState(dir);
+    assert.equal(after.status, "running", "pane.exited owns the lifecycle — never a self-invented chain-broke");
+    assert.match(readLog(dir), /deferred nudge dropped: pane gone/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c23 T6: fences honored at wake — bookkeeping never re-runs (F3/F6)", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const st = c23State({ cycles: 3, noopStreak: 1, lastAuditAt: 123456, lastNudgeAt: Date.now() - 60_000, deferredUntil: Date.now() - 500, deferredId: c23Id });
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["paused by owner", { paused: true, pausedBy: "owner", pausedAt: 5 }],
+      ["audit hold", { auditHold: { rules: ["forbidden-scope"], at: 5 } }],
+      ["status=stopped", { status: "stopped" }],
+    ];
+    for (const [reason, over] of cases) {
+      const r = run(dir, { cmd: ["deferred-nudge", "--id", c23Id] }, { config: goodConfig(dir), state: { ...st, ...over } });
+      assert.equal(r.code, 0, reason);
+      assert.deepEqual(r.calls, [], `${reason}: the fence fires before any bridge call`);
+      const after = readState(dir);
+      assert.equal(after.noopStreak, 1, `${reason}: classify is not re-run (F3)`);
+      assert.equal(after.lastAuditAt, 123456, `${reason}: audit is not re-run (F3)`);
+      assert.equal(after.cycles, 3, `${reason}: no nudge`);
+      assert.match(readLog(dir), new RegExp(`deferred nudge dropped: ${reason}`));
+    }
+    const bad = run(dir, { cmd: ["deferred-nudge", "--id", c23Id] }, { config: { v: 1, label: "probe" }, state: st });
+    assert.equal(bad.code, 0);
+    assert.deepEqual(bad.calls, []);
+    assert.match(readLog(dir), /deferred nudge dropped: config invalid/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c23 T7: kick clears the deferred schedule — nudge branch and working early-exit (F9)", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const base = { config: goodConfig(dir), event: idleEvent };
+    const a = run(dir, { cmd: ["event"] }, { ...base, state: c23State() });
+    assert.equal(a.code, 0);
+    const scheduled = readState(dir);
+    assert.ok(scheduled.deferredUntil, "precondition: a schedule exists");
+    const k = run(dir, { cmd: ["kick"], stubReplies: { ...paneIdle, ...nudgeReply } }, { config: goodConfig(dir), state: scheduled });
+    assert.equal(k.code, 0, k.stderr);
+    const kicked = readState(dir);
+    assert.ok(noSchedule(kicked), "kick cleared the schedule");
+    const w = run(dir, { cmd: ["deferred-nudge", "--id", scheduled.deferredId] }, { config: goodConfig(dir), state: kicked });
+    assert.equal(w.code, 0);
+    assert.deepEqual(w.calls, [], "the orphaned id wakes nothing");
+
+    // The working early-exit (which never wrote state before C23) must clear
+    // the schedule too: an owner kick supersedes whatever was deferred.
+    const a2 = run(dir, { cmd: ["event"] }, { ...base, state: kicked });
+    assert.equal(a2.code, 0);
+    const scheduled2 = readState(dir);
+    assert.ok(scheduled2.deferredUntil, "precondition 2: a schedule exists again");
+    const wk = run(dir, { cmd: ["kick"], stubReplies: { "pane.list": { result: { panes: [{ pane_id: "wA:p1", agent_status: "working" }] } } } },
+      { config: goodConfig(dir), state: scheduled2 });
+    assert.equal(wk.code, 0);
+    assert.equal(JSON.parse(wk.stdout).nudged, false);
+    assert.ok(noSchedule(readState(dir)), "the working early-exit cleared the schedule too");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c23 T8: a settle past the cooldown nudges immediately and mints no schedule (R10)", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const r = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, {
+      config: goodConfig(dir),
+      state: c23State({ lastNudgeAt: Date.now() - 60_000 }),
+      event: idleEvent,
+    });
+    assert.equal(r.code, 0);
+    assert.equal(r.calls.length, 1, "nudged now, exactly like the pre-C23 fast path");
+    const st = readState(dir);
+    assert.ok(noSchedule(st), "the fast path mints no schedule");
+    assert.equal(st.cycles, 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c23 T9: a real nudge, stop and start each clear a stale schedule (R5/F8)", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const stale = c23State({ lastNudgeAt: Date.now() - 60_000, deferredUntil: Date.now() + 60_000, deferredId: c23Id });
+    const r = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, { config: goodConfig(dir), state: stale, event: idleEvent });
+    assert.equal(r.calls.length, 1, "past cooldown: nudge now, as always");
+    assert.ok(noSchedule(readState(dir)), "the real nudge cleared the schedule in its own write");
+
+    const stop = run(dir, { cmd: ["stop"], stubReplies: { "workspace.close": { result: { type: "ok" } } } },
+      { config: goodConfig(dir), state: { ...stale, workspaceId: "wA" } });
+    assert.equal(stop.code, 0);
+    assert.ok(noSchedule(readState(dir)), "stop cleared the schedule");
+
+    const start = run(dir, { cmd: ["start"], stubReplies: {
+      "pane.list": { result: { panes: [] } },
+      "workspace.list": { result: { workspaces: [{ workspace_id: "wA", label: "⚙ probe" }] } },
+      "tab.create": { result: { root_pane: { pane_id: "wA:p2" } } },
+      "pane.send_text": { result: { type: "ok" } },
+    } }, { config: goodConfig(dir), state: { ...stale, workspaceId: "wA" } });
+    assert.equal(start.code, 0, start.stderr);
+    assert.ok(noSchedule(readState(dir)), "start begins with no schedule");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c23 T10: same window never re-spawns; a bridge failure retries then fires (F1/F5)", () => {
+  const dir = tmp();
+  let dirB = "";
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    // (a) two settles in one window: the id survives unchanged — proof there
+    // is no second runner spawned for the same due time.
+    const base = { config: goodConfig(dir), event: idleEvent };
+    run(dir, { cmd: ["event"] }, { ...base, state: c23State() });
+    const st1 = readState(dir);
+    run(dir, { cmd: ["event"] }, { ...base, state: st1 });
+    const st2 = readState(dir);
+    assert.equal(st2.deferredId, st1.deferredId);
+    assert.equal(st2.deferredUntil, st1.deferredUntil, "no second schedule, no drift");
+
+    // (b) one bridge failure must NOT become "pane gone": the runner keeps
+    // the schedule, retries after 5s, and fires once the bridge answers —
+    // a stub that answers broken JSON exactly once, then the real shape.
+    dirB = tmp();
+    writeFileSync(join(dirB, "prompt.md"), "probe");
+    const callsB = join(dirB, "calls.log");
+    const flaky = join(dirB, "flaky-herdr.mjs");
+    writeFileSync(flaky, `#!/usr/bin/env node
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+let buf = "";
+process.stdin.on("data", (d) => {
+  buf += d;
+  const nl = buf.indexOf("\\n");
+  if (nl === -1) return;
+  const req = JSON.parse(buf.slice(0, nl));
+  appendFileSync(${JSON.stringify(callsB)}, req.method + " " + JSON.stringify(req.params) + "\\n");
+  const marker = ${JSON.stringify(join(dirB, "flaky.marker"))};
+  if (!existsSync(marker)) {
+    writeFileSync(marker, "1");
+    process.stdout.write("this is not json\\n");
+    process.exit(0);
+  }
+  process.stdout.write(JSON.stringify({ id: req.id, result: { panes: [{ pane_id: "wB:p1", agent_status: "idle" }] } }) + "\\n");
+  process.exit(0);
+});
+`);
+    const r = run(dirB, { cmd: ["deferred-nudge", "--id", c23Id], bin: flaky }, {
+      config: goodConfig(dirB),
+      state: { paneId: "wB:p1", status: "running", armed: true, cycles: 3, noopStreak: 0, lastNudgeAt: Date.now() - 60_000, deferredUntil: Date.now() - 500, deferredId: c23Id },
+    });
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(readLog(dirB), /deferred nudge retry: bridge bad-reply \(n=1, 5s\)/, "an infra failure is a retry, not a drop (F5)");
+    assert.match(readLog(dirB), /deferred nudge: firing/);
+    assert.equal(r.calls.filter((c) => c.startsWith("pane.send_text")).length, 1, "exactly one nudge after recovery");
+    assert.ok(noSchedule(readState(dirB)));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (dirB) rmSync(dirB, { recursive: true, force: true });
+  }
+});
