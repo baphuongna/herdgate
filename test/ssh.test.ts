@@ -556,3 +556,18 @@ test("ssh leg: publickey via the real OpenSSH client (regression: ssh2's broken 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("translateMobileCore: older phones send the adapter path verbatim — map by verb, never spawn the path", async () => {
+  const { translateMobileCore } = (await import("../plugin/server/ssh.mjs")) as { translateMobileCore: (cmd: string) => string[] | null };
+  // Live shape from the laptop report 2026-11-23 18:07: phone app build sends the
+  // full adapter path; tuiOnly publishers must recognize it, DROP the path, and
+  // map only the verb through the fixed whitelist.
+  const live = "hc C:\\Users\\phuongnb\\AppData\\Local\\HerdrPilot\\releases\\tui-43508dc7d2bbc2ea\\plugin\\server\\mobile-tui-core.mjs --interactive connect";
+  assert.deepEqual(translateMobileCore(live), ["connect"]);
+  assert.deepEqual(translateMobileCore('hc "/opt/h g/mobile-tui-core.mjs" --interactive server status --json'), ["server", "status", "--json"]);
+  assert.deepEqual(translateMobileCore("hc /x/y/mobile-tui-core.mjs connect"), ["connect"]);
+  assert.equal(translateMobileCore("hc /x/mobile-tui-core.mjs rm -rf /"), null, "verb must come from the whitelist");
+  assert.equal(translateMobileCore("hc /x/other-core.mjs connect"), null, "only the mobile-tui-core adapter script counts");
+  assert.equal(translateMobileCore("hc /x/mobile-tui-core.mjs --interactive connect; rm -rf /"), null, "trailing junk is not a whitelisted verb");
+  assert.deepEqual(translateMobileCore("hc connect"), ["connect"], "the new bare-verb form keeps working");
+});

@@ -1,6 +1,6 @@
 id = "dev.herdgate.loop"
 name = "herdgate-loop"
-version = "0.12.0"
+version = "0.13.0"
 min_herdr_version = "0.9.5"
 description = "Run an agent loop in a pane: start it with a prompt file, and when the agent settles, nudge it into the next cycle — visible in the TUI, pausable, capped. Generic: any prompt file, any cwd."
 platforms = ["linux", "macos", "windows"]

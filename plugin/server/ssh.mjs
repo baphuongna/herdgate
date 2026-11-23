@@ -68,9 +68,19 @@ const mobileCoreArgs = new Map([
 ]);
 function translateMobileCore(cmd) {
   if (cmd === coreWinConnect || cmd === corePosixConnect) return ["connect"];
+  // Older phone builds send the adapter script path verbatim:
+  //   hc <path>\mobile-tui-core.mjs --interactive connect
+  // The path is identification only — never spawned. Recognize it (quoted or
+  // bare), drop it, and map the verb through the same fixed whitelist, so a
+  // phone that has not updated yet still attaches instead of falling through
+  // to hc.exe with an unrecognized subcommand (live on the laptop 2026-11-23).
+  const viaScript = cmd.match(/^(?:hc|herdr-core)(?:\.exe)?\s+(?:"([^"]*mobile-tui-core\.mjs)"|([^\s"]*mobile-tui-core\.mjs))\s+(?:--interactive\s+)?(.+)$/);
+  if (viaScript) return mobileCoreArgs.get(viaScript[3]) ?? null;
   const match = cmd.match(/^(?:hc|herdr-core)(?:\.exe)?[ \t]+(.+)$/);
-  return match ? mobileCoreArgs.get(match[1]) : null;
+  return match ? mobileCoreArgs.get(match[1]) ?? null : null;
 }
+
+export { translateMobileCore };
 
 export function createSshBridge({ send, scopeOf, log = () => {}, resolve = resolveHc, resolveHerdrBin = resolveHerdr, session = process.env.HERDGATE_HERDR_SESSION || process.env.HERDR_SESSION || "default", platform = process.platform, tuiOnly = false, mobileHcBin = null, mobileTuiAdapter = null, trustedReadCore = null, spawnImpl = spawn }) {
   const channels = new Map();
