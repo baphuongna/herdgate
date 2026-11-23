@@ -4,6 +4,19 @@
 > Trạng thái vòng nằm ở cuối file này — lượt làm việc nào cũng đọc file này
 > trước, nối đúng chỗ dừng, không hỏi lại user.
 
+## Tự vận hành (auto-run)
+
+- `herdgate-dev-loop.timer` (systemd user, mỗi 2h + jitter 15m) nạp
+  `herdgate-dev-loop.service` → `pi -p` với prompt `docs/DEV-LOOP/AUTO.md`.
+- Mỗi lần chạy = 1 vòng SDD trọn (spec → red → green → suite → commit →
+  push). Guardrails trong AUTO.md: KHÔNG npm publish/tag, KHÔNG đụng
+  service/pane user, BLOCKED thay vì cố, đúng 1 vòng/lần.
+- Release vẫn do chủ sở hữu (2b): auto-loop ghi `READY-TO-RELEASE` khi
+  theme trọn.
+- Theo dõi: `journalctl --user -u herdgate-dev-loop -f`; đổi nhịp: sửa
+  `OnCalendar` trong timer; dừng hẳn: `systemctl --user disable --now
+  herdgate-dev-loop.timer`.
+
 ## Nguyên tắc bất biến (mọi vòng đều chịu ràng buộc)
 
 1. **SDD đủ bước**: spec (acceptance rõ ràng) → design (đụng wire thì nêu
