@@ -6,6 +6,8 @@ AGENTS.md, `docs/concepts/*`, `docs/reference/{staff,agent,configuration}.md`, `
 `extension/{index,herdr,mailbox,supervision,storage,lock,managed-agent-runtime}.ts` (đọc chọn theo cơ chế),
 `extension/{agents,coordinators}/*.md`, `scripts/smoke-faux.mjs`.
 
+Bản đào sâu toàn repo (42 ADR, 28 module, quy trình, bộ học theo 5 lớp): [EXCAVATION.md](EXCAVATION.md).
+
 ---
 
 ## 1. Nó là gì
