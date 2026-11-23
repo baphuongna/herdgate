@@ -1,6 +1,6 @@
 id = "dev.herdgate.host"
 name = "herdgate"
-version = "0.11.0"
+version = "0.12.0"
 min_herdr_version = "0.9.0"
 description = "Publish this Herdr session to your own devices through a herdgate cloud relay (read-only by default)."
 platforms = ["linux", "macos"]
