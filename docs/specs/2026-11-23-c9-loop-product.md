@@ -52,3 +52,17 @@ nhìn thấy trong TUI, có phanh". Đó là một năng lực sản phẩm th�
   experiment local bằng plugin shipped trên máy home (chain tiếp tục chạy
   trên bản shipped) — THE SAME loop builds its own product.
 - READY-TO-RELEASE khi trọn (gộp theme lớn kế tiếp nếu có).
+
+## Kết quả (đóng vòng)
+
+- Shipped `plugin/loop/` (feat `18364b5`): đúng thiết kế — start/stop/pause/resume/status,
+  [[events]] chain, registry ownership, cooldown + maxCycles, owner config fail-closed
+  (v tuyệt đối, label/promptFile/cwd-under-home, cooldown floor 10s).
+- Suite 330/0 (10 test mới trong `test/loop-plugin.test.ts`).
+- **Live cutover trên home**: unlink `dev.herdgate.devloop` (experiment) → link
+  `dev.herdgate.loop` (shipped). Probe maxCycles=2 chạy toàn bộ qua event THẬT của
+  herdr (không một event giả): nudge#1 → cooldown → nudge#2 → cap → `done`, dừng đúng.
+- Bài học: validate cwd-under-home bắt probe đặt ở /tmp ngay lần chạy đầu —
+  fail-closed trên owner input là lớp bảo vệ thấy việc ngay trong verify.
+- Chuỗi DEV-LOOP từ C10 chạy trên plugin shipped; PAUSE repo flag retire
+  (plugin có `pause`/`resume` action riêng).
