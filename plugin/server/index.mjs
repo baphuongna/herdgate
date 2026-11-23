@@ -9,7 +9,7 @@
 import { execFile as execFileCb, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, statSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, statSync, realpathSync, renameSync, openSync, closeSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { hostname, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -47,8 +47,29 @@ const log = (line) => console.error(`herdgate: ${line}`);
 const SETTINGS =
   process.env.HERDGATE_SETTINGS ?? join(homedir(), ".config", "herdr-app", "herdgate", "settings.json");
 
-/** The publisher runs as a detached child of `serve`, recording its pid in state. */
+/** The publisher runs as a detached child of `serve`, recording its pid in state.
+ *  A supervisor process (C7) keeps that lineage alive: respawn on death, honest
+ *  stop via a marker file. Hosts under systemd pass HERDGATE_PUBLISHER_CHILD=1
+ *  themselves and never meet the supervisor. */
 const pidPath = D.stateDir ? join(D.stateDir, "publisher.pid") : "";
+const supervisorPidPath = D.stateDir ? join(D.stateDir, "publisher.supervisor.pid") : "";
+const stopMarkerPath = D.stateDir ? join(D.stateDir, "publisher.stop") : "";
+const publisherLogPath = D.stateDir ? join(D.stateDir, "publisher.log") : "";
+/** Crash evidence stays bounded: rotate the log above this size at serve time. */
+const PUBLISHER_LOG_MAX_BYTES = 512 * 1024;
+
+const delayMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch { return false; }
+}
+
+function readPidFile(path) {
+  if (!path || !existsSync(path)) return null;
+  const pid = Number(readFileSync(path, "utf8").trim());
+  return pid && pidAlive(pid) ? pid : null;
+}
 
 async function cloudUrl() {
   const cfg = readConfig(D.configPath);
@@ -109,7 +130,7 @@ async function status() {
       cloud: cfg.HERDGATE_URL ?? "(not set)",
       paired: Boolean(cfg.HERDGATE_ROOM_TOKEN),
     },
-    publisher: { pid: runningPid() ?? null, running: Boolean(runningPid()) },
+    publisher: { pid: runningPid() ?? null, running: Boolean(runningPid()), supervised: Boolean(runningSupervisorPid()) },
     lastPublish: state.lastPublish ?? null,
     herdr: null,
     error: null,
@@ -124,15 +145,23 @@ async function status() {
 }
 
 function runningPid() {
-  if (!pidPath || !existsSync(pidPath)) return null;
-  const pid = Number(readFileSync(pidPath, "utf8").trim());
-  if (!pid) return null;
+  return readPidFile(pidPath);
+}
+
+function runningSupervisorPid() {
+  return readPidFile(supervisorPidPath);
+}
+
+/** Open (rotating) the publisher crash log. The supervisor and every publisher
+ *  it spawns share this fd — a dying publisher finally leaves a stack trace. */
+function openPublisherLog() {
   try {
-    process.kill(pid, 0);
-    return pid;
-  } catch {
-    return null; // stale
-  }
+    if (existsSync(publisherLogPath) && statSync(publisherLogPath).size > PUBLISHER_LOG_MAX_BYTES) {
+      rmSync(`${publisherLogPath}.old`, { force: true });
+      renameSync(publisherLogPath, `${publisherLogPath}.old`);
+    }
+  } catch { /* rotation is best effort */ }
+  return openSync(publisherLogPath, "a", 0o600);
 }
 
 /** --- Wave 2 observer wiring: sysmon / port-attr / pi-transcript behind ops --- */
@@ -213,12 +242,14 @@ async function paneFocusArgvProbe() {
   return (paneFocusArgv = null);
 }
 
-/** --- serve: the startup hook. Start the publisher once, then exit (Herdr's hook is one-shot). --- */
+/** --- serve: the startup hook. Spawn the supervisor, then exit (Herdr's hook is one-shot).
+ *  The supervisor owns the publisher lineage from here on — see supervisorLoop. --- */
 async function serve() {
-  if (process.env.HERDGATE_PUBLISHER_CHILD === "1") return publisherLoop(); // the child
-  const pid = runningPid();
-  if (pid) {
-    log(`publisher already running (pid ${pid}); nothing to do`);
+  if (process.env.HERDGATE_PUBLISHER_CHILD === "1") return publisherLoop(); // the publisher itself
+  if (process.env.HERDGATE_PUBLISHER_SUPERVISOR === "1") return supervisorLoop(); // its babysitter
+  const sup = runningSupervisorPid();
+  if (sup) {
+    log(`publisher supervisor already running (pid ${sup}); nothing to do`);
     return;
   }
   const cfg = readConfig(D.configPath);
@@ -227,17 +258,116 @@ async function serve() {
     log("not paired — run the 'pair' action to publish this Herdr");
     return;
   }
-  const child = spawn(process.execPath, [new URL("./index.mjs", import.meta.url).pathname, "serve"], {
-    env: { ...process.env, HERDGATE_PUBLISHER_CHILD: "1" },
-    detached: true,
-    stdio: "ignore",
-  });
-  child.unref();
-  if (pidPath) {
-    mkdirSync(dirname(pidPath), { recursive: true });
-    writeFileSync(pidPath, String(child.pid));
+  mkdirSync(D.stateDir, { recursive: true });
+  const logFd = openPublisherLog();
+  let child;
+  try {
+    child = spawn(process.execPath, [new URL("./index.mjs", import.meta.url).pathname, "serve"], {
+      env: { ...process.env, HERDGATE_PUBLISHER_SUPERVISOR: "1" },
+      detached: true,
+      stdio: ["ignore", logFd, logFd],
+    });
+  } finally {
+    closeSync(logFd); // the supervisor inherits the fd, serve does not need it
   }
-  log(`publisher started (pid ${child.pid})`);
+  child.unref();
+  if (supervisorPidPath) writeFileSync(supervisorPidPath, String(child.pid));
+  log(`publisher supervisor started (pid ${child.pid}); crash log at ${publisherLogPath}`);
+}
+
+/** --- supervisorLoop: keep exactly one publisher alive, or die trying.
+ *  A deliberate poller — no sockets, no handles into the child: it watches the
+ *  pidfile, so it adopts a publisher an older version started just as easily
+ *  as one it spawned itself (SIGKILL and OOM deaths included). Env knobs follow
+ *  the PUBLISH_MS pattern so tests can shrink every deadline. --- */
+async function supervisorLoop() {
+  const int = (name, dflt, min) => Math.max(min, Number.parseInt(process.env[name] ?? String(dflt), 10) || dflt);
+  const POLL_MS = int("HERDGATE_WATCHDOG_POLL_MS", 1_000, 100);
+  const MAX_DEATHS = int("HERDGATE_WATCHDOG_MAX", 5, 1);
+  const WINDOW_MS = int("HERDGATE_WATCHDOG_WINDOW_MS", 600_000, 5_000);
+  const BACKOFF_BASE_MS = int("HERDGATE_WATCHDOG_BACKOFF_BASE_MS", 1_000, 50);
+  const BACKOFF_MAX_MS = 60_000;
+  const STABLE_MS = 60_000; // a child that lived this long resets the backoff ladder
+  const slog = (line) => console.error(`herdgate supervisor: ${new Date().toISOString()} ${line}`);
+  const cfg = readConfig(D.configPath);
+  if (!cfg.HERDGATE_URL || !cfg.HERDGATE_ROOM_TOKEN) {
+    slog("not paired — exiting");
+    return;
+  }
+  const deaths = []; // epoch ms of publisher deaths inside the budget window
+  let consecutive = 0; // quick deaths in a row → exponential backoff
+  let bornAt = 0;
+  const cleanFiles = () => {
+    if (stopMarkerPath) rmSync(stopMarkerPath, { force: true });
+    if (pidPath) rmSync(pidPath, { force: true });
+    if (supervisorPidPath) rmSync(supervisorPidPath, { force: true });
+  };
+  slog(`watching (poll ${POLL_MS}ms, budget ${MAX_DEATHS}/${Math.round(WINDOW_MS / 1000)}s)`);
+  for (;;) {
+    await delayMs(POLL_MS);
+    if (existsSync(stopMarkerPath)) {
+      slog("stop requested");
+      const pid = readPidFile(pidPath);
+      if (pid) {
+        try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
+        for (let i = 0; i < 40 && pidAlive(pid); i++) await delayMs(125);
+        if (pidAlive(pid)) {
+          slog(`publisher pid ${pid} ignored SIGTERM for 5s; killing`);
+          try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+        }
+      }
+      cleanFiles();
+      slog("stopped");
+      return;
+    }
+    const pid = readPidFile(pidPath);
+    if (pid) continue; // alive — adopted or ours, same lineage
+    const hadOne = Boolean(pidPath && existsSync(pidPath)) || bornAt > 0; // a death, not a first boot
+    if (hadOne) {
+      const now = Date.now();
+      if (bornAt && now - bornAt >= STABLE_MS) consecutive = 0; // it had a good life
+      while (deaths.length && now - deaths[0] > WINDOW_MS) deaths.shift();
+      if (deaths.length >= MAX_DEATHS) {
+        slog(`giving up — ${deaths.length} crashes within ${Math.round(WINDOW_MS / 1000)}s; run the 'serve' action to try again`);
+        cleanFiles();
+        process.exitCode = 1;
+        return;
+      }
+      deaths.push(now);
+      consecutive += 1;
+      const backoff = Math.min(BACKOFF_BASE_MS * 2 ** (consecutive - 1), BACKOFF_MAX_MS);
+      slog(`publisher died; respawn ${deaths.length}/${MAX_DEATHS} in ${backoff}ms`);
+      await delayMs(backoff);
+      if (existsSync(stopMarkerPath)) continue; // stop raced in during the backoff
+    } else {
+      slog("starting publisher");
+    }
+    const env = { ...process.env, HERDGATE_PUBLISHER_CHILD: "1" };
+    delete env.HERDGATE_PUBLISHER_SUPERVISOR;
+    const child = spawn(process.execPath, [new URL("./index.mjs", import.meta.url).pathname, "serve"], {
+      env,
+      detached: true,
+      stdio: "inherit", // → publisher.log, via the fd serve handed down
+    });
+    child.unref();
+    // An 'exit' listener keeps libuv reaping this child — without it a SIGKILLed
+    // publisher lingers as a zombie, and kill(pid, 0) still answers, so the
+    // poller below would forever think a dead publisher is alive.
+    child.once("exit", (code, signal) => slog(`publisher pid ${child.pid} exited (${signal ?? `code ${code}`})`));
+    child.once("error", (e) => slog(`spawn failed: ${e instanceof Error ? e.message : String(e)}`));
+    if (!child.pid) {
+      slog("spawn returned no pid; exiting");
+      cleanFiles();
+      process.exitCode = 1;
+      return;
+    }
+    bornAt = Date.now();
+    if (pidPath) {
+      mkdirSync(dirname(pidPath), { recursive: true });
+      writeFileSync(pidPath, String(child.pid));
+    }
+    slog(`publisher started (pid ${child.pid})`);
+  }
 }
 
 /**
@@ -1353,12 +1483,32 @@ async function publisherLoop() {
   setInterval(() => {}, 1 << 30);
 }
 
-/** --- stop: end the publisher. --- */
+/** --- stop: end the publisher. The supervisor (if any) owns the teardown —
+ *  the marker tells it to drain and clean up; without one we do it ourselves,
+ *  and never leave an orphaned marker behind to ambush the next `serve`. --- */
 async function stop() {
+  const sup = runningSupervisorPid();
   const pid = runningPid();
-  if (!pid) {
+  if (!sup && !pid) {
     log("publisher is not running");
-  } else {
+    if (stopMarkerPath) rmSync(stopMarkerPath, { force: true });
+    if (pidPath && existsSync(pidPath)) rmSync(pidPath, { force: true }); // stale
+    if (supervisorPidPath && existsSync(supervisorPidPath)) rmSync(supervisorPidPath, { force: true }); // stale
+    return;
+  }
+  if (stopMarkerPath) {
+    mkdirSync(dirname(stopMarkerPath), { recursive: true });
+    writeFileSync(stopMarkerPath, "", { mode: 0o600 });
+  }
+  if (sup) {
+    for (let i = 0; i < 44 && existsSync(supervisorPidPath); i++) await delayMs(125);
+    if (!existsSync(supervisorPidPath)) {
+      log(`stopped publisher (supervisor pid ${sup} drained it)`);
+      return;
+    }
+    log("supervisor did not drain in time; stopping the publisher directly");
+  }
+  if (pid) {
     try {
       process.kill(pid, "SIGTERM");
       log(`stopped publisher (pid ${pid})`);
@@ -1366,7 +1516,11 @@ async function stop() {
       log(`could not stop pid ${pid}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  if (pidPath && existsSync(pidPath)) rmSync(pidPath, { force: true });
+  if (!runningSupervisorPid()) { // a live supervisor still cleans up on its next poll
+    if (stopMarkerPath) rmSync(stopMarkerPath, { force: true });
+    if (pidPath && existsSync(pidPath)) rmSync(pidPath, { force: true });
+    if (supervisorPidPath && existsSync(supervisorPidPath)) rmSync(supervisorPidPath, { force: true });
+  }
 }
 
 /** --- pane: the surface inside Herdr. Honest lines, refreshed on a light poll. --- */
@@ -1379,7 +1533,8 @@ async function pane() {
     lines.push(`herdgate · ${NAME}`);
     lines.push(`cloud: ${cfg.HERDGATE_URL ?? "not configured"}`);
     lines.push(`pairing: ${cfg.HERDGATE_ROOM_TOKEN ? "paired" : "not paired"}`);
-    lines.push(`publisher: ${pid ? `running (pid ${pid})` : "stopped"}`);
+    const sup = runningSupervisorPid();
+    lines.push(`publisher: ${pid ? `running (pid ${pid}${sup ? ", supervised" : ""})` : "stopped"}`);
     if (state.lastPublish) {
       const s = state.lastPublish.summary;
       lines.push(`last publish: ${state.lastPublish.at}`);
@@ -1426,8 +1581,8 @@ if (cmd === "" || cmd === "--help" || cmd === "-h" || cmd === "help") {
 
   pair     pair this Herdr to a cloud (device flow), storing the room token in the config dir
   status   JSON: config, publisher pid, last publish, current Herdr summary
-  serve    start the publisher once (the [[startup]] hook); exits after spawning it
-  stop     stop the publisher
+  serve    start the supervised publisher (the [[startup]] hook); exits after spawning the supervisor
+  stop     stop the publisher (the supervisor drains and cleans up)
   pane     the split-pane surface (light 10s poll, q closes)`);
   process.exit(0);
 }
