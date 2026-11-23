@@ -183,6 +183,10 @@ test('pwa2 ops: usage.rollup, diff.get, pane.focus over the device channel', { s
     assert.equal(focused.via, 'pane focus');
     await waitFor('the stub herdr received pane focus w1:p2',
       () => readFileSync(callsFile, 'utf8').split('\n').includes('pane focus w1:p2'));
+    t.diagnostic('pane.focus: herdr pane ids are not all digits (wG:p1) — the charset matches the term ops');
+    const lettered = await ask({ op: 'pane.focus', paneId: 'wG:p1' }, 'pane.focused');
+    assert.equal(lettered.op, 'pane.focused');
+    assert.equal(lettered.paneId, 'wG:p1');
   } catch (err) {
     t.diagnostic(log.join('\n').slice(-4000));
     throw err;

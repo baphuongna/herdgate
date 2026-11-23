@@ -13,7 +13,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, statSync, r
 import { join, dirname } from "node:path";
 import { hostname, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead, pkgVersion } from "./common.mjs";
+import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead, pkgVersion, nextPublishDelay } from "./common.mjs";
 import { gitRead, diffRepoDir } from "./git-safe.mjs";
 import { createSshBridge } from "./ssh.mjs";
 import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
@@ -35,6 +35,7 @@ const run = execFile; // term.send/term.keys: argv arrays, never a shell
 /** diff.get ships at most 128 KiB of `git show` output, marked truncated beyond. */
 const MAX_DIFF_BYTES = 128 * 1024;
 const MAX_PANES = 200; // pane-carrying replies (term.list, fleet.detail) — a tab storm must not push the reply past the gate's 256KiB frame cap
+const MAX_ATTACHMENTS = 200; // attachment.list reply cap — attachments accumulate monthly; the newest 200 are a screen's worth
 const MAX_FILE_ENTRIES = 5000; // file.tree cap — the fuzzy finder ranks within this
 const MAX_FILE_BYTES = 128 * 1024; // file.read cap — same class as diffs, and well under the gate's 256KiB frame limit
 const MAX_REVIEW_FILES = 5000; // review.files entries cap (one screen's worth of scrolling)
@@ -274,9 +275,15 @@ async function publisherLoop() {
   // inside the freshness window replays the last snapshot instead of spawning
   // `herdr api snapshot` again (bimodal view latency: 4ms cached vs 150ms cold).
   const PUBLISH_MS = Math.max(2_000, Number.parseInt(process.env.HERDGATE_PUBLISH_MS ?? "30000", 10) || 30000);
+  const PUBLISH_MAX_MS = Math.max(PUBLISH_MS, Number.parseInt(process.env.HERDGATE_PUBLISH_MAX_MS ?? "60000", 10) || 60000);
   const SNAPSHOT_FRESH_MS = Math.max(0, Number.parseInt(process.env.HERDGATE_SNAPSHOT_FRESH_MS ?? "2000", 10) || 0);
   let snapshotInflight = null;
   let snapshotCached = null; // { payload, at }
+  // Adaptive cadence state (nextPublishDelay decides every tick): busy agents
+  // or a changed snapshot keep the fast lane; quiet streaks relax ×1.5/tick.
+  let cadenceBusy = false;
+  let cadenceChanged = false;
+  let quietStreak = 0;
 
   const snapshotPayload = async () => {
     let snap;
@@ -288,12 +295,14 @@ async function publisherLoop() {
     }
     const sig = JSON.stringify([snap?.workspaces, snap?.agents, snap?.focused_workspace_id]);
     const summary = summarize(snap);
+    cadenceBusy = (summary.working + summary.blocked) > 0;
     let changed = false;
     if (sig !== lastSig) {
       changed = true;
       lastSig = sig;
       writeState(D.statePath, { lastPublish: { at: new Date().toISOString(), summary } });
     }
+    cadenceChanged = changed;
     if (changed) wakeAway(true);
     const payload = { op: "view", view: { v: 1, source: "herdr", takenAt: new Date().toISOString(), summary } };
     snapshotCached = { payload, at: Date.now() };
@@ -411,6 +420,22 @@ async function publisherLoop() {
     for (const d of devices) {
       await sendPayload(ws, d.id, payload);
     }
+  };
+
+  /** The adaptive tick chain: publish, then schedule the next tick by how busy
+   *  and how quiet the room is. One timer at a time; events (hello, room.update)
+   *  publish out-of-band and reschedule so changes are seen at once. */
+  const scheduleNext = () => {
+    if (timer) clearTimeout(timer);
+    const delay = nextPublishDelay({ baseMs: PUBLISH_MS, maxMs: PUBLISH_MAX_MS, busy: cadenceBusy, quietStreak, changed: cadenceChanged });
+    timer = setTimeout(() => {
+      void (async () => {
+        await publish(wsRef);
+        quietStreak = !cadenceBusy && !cadenceChanged ? quietStreak + 1 : 0;
+        scheduleNext();
+      })();
+    }, delay);
+    timer.unref?.();
   };
 
   /** Push receipt settles only to devices that registered a durable watch for
@@ -534,7 +559,7 @@ async function publisherLoop() {
         backoff = 1_000;
         devices = m.devices ?? [];
         lifecycle?.setConnected(true);
-        log(`connected to ${url}${loopbackPort ? ` via loopback 127.0.0.1:${loopbackPort}` : ""} (room ${m.roomId}, ${devices.length} device(s), publish ${PUBLISH_MS}ms)`);
+        log(`connected to ${url}${loopbackPort ? ` via loopback 127.0.0.1:${loopbackPort}` : ""} (room ${m.roomId}, ${devices.length} device(s), publish ${PUBLISH_MS}ms adaptive→${PUBLISH_MAX_MS}ms)`);
         if (process.env.HERDGATE_PI_RECEIPTS === "1" && !receiptWatch) {
           // Settles push to subscribed devices only. Parent wakes no longer ride
           // this watcher — the child-cooperative design (arm/marker/observer)
@@ -549,9 +574,8 @@ async function publisherLoop() {
         }
         for (const d of devices) flushWatches(d.id);
         void publish(ws);
-        if (timer) clearInterval(timer);
-        timer = setInterval(() => void publish(ws), PUBLISH_MS);
-        timer.unref?.();
+        quietStreak = 0; // a fresh connection is not quiet — start on the fast lane
+        scheduleNext();
         void recordGitAnchor("boot"); // seed the first boundary so turn 1 is diffable
         return;
       }
@@ -564,6 +588,7 @@ async function publisherLoop() {
         devices = next;
         for (const d of devices) flushWatches(d.id);
         void publish(ws);
+        scheduleNext(); // device churn is activity — reschedule now
         return;
       }
       if (m.t === "frame") {
@@ -834,9 +859,11 @@ async function publisherLoop() {
             return void replyTo({ op: "error", code: "attachment", message: "no plugin state dir — attachments unavailable" });
           }
           if (op === "attachment.list") {
-            const attachments = listAttachments(D.stateDir);
-            log(`attachment: ${m.device} list -> ${attachments.length} file(s)`);
-            return void replyTo({ op: "attachment.list.result", attachments });
+            const all = listAttachments(D.stateDir);
+            const capped = all.length > MAX_ATTACHMENTS;
+            const attachments = capped ? all.slice(0, MAX_ATTACHMENTS) : all;
+            log(`attachment: ${m.device} list -> ${all.length} file(s)${capped ? ` (capped at ${MAX_ATTACHMENTS})` : ""}`);
+            return void replyTo({ op: "attachment.list.result", attachments, capped, total: all.length });
           }
           const name = typeof payload.name === "string" ? payload.name.trim() : "";
           const dataBase64 = typeof payload.dataBase64 === "string" ? payload.dataBase64 : "";
@@ -1213,8 +1240,8 @@ async function publisherLoop() {
           // Focus a pane on the host's Herdr. Fire-and-forget spawn, never awaited:
           // a phone must not hang on a TUI command. argv comes from the --help probe.
           const paneId = typeof payload.paneId === "string" ? payload.paneId : "";
-          if (!/^w\d+:p\d+$/.test(paneId)) {
-            return void replyTo({ op: "error", code: "bad-pane", message: "pane.focus needs a pane id like w0:p1" });
+          if (!/^[A-Za-z0-9_:.-]{1,64}$/.test(paneId)) {
+            return void replyTo({ op: "error", code: "bad-pane", message: "pane.focus needs a pane id" });
           }
           const argv = await paneFocusArgvProbe();
           if (!argv) {
@@ -1252,7 +1279,7 @@ async function publisherLoop() {
       if (retried) return;
       retried = true;
       lifecycle?.setConnected(false);
-      if (timer) clearInterval(timer);
+      if (timer) clearTimeout(timer);
       timer = null;
       ssh.closeAll();
       e2eSessions.clear();

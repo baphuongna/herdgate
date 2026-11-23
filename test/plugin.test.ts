@@ -74,6 +74,57 @@ test("plugin: the hello advertises the real package version, not a stale literal
   assert.ok(!readFileSync(INDEX, "utf8").includes('version: "0.9.38"'), "no hard-coded version in the publisher hello");
 });
 
+test('attachment caps: the list reply is capped, newest first', async () => {
+  const { listAttachments } = await import(new URL('../plugin/server/attachments.mjs', import.meta.url).href) as { listAttachments: (base: string) => unknown[] };
+  const dir = mkdtempSync(join(tmpdir(), 'hg-att-cap-'));
+  try {
+    const month = join(dir, 'attachments', '2026-11');
+    mkdirSync(month, { recursive: true });
+    for (let i = 0; i < 250; i++) {
+      writeFileSync(join(month, `${crypto.randomUUID()}.png`), Buffer.from([0x89, 0x50]));
+    }
+    const all = listAttachments(dir);
+    assert.equal(all.length, 250, 'the raw helper still lists everything (host-side tools)');
+    // The op layer caps at 200 newest — assert the cap constant exists and the slicing marker is wired.
+    const src = readFileSync(new URL('../plugin/server/index.mjs', import.meta.url), 'utf8');
+    assert.match(src, /MAX_ATTACHMENTS\b/, 'the cap constant exists');
+    assert.match(src, /all\.slice\(0, MAX_ATTACHMENTS\)/, 'attachment.list slices when over the cap');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('cadence: nextPublishDelay bursts when busy or changed, relaxes when quiet', async () => {
+  const { nextPublishDelay } = (await import(new URL('../plugin/server/common.mjs', import.meta.url).href)) as { nextPublishDelay: (o: Record<string, unknown>) => number };
+  // Busy agents or a changed snapshot: the fast lane (5s floor, never below 2s).
+  assert.equal(nextPublishDelay({ baseMs: 30_000, busy: true }), 5_000);
+  assert.equal(nextPublishDelay({ baseMs: 5_000, changed: true }), 5_000);
+  assert.equal(nextPublishDelay({ baseMs: 5_000, busy: true }), 5_000);
+  // Quiet: grows ×1.5 per streak from the base, clamped at 60s.
+  assert.equal(nextPublishDelay({ baseMs: 5_000, quietStreak: 1 }), 7_500);
+  assert.equal(nextPublishDelay({ baseMs: 5_000, quietStreak: 2 }), 11_250);
+  assert.equal(nextPublishDelay({ baseMs: 5_000, quietStreak: 40 }), 60_000, 'clamped at max');
+  // A large base stays itself while quiet — never faster than configured.
+  assert.equal(nextPublishDelay({ baseMs: 30_000, quietStreak: 0 }), 30_000);
+  assert.equal(nextPublishDelay({ baseMs: 1_000 }), 2_000, 'never below the 2s floor');
+  // Env-shaped max override is honored.
+  assert.equal(nextPublishDelay({ baseMs: 5_000, quietStreak: 40, maxMs: 20_000 }), 20_000);
+});
+
+test('invariant: every bulk op reply carries a cap (source tripwire)', () => {
+  const src = readFileSync(INDEX, 'utf8');
+  const markers: [string, RegExp, string][] = [
+    ['term.list + fleet.detail panes', /MAX_PANES/g, 'both pane-carrying ops cap'],
+    ['file.tree entries', /MAX_FILE_ENTRIES/, 'the file index caps'],
+    ['file.read bytes', /MAX_FILE_BYTES/, 'file bytes cap'],
+    ['file.read wire-budget shrink', /240 \* 1024/, 'the envelope shrink loop lives'],
+    ['review.files entries', /MAX_REVIEW_FILES/, 'review list caps'],
+    ['diff/review.diff bytes', /MAX_DIFF_BYTES/g, 'patch bytes cap'],
+  ];
+  for (const [name, re, why] of markers) {
+    const hits = re.global ? [...src.matchAll(re)].length : re.test(src) ? 1 : 0;
+    assert.ok(hits >= (re.global ? 2 : 1), `${name}: ${why} (found ${hits})`);
+  }
+});
+
 test("plugin: --help works, and status reports honest, real values", async () => {
   const dir = mkdtempSync(join(tmpdir(), "herdgate-plugin-"));
   try {

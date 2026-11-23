@@ -108,6 +108,18 @@ export async function herdrRead(bin, target, lines = 40, timeoutMs = 8_000) {
   }
 }
 
+/** The publisher's adaptive tick: fast while agents work or the snapshot
+ *  just changed (a settle must reach phones in seconds), relaxing ×1.5 per
+ *  quiet tick down to hours-safe floors. Pure — the loop only feeds it flags. */
+export function nextPublishDelay({ baseMs = 30_000, minMs = 5_000, maxMs = 60_000, busy = false, quietStreak = 0, changed = false } = {}) {
+  const base = Math.max(2_000, Math.floor(baseMs));
+  const min = Math.min(base, Math.max(2_000, Math.floor(minMs)));
+  const max = Math.max(base, Math.floor(maxMs));
+  if (busy || changed) return min;
+  const grown = Math.round(base * Math.pow(1.5, Math.min(Math.max(quietStreak, 0), 10)));
+  return Math.max(min, Math.min(max, grown));
+}
+
 export function summarize(snap) {
   const ws = Array.isArray(snap?.workspaces) ? snap.workspaces : [];
   const agents = Array.isArray(snap?.agents) ? snap.agents : [];
