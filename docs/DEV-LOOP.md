@@ -79,7 +79,8 @@
 | C8 | — | **Windows TUI publisher watchdog** (lock run-id riêng — nối theme C7) | Trung bình–cao | ✅ xong |
 | C9 | — | **Loop như tính năng shipped** (`plugin/loop/` — shipped, live) | Cao | ✅ xong |
 | C10 | kế tiếp | **Loop nudge arming** (bug sống của theme C9 — nudge lúc sinh) | Cao | ✅ xong |
-| C11 | — | **Jobs/results phong phú** — chỉ khi có bằng chứng nhu cầu quan sát được; **EXCAVATION chọn lọc** vẫn parked | Tham khảo | parked |
+| C11 | kế tiếp | **Loop boot path Windows** — manifest claim `windows` nhưng boot `cd X && pi "$(cat Y)"` là POSIX-only; laptop user (Windows + herdr, sắp update 0.11.0) sẽ hỏng ngay khi start. Fix: template theo platform (bootCommand config + default chuẩn Windows), test unit từng platform | Cao | 🔄 chọn khi mở |
+| C12 | — | **Jobs/results phong phú** — chỉ khi có bằng chứng nhu cầu quan sát được; **EXCAVATION chọn lọc** vẫn parked; **multi-loop registry** (một plugin một loop — probe C10 phải bơm event tay) parked tới khi có nhu cầu thật hai loop song song | Tham khảo | parked |
 | — | blocked | VPS cutover (việc user — `docs/plans/vps-cutover.md`); herdr > 0.9.5 lộ pid | — | blocked |
 
 ## Cycle Log
