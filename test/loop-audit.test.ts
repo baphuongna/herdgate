@@ -5,7 +5,7 @@
 // resumes. Direct auditWindow tests below use a throwaway git repo.
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
@@ -158,6 +158,32 @@ test("audit: a committed token is a token violation and the secret never leaks",
     const dump = JSON.stringify(r);
     assert.ok(!dump.includes("abcdefgh12345"), "the token value must never appear in audit output");
     assert.ok(!dump.includes("HERDGATE_ACCOUNT_TOKEN"), "the raw matched line must never appear either");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("audit: token-shaped lines in tests/fixtures/docs are fixtures, not leaks — counted and skipped, code is still caught", () => {
+  // Caught live before the first real audit run: C18's own test fixture
+  // (`HERDGATE_ACCOUNT_TOKEN=abcdefgh12345` in test/) and its spec example
+  // would have held the dev-loop on its very first cycle. Fake secrets are the
+  // nature of tests and prose; the rule guards code and config.
+  const dir = tmp();
+  try {
+    gitRepo(dir);
+    const since = Date.now() - 1500;
+    const secret = "HERDGATE_ROOM_TOKEN=fixture-token-1234";
+    for (const f of ["test/fixtures/sample.env", "docs/runbook.md", "experiments/probe.mjs", "scripts/deploy.sh"]) {
+      mkdirSync(dirname(join(dir, f)), { recursive: true });
+      writeFileSync(join(dir, f), `${secret}\n`);
+    }
+    git(["add", "."], dir);
+    commitInWindow(dir, [], "token lines in four kinds of files");
+    const r = auditWindow({ cwd: dir, since, until: Date.now() });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const leaks = r.violations.filter((v) => v.rule === "token");
+    assert.equal(leaks.length, 1, `only scripts/deploy.sh is a violation: ${JSON.stringify(r.violations)}`);
+    assert.equal(leaks[0].file, "scripts/deploy.sh");
+    assert.equal(r.skipped, 3, "the three fixture/prose lines are counted, not silently dropped");
+    assert.ok(!JSON.stringify(r).includes("fixture-token-1234"), "the value never appears in audit output");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

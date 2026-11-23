@@ -34,6 +34,13 @@ const VERSION_TOML_RE = /^[-+]version\s*=/;
 // Secrets that must never be committed. Matched on ADDED lines only.
 const TOKEN_RE = /HERDGATE_(ACCOUNT|ROOM|BRIDGE)_TOKEN\s*=\s*\S{8,}/;
 const DEVICE_SECRET_RE = /"deviceSecret"\s*:\s*"[^"]{8,}"/;
+// Where a token-shaped line is a FIXTURE or PROSE, not a leak: tests,
+// experiments, fixtures and docs legitimately carry fake secrets (the rule
+// caught its own test on the first real run). Counted and skipped — never
+// silent — while code and config stay under the rule.
+const FIXTURE_OR_PROSE_RE = /^(?:test|experiments|fixtures|docs)\//;
+const FIXTURE_FILE_RE = /\.(?:test|spec)\.[cm]?[jt]s$/;
+const NEW_FILE_RE = /^\+\+\+ b\/(.+)$/;
 // `@@ -a,b +c,d @@` — c is where the new file continues.
 const HUNK_RE = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
 const SHA_LINE_RE = /^[0-9a-f]{40}$/;
@@ -137,15 +144,20 @@ export function auditWindow({ cwd, since, until }) {
   const patch = gitRun(["log", "-p", "--format=%H", sinceArg, untilArg], cwd, deadline);
   if (!patch.ok) return { ok: false, error: patch.error };
   let sha = null;
+  let file = null;
   let newLine = 0;
+  let skipped = 0;
   for (const line of patch.stdout.split("\n")) {
     if (SHA_LINE_RE.test(line)) { sha = line; newLine = 0; continue; }
+    const nf = NEW_FILE_RE.exec(line);
+    if (nf) { file = nf[1]; continue; }
     const hunk = HUNK_RE.exec(line);
     if (hunk) { newLine = Number(hunk[1]); continue; }
     if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("\\")) continue;
     if (line.startsWith("+")) {
       if (TOKEN_RE.test(line) || DEVICE_SECRET_RE.test(line)) {
-        violations.push({ rule: "token", sha, line: newLine });
+        if (file && (FIXTURE_OR_PROSE_RE.test(file) || FIXTURE_FILE_RE.test(file))) skipped++;
+        else violations.push({ rule: "token", sha, file, line: newLine });
       }
       newLine++;
     } else if (!line.startsWith("-")) {
@@ -153,5 +165,5 @@ export function auditWindow({ cwd, since, until }) {
     }
   }
 
-  return { ok: true, commits, tags, violations };
+  return { ok: true, commits, tags, violations, skipped };
 }

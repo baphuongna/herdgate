@@ -392,7 +392,7 @@ async function cmdEvent() {
     log(`AUDIT VIOLATION ${rules.join(",")} — nudges held until resume`);
     process.exit(0);
   }
-  if (audit.ok) log(`AUDIT ok commits=${audit.commits.length} tags=${audit.tags.length}`);
+  if (audit.ok) log(`AUDIT ok commits=${audit.commits.length} tags=${audit.tags.length}${audit.skipped ? ` (${audit.skipped} token-shaped fixture/prose lines skipped)` : ""}`);
   else log(`AUDIT error ${audit.error} — fail-open: infra failure is not evidence of a violation; window re-audited next settle`);
 
 
