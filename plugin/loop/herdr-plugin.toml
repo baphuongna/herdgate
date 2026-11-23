@@ -33,6 +33,11 @@ id = "resume"
 title = "herdgate-loop: resume nudges"
 command = ["node", "server/index.mjs", "resume"]
 
+[[actions]]
+id = "kick"
+title = "herdgate-loop: resume and nudge now"
+command = ["node", "server/index.mjs", "kick"]
+
 # One short-lived process per event; never a daemon. A settle (idle|done) of
 # OUR pane sends the next-cycle prompt; pane.exited records a broken chain —
 # the owner decides whether to restart (no auto-respawn: it could fight a

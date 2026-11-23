@@ -19,7 +19,7 @@ test("loop manifest: declares lifecycle actions and both chain events", () => {
   assert.match(MANIFEST, /^version = /m);
   assert.match(MANIFEST, /^min_herdr_version = /m);
   assert.match(MANIFEST, /^platforms = \[/m);
-  for (const action of ["status", "start", "stop", "pause", "resume"]) {
+  for (const action of ["status", "start", "stop", "pause", "resume", "kick"]) {
     assert.match(MANIFEST, new RegExp(`^id = "${action}"$`, "m"), `action ${action}`);
   }
   // Herdr's rule: local ids carry no dots (only the plugin id itself may).
@@ -709,8 +709,8 @@ test("loop status: honest JSON for humans and scripts", () => {
   try {
     writeFileSync(join(dir, "prompt.md"), "probe");
     const r = run(dir, { cmd: ["status"], stubReplies: { "pane.list": { result: { panes: [{ pane_id: "w7:p3" }] } } } }, {
-      config: goodConfig(dir, { cooldownMs: 30_000, maxCycles: 5 }),
-      state: { paneId: "w7:p3", workspaceId: "w7", status: "running", armed: true, cycles: 2, lastNudgeAt: 123 },
+      config: goodConfig(dir, { cooldownMs: 30_000, maxCycles: 5, watchFiles: [join(dir, "prompt.md")] }),
+      state: { paneId: "w7:p3", workspaceId: "w7", status: "running", paused: true, pausedBy: "owner", pausedAt: 1234, armed: true, cycles: 2, lastNudgeAt: 123 },
     });
     assert.equal(r.code, 0);
     const j = JSON.parse(r.stdout);
@@ -720,5 +720,160 @@ test("loop status: honest JSON for humans and scripts", () => {
     assert.equal(j.state.cycles, 2);
     assert.equal(j.state.armed, true);
     assert.equal(j.state.paneAlive, true);
+    // C20: pause metadata and the watched-file list are visible to operators.
+    assert.equal(j.state.pausedBy, "owner");
+    assert.equal(j.state.pausedAt, 1234);
+    assert.deepEqual(j.config.watchFiles, [join(dir, "prompt.md")]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---- C20: kick + auto-resume on watched files -------------------------------
+
+test("loop kick: a live idle pane gets exactly one nudge, cooldown bypassed once", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const r = run(dir, { cmd: ["kick"], stubReplies: {
+      "pane.list": { result: { panes: [{ pane_id: "wA:p1", agent_status: "idle" }] } },
+      "pane.send_text": { result: { type: "ok" } },
+    } }, {
+      config: goodConfig(dir, { nudgeText: "KICK-NUDGE-MARKER\r" }),
+      // lastNudgeAt = now proves the cooldown is bypassed; paused proves kick resumes.
+      state: { paneId: "wA:p1", workspaceId: "wA", status: "running", paused: true, pausedBy: "owner", pausedAt: 123, noopStreak: 4, cycles: 3, lastNudgeAt: Date.now() },
+    });
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(r.calls.map((c) => c.split(" ")[0]), ["pane.list", "pane.send_text"], "one status read, one nudge");
+    assert.equal(JSON.parse(r.stdout).nudged, true);
+    const send = r.calls.find((c) => c.startsWith("pane.send_text"));
+    assert.equal(JSON.parse(send.slice("pane.send_text ".length)).text, "KICK-NUDGE-MARKER\r");
+    const st = JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8"));
+    assert.equal(st.cycles, 4, "a kick counts as one cycle");
+    assert.equal(st.paused, false);
+    assert.ok(!("pausedBy" in st), "kick clears pausedBy");
+    assert.equal(st.noopStreak, 0);
+    assert.ok(st.lastNudgeAt > 0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop kick: a working pane is left alone — no typing mid-turn", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const before = { paneId: "wA:p1", workspaceId: "wA", status: "running", paused: true, pausedBy: "owner", cycles: 3, lastNudgeAt: 0 };
+    const r = run(dir, { cmd: ["kick"], stubReplies: {
+      "pane.list": { result: { panes: [{ pane_id: "wA:p1", agent_status: "working" }] } },
+    } }, { config: goodConfig(dir), state: before });
+    assert.equal(r.code, 0);
+    assert.deepEqual(r.calls.map((c) => c.split(" ")[0]), ["pane.list"], "no send_text reaches the bridge");
+    const o = JSON.parse(r.stdout);
+    assert.equal(o.ok, true);
+    assert.equal(o.nudged, false);
+    assert.equal(o.reason, "working");
+    const st = JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8"));
+    assert.equal(st.cycles, 3, "no cycle counted");
+    assert.equal(st.paused, true, "state untouched");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop kick: a dead pane refuses with the start-again pointer", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const r = run(dir, { cmd: ["kick"], stubReplies: { "pane.list": { result: { panes: [] } } } }, {
+      config: goodConfig(dir),
+      state: { paneId: "wA:p1", workspaceId: "wA", status: "running", cycles: 1 },
+    });
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /pane wA:p1 is gone — start a new loop/);
+    assert.deepEqual(r.calls.map((c) => c.split(" ")[0]), ["pane.list"], "no send_text on a dead pane");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop pause records owner authorship; resume clears it", () => {
+  const dir = tmp();
+  try {
+    const p = run(dir, { cmd: ["pause"] }, { state: { paneId: "wA:p1", workspaceId: "wA", status: "running", noopStreak: 2 } });
+    assert.equal(p.code, 0);
+    const st = JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8"));
+    assert.equal(st.paused, true);
+    assert.equal(st.pausedBy, "owner", "the machine must know whose pause it is");
+    assert.ok(st.pausedAt > 0, "pausedAt stamped");
+    assert.equal(st.noopStreak, 2, "a pause never touches the noop streak");
+
+    const res = run(dir, { cmd: ["resume"] }, { state: st });
+    assert.equal(res.code, 0);
+    const st2 = JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8"));
+    assert.equal(st2.paused, false);
+    assert.ok(!("pausedBy" in st2), "resume clears pausedBy");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop auto-resume: a self-paused loop comes back when a watched file changes", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "backlog v2"); // mtime = now > pausedAt
+    const base = {
+      config: goodConfig(dir, { watchFiles: [join(dir, "prompt.md")] }),
+      event: { event: "pane.agent_status_changed", data: { pane_id: "wA:p1", agent_status: "idle" } },
+      state: { paneId: "wA:p1", status: "running", paused: true, pausedBy: "auto", pausedAt: Date.now() - 60_000, armed: true, cycles: 0, lastNudgeAt: 0 },
+    };
+    const r = run(dir, { cmd: ["event"], stubReplies: { "pane.send_text": { result: { type: "ok" } } } }, base);
+    assert.equal(r.code, 0);
+    assert.equal(r.calls.length, 1, "the resume settles into a normal nudge");
+    assert.ok(r.calls[0].startsWith("pane.send_text"));
+    const log = readFileSync(join(dir, "state", "loop.log"), "utf8");
+    assert.match(log, /auto-resume: watched file changed — prompt\.md/);
+    const st = JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8"));
+    assert.equal(st.paused, false);
+    assert.ok(!("pausedBy" in st));
+    assert.equal(st.cycles, 1);
+
+    // The resumed loop respects the normal cooldown on the next settle.
+    const again = run(dir, { cmd: ["event"] }, { ...base, state: st });
+    assert.deepEqual(again.calls, [], "cooldown still applies after an auto-resume");
+    assert.match(readFileSync(join(dir, "state", "loop.log"), "utf8"), /cooldown/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop auto-resume: an owner pause is never overridden, even with fresh files", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "backlog v2");
+    const r = run(dir, { cmd: ["event"] }, {
+      config: goodConfig(dir, { watchFiles: [join(dir, "prompt.md")] }),
+      event: { event: "pane.agent_status_changed", data: { pane_id: "wA:p1", agent_status: "idle" } },
+      state: { paneId: "wA:p1", status: "running", paused: true, pausedBy: "owner", pausedAt: Date.now() - 60_000, armed: true, cycles: 0, lastNudgeAt: 0 },
+    });
+    assert.equal(r.code, 0);
+    assert.deepEqual(r.calls, [], "owner pause wins over watched files");
+    assert.match(readFileSync(join(dir, "state", "loop.log"), "utf8"), /paused by owner — no auto-resume/);
+    const st = JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8"));
+    assert.equal(st.paused, true, "state untouched");
+    assert.equal(st.cycles, 0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop config: watchFiles fails closed on relative, missing, directory, empty or 9 entries", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const nine = Array.from({ length: 9 }, (_, i) => {
+      const p = join(dir, `w${i}.md`);
+      writeFileSync(p, "x");
+      return p;
+    });
+    const cases = {
+      "a relative path": ["relative/backlog.md"],
+      "a missing file": [join(dir, "nope.md")],
+      "a directory": [dir],
+      "an empty list": [],
+      "nine entries": nine,
+    };
+    for (const [name, watchFiles] of Object.entries(cases)) {
+      const r = run(dir, { cmd: ["start"] }, { config: goodConfig(dir, { watchFiles }) });
+      assert.equal(r.code, 2, `${name} must be rejected`);
+      assert.match(r.stderr, /watchFiles/, `${name}: the error names the field`);
+      assert.deepEqual(r.calls, [], `${name}: a rejected config never reaches the bridge`);
+    }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -18,6 +18,14 @@
   `stop` (đóng cả workspace — đọc câu trả lời cuối trước khi stop). Từ
   C11c, `start` từ chối khi pane cũ còn sống bất kể status (done để lại
   đáp án trên màn hình — stop rồi start lại là một bảng sạch).
+- **Nạp việc không mất pane (C20)**: action `kick` — resume + nudge NGAY
+  (bypass cooldown một lần, +1 cycle); chừa khi pane `working|blocked`
+  (`nudged:false`, không chen ngang), pane chết → exit 1 hẹn `start` lại.
+- **Auto-resume (C20)**: config `watchFiles` (1–8 file TUYỆT ĐỐI, phải
+  tồn tại — fail-closed): loop tự pause (`pausedBy:"auto"`) mà file đổi
+  (mtime > pausedAt) → settle kế tự resume + nudge, cooldown vẫn giữ.
+  `pausedBy:"owner"` (action `pause`) không bao giờ tự resume; `status`
+  lộ `watchFiles`/`pausedBy`/`pausedAt`.
 - Hệ driver cũ (systemd `herdgate-devloopd` + script
   `~/.local/bin/herdgate-dev-loop.sh`) đã **retired** (inactive/disabled,
   log dừng ở era PAUSE 03:47) — giữ làm khảo cổ, đừng khởi động lại khi

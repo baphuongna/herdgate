@@ -13,8 +13,8 @@
 // - only the pane in our registry is ever touched; foreign panes exit 0
 // - the event hook must never crash or hang Herdr: every path is bounded
 // - state survives restarts (state.json), so a crashed plugin loses nothing
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { isAbsolute, join, basename } from "node:path";
 import { homedir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import { bootText, buildBoot, validateBootCommand } from "./boot.mjs";
@@ -79,6 +79,18 @@ function validateConfig(c) {
   const maxCycles = c.maxCycles ?? 0;
   if (!Number.isInteger(maxCycles) || maxCycles < 0) return "loop.json: `maxCycles` must be an integer >= 0";
   if (c.nudgeText !== undefined && (typeof c.nudgeText !== "string" || c.nudgeText.length > 2000)) return "loop.json: `nudgeText` must be a string <= 2000 chars";
+  // C20 watchFiles: the files the loop watches to auto-resume a self-paused
+  // loop. Owner input, so fail closed like everything else: absolute paths,
+  // 1-8 of them, each must exist and be a file (a directory can carry an
+  // mtime but means the owner pointed at the wrong thing).
+  if (c.watchFiles !== undefined) {
+    if (!Array.isArray(c.watchFiles) || c.watchFiles.length < 1 || c.watchFiles.length > 8) return "loop.json: `watchFiles` must be an array of 1-8 absolute file paths";
+    for (const f of c.watchFiles) {
+      if (typeof f !== "string" || !isAbsolute(f)) return `loop.json: watchFiles entries must be absolute paths: ${f}`;
+      if (!existsSync(f)) return `loop.json: watchFiles entry not found: ${f}`;
+      if (!statSync(f).isFile()) return `loop.json: watchFiles entry is not a file: ${f}`;
+    }
+  }
   const bootErr = validateBootCommand(c.bootCommand);
   if (bootErr) return bootErr;
   // C17: auto-pause tuning. Defaults live here (not at the read sites) so
@@ -155,9 +167,15 @@ function classifyCycle(cfg, sinceMs, now) {
   return subjects.every((s) => pattern.test(s)) ? "no-op" : "work";
 }
 
-async function paneAlive(paneId) {
+// One pane.list answers both "alive?" and (for kick) "busy?" — the pane
+// object carries agent_status in the real bridge shape.
+async function getPane(paneId) {
   const r = await herdr("pane.list", {});
-  return r.ok && Array.isArray(r.result?.panes) && r.result.panes.some((p) => p?.pane_id === paneId);
+  return r.ok && Array.isArray(r.result?.panes) ? r.result.panes.find((p) => p?.pane_id === paneId) ?? null : null;
+}
+
+async function paneAlive(paneId) {
+  return (await getPane(paneId)) !== null;
 }
 
 // ---- actions -------------------------------------------------------------
@@ -168,8 +186,8 @@ async function cmdStatus() {
   const s = loadState();
   const alive = s.paneId ? await paneAlive(s.paneId) : false;
   out({
-    config: cfgErr ? { ok: false, error: cfgErr, path: CONFIG } : { ok: true, label: cfg.label, promptFile: cfg.promptFile, cwd: cfg.cwd, boot: buildBoot(cfg), cooldownMs: cfg.cooldownMs ?? MIN_COOLDOWN_MS, maxCycles: cfg.maxCycles ?? 0, noopPauseAfter: cfg.noopPauseAfter ?? 2 },
-    state: { paneId: s.paneId ?? null, workspaceId: s.workspaceId ?? null, status: s.status ?? "idle", paused: s.paused === true, pausedBy: s.pausedBy ?? null, armed: s.armed === undefined ? true : s.armed === true, cycles: s.cycles ?? 0, noopStreak: Number(s.noopStreak) || 0, lastNudgeAt: s.lastNudgeAt ?? 0, lastAuditAt: s.lastAuditAt ?? null, auditHold: s.auditHold ?? null, paneAlive: alive },
+    config: cfgErr ? { ok: false, error: cfgErr, path: CONFIG } : { ok: true, label: cfg.label, promptFile: cfg.promptFile, cwd: cfg.cwd, boot: buildBoot(cfg), cooldownMs: cfg.cooldownMs ?? MIN_COOLDOWN_MS, maxCycles: cfg.maxCycles ?? 0, noopPauseAfter: cfg.noopPauseAfter ?? 2, watchFiles: Array.isArray(cfg.watchFiles) ? cfg.watchFiles : [] },
+    state: { paneId: s.paneId ?? null, workspaceId: s.workspaceId ?? null, status: s.status ?? "idle", paused: s.paused === true, pausedBy: s.pausedBy ?? null, pausedAt: s.pausedAt ?? 0, armed: s.armed === undefined ? true : s.armed === true, cycles: s.cycles ?? 0, noopStreak: Number(s.noopStreak) || 0, lastNudgeAt: s.lastNudgeAt ?? 0, lastAuditAt: s.lastAuditAt ?? null, auditHold: s.auditHold ?? null, paneAlive: alive },
     log: LOG,
   });
 }
@@ -219,6 +237,28 @@ async function cmdStart() {
   out({ ok: true, paneId, workspaceId: wsId });
 }
 
+// C20 — kick: resume and nudge NOW, without the stop+start round-trip that
+// throws away the pane (and its final answer). A busy agent is left alone
+// (typing over a running turn would inject mid-thought); a dead pane sends
+// the owner to `start`.
+async function cmdKick() {
+  const s = loadState();
+  if (!s.paneId) return die(1, "no loop to kick (no state)");
+  const pane = await getPane(s.paneId);
+  if (!pane) return die(1, `pane ${s.paneId} is gone — start a new loop`);
+  if (pane.agent_status === "working" || pane.agent_status === "blocked") {
+    out({ ok: true, nudged: false, reason: "working" });
+    return;
+  }
+  const cfg = loadConfig(); // deliberately not validated: a nudge is owner-initiated
+  const text = cfg?.nudgeText ?? DEFAULT_NUDGE;
+  const r = await herdr("pane.send_text", { pane_id: s.paneId, text });
+  if (!r.ok) return die(3, `pane.send_text failed: ${r.error?.message}`);
+  saveState({ ...s, paused: false, pausedBy: undefined, noopStreak: 0, cycles: (Number(s.cycles) || 0) + 1, lastNudgeAt: Date.now() });
+  log(`kick: nudged pane ${s.paneId}`);
+  out({ ok: true, nudged: true, paneId: s.paneId });
+}
+
 async function cmdStop() {
   const s = loadState();
   if (!s.workspaceId) return die(1, "nothing to stop (no state)");
@@ -234,22 +274,47 @@ async function cmdStop() {
 function cmdPause(resume) {
   const s = loadState();
   if (!s.paneId && !s.workspaceId) return die(1, "no loop to pause/resume");
-  // resume = the owner decided: the audit hold is cleared for good (undefined
-  // keys vanish from the JSON; the audited window stays recorded) and the
-  // no-op streak is forgiven — counting stale no-ops against a loop the owner
-  // just resumed would re-pause it on the very next quiet cycle.
+  // WHOSE pause is it, and what does resume forgive? `owner` is a human
+  // decision the engine never overrides; C17's self-pause stamps `auto` and
+  // may be lifted when a watched file changes. resume = the owner decided:
+  // the no-op streak is forgiven (stale no-ops would re-pause on the next
+  // quiet cycle) and the audit hold is cleared for good (undefined keys
+  // vanish from the JSON; the audited window stays recorded).
   const next = { ...s, paused: !resume };
   if (resume) {
     next.noopStreak = 0;
     delete next.pausedBy;
+    delete next.pausedAt;
     next.auditHold = undefined;
   } else {
     next.pausedBy = "owner";
+    next.pausedAt = Date.now();
   }
   saveState(next);
   log(resume ? `resume: nudges re-enabled (noop streak reset${s.auditHold ? ", audit hold cleared" : ""})` : "pause: nudges muted (pausedBy owner)");
   out({ ok: true, paused: !resume });
 }
+
+// C20 — auto-resume: a loop the LOOP itself paused (pausedBy "auto") may
+// come back on its own when a watched file changes (mtime newer than the
+// pause stamp) — the owner editing the backlog is the only signal needed.
+// An owner pause is a human decision and is never overridden. Kept as two
+// standalone functions so parallel work on the same fields (C17) merges
+// cleanly: callers ask `shouldAutoResume(state, cfg)`; the file path is
+// available for honest logs via `latestWatchedChange`.
+function latestWatchedChange(state, cfg) {
+  if (state.pausedBy !== "auto") return null;
+  const files = Array.isArray(cfg?.watchFiles) ? cfg.watchFiles : [];
+  if (files.length === 0) return null;
+  let newest = null, newestMs = -Infinity;
+  for (const f of files) {
+    let ms;
+    try { ms = statSync(f).mtimeMs; } catch { continue; } // vanished since validation: not a change
+    if (ms > newestMs) { newestMs = ms; newest = f; }
+  }
+  return newestMs > (Number(state.pausedAt) || 0) ? newest : null;
+}
+const shouldAutoResume = (state, cfg) => latestWatchedChange(state, cfg) !== null;
 
 // ---- the engine: event hook ----------------------------------------------
 
@@ -259,7 +324,7 @@ async function cmdEvent() {
   const event = typeof payload?.event === "string" ? payload.event : "";
   const data = payload?.data && typeof payload.data === "object" ? payload.data : {};
   const paneId = typeof data.pane_id === "string" ? data.pane_id : "";
-  const s = loadState();
+  let s = loadState(); // reassigned on auto-resume: later saves must not resurrect `paused`
   if (!s.paneId || paneId !== s.paneId) process.exit(0); // not our pane — silent, always
 
   if (event === "pane.exited") {
@@ -293,7 +358,19 @@ async function cmdEvent() {
   const cycles = Number(s.cycles) || 0;
 
   if (s.status !== "running") { log(`status=${s.status} — no nudge`); process.exit(0); }
-  if (s.paused === true) { log("paused — no nudge"); process.exit(0); }
+  if (s.paused === true) {
+    const changed = latestWatchedChange(s, cfg);
+    if (!changed) {
+      // "owner" (or a pause without authorship, from older states) is never
+      // lifted by the machine — one honest line per settle.
+      log(s.pausedBy === "auto" ? "paused (auto) — no watched file changed since the pause — no nudge" : "paused by owner — no auto-resume");
+      process.exit(0);
+    }
+    s = { ...s, paused: false, pausedBy: undefined, pausedAt: undefined, noopStreak: 0 };
+    saveState(s);
+    log(`auto-resume: watched file changed — ${basename(changed)}`);
+    // falls through: the resumed loop obeys the normal nudge rules below
+    // (maxCycles, cooldown) exactly like an un-paused settle would.
   if (s.auditHold) { log(`audit hold ${s.auditHold.rules.join(",")} — no nudge until the owner resumes`); process.exit(0); }
 
   // Cycle audit (C18): the guardrails as a mechanism, not a promise. The
@@ -355,6 +432,7 @@ const commands = {
   stop: cmdStop,
   pause: () => cmdPause(false),
   resume: () => cmdPause(true),
+  kick: cmdKick,
   event: cmdEvent,
 };
 if (!commands[cmd]) die(2, `usage: index.mjs <${Object.keys(commands).join("|")}>`);
