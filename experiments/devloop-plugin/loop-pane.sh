@@ -26,5 +26,10 @@ fi
 TAB=$(api "{\"id\":\"t1\",\"method\":\"tab.create\",\"params\":{\"workspace_id\":\"$WS\",\"label\":\"dev-loop\"}}")
 PANE=$(printf '%s' "$TAB" | python3 -c "import json,sys; print(json.loads(sys.stdin.readline())['result']['root_pane']['pane_id'])")
 echo "{\"paneId\": \"$PANE\", \"startedAt\": $(date +%s)}" > "$STATE"
-printf '%s\n' "{\"id\":\"s1\",\"method\":\"pane.send_text\",\"params\":{\"pane_id\":\"$PANE\",\"text\":\"cd /home/bom/source/herdgate && pi \\\"\\$(cat docs/DEV-LOOP/AUTO.md)\\\"\r\"}}" | timeout 8 herdr --session default remote-api-bridge >/dev/null 2>&1
+python3 - "$PANE" <<'PY'
+import json, subprocess, sys
+req = json.dumps({"id": "s1", "method": "pane.send_text", "params": {"pane_id": sys.argv[1], "text": 'cd /home/bom/source/herdgate && pi "$(cat docs/DEV-LOOP/AUTO.md)"\r'}})
+out = subprocess.run(["herdr", "--session", "default", "remote-api-bridge"], input=req + "\n", capture_output=True, text=True, timeout=8)
+print(out.stdout.splitlines()[0] if out.stdout else "send_text FAILED: " + out.stderr[:120])
+PY
 echo "loop pane: $PANE (workspace $WS)"
