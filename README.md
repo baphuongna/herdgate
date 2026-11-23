@@ -159,7 +159,8 @@ no-accumulation close rule, worktree-vs-main-branch whitelists).
 · `usage.rollup` · `diff.get` (hardened git: hooks off, env scrubbed, `~ ^` refs)
 · `sysmon.snapshot` (per-agent CPU/RAM from /proc, cutime-aware) · `ports.list` (listeners attributed
 by process ancestry; unattributed stay honest) · `attachment.upload/list` (magic-byte photos from
-the phone to the agent's own disk, 0700/0600, uuid names) — plus the SSH/mobile leg below.
+the phone to the agent's own disk, 0700/0600, uuid names)
+· `loop.status` (the dev-loop plugin's state.json + capped log tail, read-only; missing state answers `unknown` honestly) — plus the SSH/mobile leg below.
 
 ### Mobile transport
 One persistent shell with marker framing replaces exec-per-command; phone keystrokes enter a

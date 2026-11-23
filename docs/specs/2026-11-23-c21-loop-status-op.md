@@ -120,4 +120,19 @@ gate; UI phone sẽ đi vòng riêng khi main rảnh.
 
 ## Nghiệm thu (điền lúc xong)
 
-- (chưa chạy)
+- Test đỏ (trước implement): `node --test test/loop-status-op.test.ts` →
+  **5/5 fail**, đúng một kiểu: `no loop.status reply within 8000ms` (op
+  chưa có handler nên không reply — hello/connection vẫn sống vì assert
+  `publisher never connected` đã pass trước đó). Không crash publisher.
+- Test xanh (sau implement): cùng file → **5 pass / 0 fail** (~1.3s):
+  happy-path shape (logTail ≤ 20, dòng ≤ 200, newest-last, `pane.alive ===
+  null`), no-state → `{ok:false,error:"unknown"}` + `view` sau đó vẫn trả,
+  `HERDR_LOOP_STATE_DIR` thắng sibling, BOM parse được (`lastNudgeAt` 0 →
+  `null` trung thực), dòng log 500 ký tự bị cắt đúng 200.
+- Test lân cận không đứt: `node --test test/plugin.test.ts
+  test/publisher-loopback.test.ts` → **15 pass / 0 fail** (invariant
+  tripwire cap + pattern fake-gate tôi mượn vẫn nguyên).
+- Full suite KHÔNG chạy theo ràng buộc vòng (4 CPU/5 agent) — controller
+  chạy lúc merge. Live-verify qua gate thật không làm (ngoài phạm vi; op
+  đọc đúng file state thật qua env là đủ cho vòng này).
+- README: đã thêm đúng 1 dòng `loop.status` vào "Device-channel ops".

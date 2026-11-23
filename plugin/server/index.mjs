@@ -40,6 +40,8 @@ const MAX_FILE_ENTRIES = 5000; // file.tree cap — the fuzzy finder ranks withi
 const MAX_FILE_BYTES = 128 * 1024; // file.read cap — same class as diffs, and well under the gate's 256KiB frame limit
 const MAX_REVIEW_FILES = 5000; // review.files entries cap (one screen's worth of scrolling)
 const MAX_REVIEW_COMMENTS = 50; // review.send comments per batch — a review, not a prompt
+const MAX_LOOP_LOG_TAIL = 20; // loop.status log tail — a screenful of loop decisions, bounded by construction
+const MAX_LOOP_LOG_LINE = 200; // one loop.log line, cut not dropped — the whole reply stays ≈4KiB, far under the frame cap
 const NAME = process.env.HERDGATE_HOST_NAME || hostname();
 const log = (line) => console.error(`herdgate: ${line}`);
 /** The panel's settings file (app home herdgate dir) — the owner's switches live
@@ -918,6 +920,42 @@ async function publisherLoop() {
             ...(enabled
               ? { queued, running, heartbeat: beat ? { ts: beat.ts, source: beat.source, ageSeconds: age } : null }
               : { reason: "pi_worker_disabled" }) });
+        }
+        if (op === "loop.status") {
+          // READ-ONLY presence for the shipped dev-loop plugin (dev.herdgate.loop):
+          // its state dir sits next to ours in the same herdr home (or comes in via
+          // env for probes/tests). One state.json read plus a capped log tail — no
+          // herdr call, no write, so `pane.alive` is honestly null (pane liveness
+          // is what view/fleet.detail already answer). A missing or unreadable
+          // state is an `unknown` loop, never a throw and never a broken socket.
+          const loopBase = process.env.HERDGATE_LOOP_STATE_DIR || process.env.HERDR_LOOP_STATE_DIR
+            || (process.env.HERDR_PLUGIN_STATE_DIR
+              ? join(dirname(process.env.HERDR_PLUGIN_STATE_DIR), "dev.herdgate.loop")
+              : "");
+          let loop = { ok: false, error: "unknown" };
+          try {
+            if (loopBase) {
+              // Same BOM rule the loop plugin itself learned in C12: a Windows-written
+              // state.json must not read back as "not found".
+              const st = JSON.parse(readFileSync(join(loopBase, "state.json"), "utf8").replace(/^\uFEFF/, ""));
+              if (st && typeof st === "object" && !Array.isArray(st)) {
+                let logTail = [];
+                try {
+                  logTail = readFileSync(join(loopBase, "loop.log"), "utf8").split("\n")
+                    .filter((l) => l.length > 0).slice(-MAX_LOOP_LOG_TAIL).map((l) => l.slice(0, MAX_LOOP_LOG_LINE));
+                } catch { /* no log yet — the state file is still the truth */ }
+                loop = { ok: true, pane: { id: typeof st.paneId === "string" ? st.paneId : null, alive: null },
+                  status: typeof st.status === "string" ? st.status : "unknown",
+                  paused: st.paused === true,
+                  pausedBy: typeof st.pausedBy === "string" ? st.pausedBy : null,
+                  cycles: Number(st.cycles) || 0,
+                  lastNudgeAt: Number(st.lastNudgeAt) > 0 ? Number(st.lastNudgeAt) : null,
+                  logTail };
+              }
+            }
+          } catch { loop = { ok: false, error: "unknown" }; }
+          log(`loop: ${m.device} status -> ${loop.ok ? `${loop.status} cycles=${loop.cycles} tail=${loop.logTail.length}` : "unknown"}`);
+          return void replyTo({ op: "loop.status", loop });
         }
         if (op === "receipt.body") {
           // Experimental: serving archived replies is separate from metadata push.
