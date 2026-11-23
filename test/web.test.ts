@@ -134,7 +134,7 @@ test("client: renders text only, and sends nothing but view", () => {
   // not a shape accident. tab.*/term.send/term.keys run only when the device
   // holds an act grant; the host refuses the rest.
   const ops = [...src.matchAll(/op:\s*"([a-z][a-z.]*)"/g)].map((m) => m[1]);
-  const allowed = ["receipt.ack", "receipt.get", "receipt.watch", "review.send", "tab.close", "tab.create", "term.list", "term.read", "term.send", "view", "worker.health", "worker.submit"];
+  const allowed = ["loop.status", "receipt.ack", "receipt.get", "receipt.watch", "review.send", "tab.close", "tab.create", "term.list", "term.read", "term.send", "view", "worker.health", "worker.submit"];
   assert.deepEqual([...new Set(ops)].sort(), allowed, "the client sends exactly the allowlisted ops");
   // The typing lane and the phone-tab chips exist only behind the act check.
   assert.match(src, /state\.deviceScope === "act"/, "typing and tab creation are act-gated in the UI");
@@ -175,6 +175,19 @@ test("client: a device that was just here says so — lastSeen names the leg and
   assert.match(src, /d\.lastSeen/, "device rows read d.lastSeen");
   assert.match(src, /lastSeen\.at/, "the age renders from lastSeen.at");
   assert.match(src, /last seen /, "the wording says what it is");
+});
+
+test("client: the worker box shows the dev-loop's own status line", () => {
+  const src = codeOnly(readFileSync(join(WEB, "app.js"), "utf8"));
+  // C21 shipped the read-only loop.status op; C22 makes the phone SEE it — one
+  // muted line beside the worker queue line: status, pause+who, cycles, last
+  // nudge. An old host that has no such op must not paint the room red for it.
+  assert.match(src, /op === "loop\.status"/, "the loop.status reply is handled");
+  assert.match(src, /payload\.loop/, "the loop state rides payload.loop");
+  assert.match(src, /dev-loop: /, "the line names what it is");
+  assert.match(src, /lastNudgeAt/, "the last nudge renders");
+  assert.match(src, /pausedBy/, "who paused the loop is shown");
+  assert.match(src, /no op loop\\\.status/, "an old host's refusal is swallowed, not a room error");
 });
 
 test("client: review.send closes the loop — the phone learns when the agent is done", () => {

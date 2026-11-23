@@ -160,7 +160,7 @@ const state = {
   termBody: null,
   termPre: null,
   retry: 0,
-  worker: { health: null, jobs: new Map(), error: null, search: null, searchError: null, tab: "jobs", usage: null, chatError: null, bodyError: null, draft: null, enrich: null, files: { tree: null, total: 0, capped: false, loading: false, error: null, query: "", open: null, text: null, lines: 0, truncated: false, goto: null, search: "" }, review: { scope: "uncommitted", files: null, base: null, capped: false, loading: false, error: null, open: null, diff: null, truncated: false, comments: {}, boxLine: null, sending: false, sent: null } },
+  worker: { health: null, loop: null, jobs: new Map(), error: null, search: null, searchError: null, tab: "jobs", usage: null, chatError: null, bodyError: null, draft: null, enrich: null, files: { tree: null, total: 0, capped: false, loading: false, error: null, query: "", open: null, text: null, lines: 0, truncated: false, goto: null, search: "" }, review: { scope: "uncommitted", files: null, base: null, capped: false, loading: false, error: null, open: null, diff: null, truncated: false, comments: {}, boxLine: null, sending: false, sent: null } },
   diff: null,
   chat: { filter: null, spawn: null },
 };
@@ -1642,6 +1642,11 @@ function renderWorkerBox(box) {
   summary.textContent = "Pi worker (experimental)";
   const health = document.createElement("p");
   health.className = "muted small";
+  // The dev-loop's own heartbeat sits right under the queue line: same box,
+  // same refresh, read-only (C21's loop.status — status, pause, cycles, last
+  // nudge; pane liveness stays with view/fleet.detail where it belongs).
+  const loopLine = document.createElement("p");
+  loopLine.className = "muted small";
   const refresh = document.createElement("button");
   refresh.type = "button";
   refresh.className = "link";
@@ -1803,7 +1808,7 @@ function renderWorkerBox(box) {
   const reviewOut = document.createElement("div");
   reviewOut.className = "review-out";
   reviewView.append(reviewOut);
-  details.append(summary, health, refresh, bar, form, formError, search, recap, usageView, timelineView, diffView, filesView, reviewView, jobs);
+  details.append(summary, health, loopLine, refresh, bar, form, formError, search, recap, usageView, timelineView, diffView, filesView, reviewView, jobs);
   box.append(details);
 
   filesForm.addEventListener("submit", (event) => {
@@ -1820,7 +1825,7 @@ function renderWorkerBox(box) {
     state.worker.files.query = filesInput.value.trim();
   });
 
-  const askHealth = () => sendPayload({ op: "worker.health" });
+  const askHealth = () => { sendPayload({ op: "worker.health" }); sendPayload({ op: "loop.status" }); };
   refresh.addEventListener("click", askHealth);
   details.addEventListener("toggle", () => { if (details.open) askHealth(); });
   form.addEventListener("submit", (event) => {
@@ -1895,6 +1900,10 @@ function renderWorkerBox(box) {
       const beat = h.heartbeat ? ` · heartbeat ${h.heartbeat.source} ${h.heartbeat.ageSeconds}s ago` : " · no heartbeat";
       health.textContent = `queue ${h.queued ?? "?"} waiting, ${h.running ?? "?"} running${beat}`;
     }
+    const l = w.loop;
+    loopLine.textContent = !online || !l ? "" : l.ok !== true
+      ? "dev-loop: unknown (no loop state on this host)"
+      : `dev-loop: ${[l.status ?? "unknown", ...(l.paused ? [`paused${l.pausedBy ? ` by ${l.pausedBy}` : ""}`] : []), ...(typeof l.cycles === "number" ? [`${l.cycles} cycles`] : []), ...(l.lastNudgeAt ? [`nudge ${new Date(l.lastNudgeAt).toISOString().slice(11, 19)}Z`] : [])].join(" · ")}`;
     formError.hidden = !w.error;
     formError.textContent = w.error ?? "";
     searchHits.replaceChildren();
@@ -2866,6 +2875,10 @@ function applyPayload(payload) {
       paintTerm();
     }
     return;
+  } else if (payload && typeof payload === "object" && payload.op === "loop.status") {
+    state.worker.loop = payload.loop ?? { ok: false };
+    state.roomUi?.updateWorker?.(true);
+    return;
   } else if (payload && typeof payload === "object" && payload.op === "worker.health.result") {
     state.worker.health = payload;
     state.worker.error = payload.enabled === false ? payload.message ?? "worker queue disabled on this host" : null;
@@ -2985,6 +2998,8 @@ function applyPayload(payload) {
     return;
   } else if (payload && typeof payload === "object" && payload.op === "error" && PANE_ERROR_CODES.has(payload.code)) {
     return; // no pane-focus surface yet — the refusal is not the room's problem
+  } else if (payload && typeof payload === "object" && payload.op === "error" && payload.code === "read-only" && /no op loop\.status/.test(String(payload.message ?? ""))) {
+    return; // a host from before C21: no loop to show — the empty line says enough
   } else if (payload && typeof payload === "object" && payload.op === "error" && WORKER_ERROR_CODES.has(payload.code)) {
     // Scoped to the worker panel: a refused submit/watch must not blank the room view.
     state.worker.error = payload.message ?? payload.code ?? "the host refused";
