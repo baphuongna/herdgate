@@ -6,16 +6,21 @@
 
 ## Tự vận hành (auto-run)
 
-- `herdgate-dev-loop.timer` (systemd user, mỗi 2h + jitter 15m) nạp
-  `herdgate-dev-loop.service` → `pi -p` với prompt `docs/DEV-LOOP/AUTO.md`.
-- Mỗi lần chạy = 1 vòng SDD trọn (spec → red → green → suite → commit →
-  push). Guardrails trong AUTO.md: KHÔNG npm publish/tag, KHÔNG đụng
-  service/pane user, BLOCKED thay vì cố, đúng 1 vòng/lần.
-- Release vẫn do chủ sở hữu (2b): auto-loop ghi `READY-TO-RELEASE` khi
-  theme trọn.
-- Theo dõi: `journalctl --user -u herdgate-dev-loop -f`; đổi nhịp: sửa
-  `OnCalendar` trong timer; dừng hẳn: `systemctl --user disable --now
-  herdgate-dev-loop.timer`.
+- **`herdgate-devloopd.service`** (systemd user, chạy nền liên tục) dùng
+  driver `~/.local/bin/herdgate-dev-loop.sh`: xong 1 vòng → breather 90s →
+  vòng kế NGAY (không chờ timer).
+- Mỗi vòng = 1 session `pi -p` mới với prompt `docs/DEV-LOOP/AUTO.md`:
+  1 chu kỳ SDD trọn (spec → red → green → suite → commit → push).
+- Van an toàn: exit nhanh (<10 phút: BLOCKED/việc gì) hoặc lỗi → cooldown
+  30 phút (chống đốt token vòng lặp nóng); `timeout 4h` chặn session treo;
+  cờ **`docs/DEV-LOOP/PAUSE`** ghì loop khi người làm việc trực tiếp trong
+  repo (tạo file để pause, xoá để chạy lại).
+- Guardrails AUTO.md: KHÔNG npm publish/tag (ghi `READY-TO-RELEASE`
+  khi theme trọn — chủ sở liệu publish), KHÔNG đụng service/pane user,
+  KHÔNG in token, đúng 1 vòng/lần.
+- Theo dõi: `tail -f ~/.local/state/herdgate-dev-loop.log` và
+  `journalctl --user -u herdgate-devloopd -f`. Dừng hẳn:
+  `systemctl --user disable --now herdgate-devloopd`.
 
 ## Nguyên tắc bất biến (mọi vòng đều chịu ràng buộc)
 
