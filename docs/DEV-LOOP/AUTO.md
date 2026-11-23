@@ -11,6 +11,7 @@ Nhiệm vụ: chạy đúng **một vòng phát triển** theo protocol đã đ�
 
 1. Đọc `docs/DEV-LOOP.md` toàn bộ — đặc biệt: Nguyên tắc bất biến, Chính sách
    release 2b, Cycle Log (vòng cuối đã ✅?), Bài học các vòng trước.
+   Lịch sử các vòng cũ nằm ở `docs/DEV-LOOP/LOG-2026-11.md` — chỉ đọc khi cần bối cảnh.
 2. Chọn vòng: mục backlog đầu tiên có trạng thái 🔄/queued. Nếu bảng ghi
    BLOCKED ở đầu — dừng ngay, exit 0, không cố.
 3. Viết spec `docs/specs/<hôm nay>-c<N>-<tên>.md` (mẫu: các spec cũ) — gọn,
