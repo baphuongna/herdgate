@@ -31,7 +31,7 @@ R2. Nudge hoãn, khi đến giờ, **không tự ý nudge**: nó kiểm tra lạ
     không phải đường dẫn thứ hai.
 R3. Trước khi nudge, nudge hoãn hỏi herdr một lần trạng thái pane: `working|blocked` → **bỏ** (agent đang
     bận — một settle thật sẽ đến); pane không còn → **bỏ** + log (KHÔNG tự ghi `chain-broke`: sự kiện
-    `pane.exited` của herdr mới là chủ vòng đời — loop không bị절 dẫn lifecycle).
+    `pane.exited` của herdr mới là chủ vòng đời — loop không tự sáng tạo chuyển trạng thái vòng đời).
 R4. **Idempotent**: nhiều settle trong cùng cửa sổ cooldown → một lịch hoãn (ghi đè cùng lúc đến);
     `kick`/`stop`/`start` xoá lịch hoãn; một lịch hoãn bị thay thế (id khác) phải tự thoát im lặng.
 R5. Nudge thật (`lastNudgeAt` đổi) → xoá lịch hoãn còn treo.
@@ -68,7 +68,7 @@ R10. Hành vi cũ giữ nguyên khi cooldown đã qua (nudge ngay) và khi `cool
 
 ## 4. Non-goals
 
-- Không đổi cooldown mặc định (60s) hay MIN (10s). Không introducing timer chung hay daemon.
+- Không đổi cooldown mặc định (60s) hay MIN (10s). Không đưa vào timer chung hay daemon.
 - Không đụng `plugin/server/index.mjs` ngoài việc thêm `deferredUntil` vào op `loop.status`.
 - Không sửa `scripts/`, systemd units, `docs/DEV-LOOP/AUTO.md`, `herdr-plugin.toml` (không cần action mới —
   `deferred-nudge` là lệnh nội bộ; nếu muốn đăng ký action thì **không**, giữ nội bộ).
