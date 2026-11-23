@@ -6,21 +6,31 @@
 
 ## Tự vận hành (auto-run)
 
-- **`herdgate-devloopd.service`** (systemd user, chạy nền liên tục) dùng
-  driver `~/.local/bin/herdgate-dev-loop.sh`: xong 1 vòng → breather 90s →
-  vòng kế NGAY (không chờ timer).
-- Mỗi vòng = 1 session `pi -p` mới với prompt `docs/DEV-LOOP/AUTO.md`:
-  1 chu kỳ SDD trọn (spec → red → green → suite → commit → push).
-- Van an toàn: exit nhanh (<10 phút: BLOCKED/việc gì) hoặc lỗi → cooldown
-  30 phút (chống đốt token vòng lặp nóng); `timeout 4h` chặn session treo;
-  cờ **`docs/DEV-LOOP/PAUSE`** ghì loop khi người làm việc trực tiếp trong
-  repo (tạo file để pause, xoá để chạy lại).
+- **Driver hiện tại = chính plugin shipped `dev.herdgate.loop`** (cutover
+  C9): action `start` mở workspace `⚙ dev-loop`, boot pi với prompt
+  `docs/DEV-LOOP/AUTO.md` (cwd = repo); event hook nudge vòng kế khi
+  pane settle. State/log: `~/.local/state/herdr/plugins/dev.herdgate.loop/`
+  (state.json: cycles/armed/paused; loop.log: mọi quyết định nudge).
+- Mỗi vòng = 1 turn của cùng session pi trong pane đó (không còn
+  `pi -p` headless mỗi vòng): 1 chu kỳ SDD trọn (spec → red → green →
+  suite → commit → push) rồi dừng đúng 1 vòng.
+- **Đóng băng**: action `pause` của plugin; resume: `resume`; dừng hẳn:
+  `stop` (đóng cả workspace — đọc câu trả lời cuối trước khi stop). Từ
+  C11c, `start` từ chối khi pane cũ còn sống bất kể status (done để lại
+  đáp án trên màn hình — stop rồi start lại là một bảng sạch).
+- Hệ driver cũ (systemd `herdgate-devloopd` + script
+  `~/.local/bin/herdgate-dev-loop.sh`) đã **retired** (inactive/disabled,
+  log dừng ở era PAUSE 03:47) — giữ làm khảo cổ, đừng khởi động lại khi
+  chuỗi plugin đang chạy (double-drive).
 - Guardrails AUTO.md: KHÔNG npm publish/tag (ghi `READY-TO-RELEASE`
   khi theme trọn — chủ sở liệu publish), KHÔNG đụng service/pane user,
   KHÔNG in token, đúng 1 vòng/lần.
-- Theo dõi: `tail -f ~/.local/state/herdgate-dev-loop.log` và
-  `journalctl --user -u herdgate-devloopd -f`. Dừng hẳn:
-  `systemctl --user disable --now herdgate-devloopd`.
+- Theo dõi: `tail -f ~/.local/state/herdr/plugins/dev.herdgate.loop/loop.log`;
+  trạng thái: action `status` của plugin.
+- **Backlog trống** (hết mục 🔄/queued, không nợ giao/nghiệm thu nào trả
+  được ngay): vòng **no-op ngắn** — quét log sống (loop/gate/publisher)
+  + 1 dòng Cycle Log `no-op — backlog trống`; KHÔNG săn theme ép,
+  KHÔNG tự pause loop (quyết định dừng là của owner).
 
 ## Nguyên tắc bất biến (mọi vòng đều chịu ràng buộc)
 
@@ -143,6 +153,12 @@
 - `herdr pane send-text` (CLI) KHÔNG kèm Enter — text nằm trên prompt mà không chạy; phải `pane send-keys <id> enter` sau đó. (Api `pane.send_text` với `\r` trong text thì tự Enter — hai lane khác nhau.)
 - Footprint nhỏ nhất khi drive máy sống của owner: 1 tab riêng có nhãn trong workspace đang mở + tự đóng; chứng minh không đụng gì bằng diff pane.list trước/sau.
 - Scrub secret theo TÊN key là chưa đủ: filter 'TOKEN' đã lọt 'ROOM_TOKEN' và in giá trị thật ra output. Scrub theo GIÁ TRỊ (regex hình-dạng secret / độ dài) hoặc whitelist tên field ĐƯỢC PHÉP in — mọi script đọc env cấu hình phải mặc định deny.
+
+### Bài học C11c
+- "Done" không phải "gone": máy trạng thái có trạng thái kết thúc phải hỏi "tài sản của trạng thái đó còn trên đời không?" — pane done vẫn sống với đáp án cuối; restart đè lên nó = mồ côi hoá tài sản người đọc. Từ chối + chỉ lối ra (stop) an toàn hơn dọn hộ (đừng đóng cái owner có thể đang đọc).
+- Tài liệu vận hành là code: section "Tự vận hành" sai một epoch (devloopd) khiến mỗi vòng tốn khảo cổ lại kiến trúc. Khi driver đổi, đoạn mô tả driver phải đổi trong CÙNG vòng cutover.
+- Backlog trống là tín hiệu thiết kế thiếu: chuỗi tự chạy cần giao thức no-op trung thực (sweep + 1 dòng log) — săn theme ép khi không có việc là tự tạo việc ảo, tệ hơn im lặng ghi nhận.
 | v0.11.0 | 2026-11-23 | 🚀 RELEASE "Self-healing + Loop" — gộp theme: C7 publisher watchdog (serve) + C8 TUI watchdog (run-id lock) + C9 plugin/loop shipped + C10 arming | bump + tag v0.11.0 | Đủ điều kiện 2b(a): trọn theme lớn user-facing. Suite 333/0. Windows-on-metal verify TUI watchdog đá ngay sau publish (nợ C8). **Trạng thái**: npm latest flipped 0.11.0 ✓; laptop offline (cả 6 device) tại lúc drive — update + verify on-metal chờ laptop online (chủ sở hữu mở máy hoặc drive lại sau) |
 | C11 | 2026-11-23 | ✅ xong — loop boot path Windows (dòng boot thoát POSIX-only), **không bump** theo 2b | spec `7b1d964` + feat (c11) + dọn `c72bc2f` | Suite **338/0** (5 test mới: boot.mjs default/override/fail-closed + dependency manifest; CLI: tab.create CÓ cwd, text boot mới, bootCommand override end-to-end, boot hỏng chết trước bridge, status.boot). **Live probe home** (herdr 0.9.5 thật, scratch state — không đụng loop dev-loop thật): start → pane wJ:p2 sinh ĐÚNG cfg.cwd qua `tab.create` cwd (không gõ `cd`); boot `pi "@<promptFile>"` (không command substitution) → pi thật boot trong pane (agent detected, working) → trả lời `C11-PROBE-OK` qua attachment, done; stop đóng workspace sạch; shipped loop 0 đụng pane probe (foreign-check). min_herdr_version loop 0.9.0→0.9.5 (tab.create cwd). Bắt thêm: release v0.11.0 commit bỏ sót host manifest (bump rơi khỏi commit, file dirty 6 tiếng) — dọn commit riêng. Windows-on-metal chờ laptop (cùng nợ C8). **READY-TO-RELEASE: loop-windows-boot** — theme C9–C11 trọn; laptop đang update 0.11.0 sẽ hỏng boot trên Windows, owner publish sớm để fix tới máy |
 | C11b | 2026-11-23 | ✅ xong — **giao v0.11.0 cho laptop + đòi nợ on-metal C8** (drive-verify, không đổi code repo) | spec `2e9ec3f` | Backlog hết mục queued → chọn nợ ghi 2 lần trong log: laptop còn 0.10.0, owner đã publish v0.11.0. **Drive qua lane chính thống** `herdr --machine laptop` (machine saved `328f45bf`, device `d_39752695` scope act do owner pair bằng `herdgate connect`): 1 tab riêng `c11update` trong workspace owner đang mở, KHÔNG đụng pane có sẵn (diff pane.list 43/43 trước/sau — chỉ pane mình tạo biến mất). Dry-run `herdgate status` (0.10.0, connected pid 30420) → `herdgate update` → JSON `{"release":"tui-212160f7c748d246","state":"connected","pid":28488,"supervised":true}` — **supervised:true là C8 sống on-metal**; supervisor log: `watching (poll 1000ms, budget 5/600s)` → `publisher starting (pid 28488, run d604f95a)` → `publisher started`; heartbeat `publisher-tui.supervisor.json` fresh ({pid:37020, pollMs:1000, at=ngay lúc đọc}); **gate hostInfo r_5a22e50b flips 0.10.0 → 0.11.0** (04:57:08Z). Loop plugin shipped trên laptop (releases\tui-212160f7c748d246\plugin\loop\{herdr-plugin.toml, server\index.mjs}) — trung thực: **không có boot.mjs (pre-C11)**, loop inert ở đó cho tới khi owner publish fix C11 — READY-TO-RELEASE: loop-windows-boot vẫn đứng. Không đổi code repo — suite không chạy lại (baseline 338/0 của C11). **Vi phạm guardrail ghi trung thực**: đầu vòng in 2 room token ra output khi lọc env theo tên biến (ROOM_TOKEN khớp substring 'TOKEN' của filter) — giá trị chỉ nằm trong transcript local; bài học C11b |
+| C11c | 2026-11-23 | ✅ xong — **loop operability**: start sạch sau done + tài liệu vận hành nói sự thật + giao thức no-op, **không bump** theo 2b | spec + feat + docs | Suite **340/0** (2 test mới: done+alive → từ chối, đúng 1 pane.list, không tab.create; chain-broke+dead → restart sạch cùng workspace, cycles về 0). **Bug thật**: guard idempotent cũ chỉ kiểm `status==="running"` ⇒ `start` sau `done` (pane còn sống với đáp án cuối) tạo tab MỚI, pane cũ mồ côi trong `⚙ <label>` — mỗi restart +1 tab rác. Fix: từ chối khi pane mình còn sống bất kể status, message nêu status + "stop it first" (chọn từ chối thay vì tự đóng: pane done chứa đáp án owner có thể đang đọc). Trung thực lệch spec nhỏ: assertion test idempotent cũ đổi theo message mới (spec viết "giữ nguyên" — hành vi giữ nguyên, chữ đổi). Docs: "Tự vận hành" viết lại theo thực tại (driver = plugin shipped C9, devloopd retired — inactive/disabled đo được, pause/resume/stop actions, **giao thức no-op khi backlog trống** — bằng chứng 3 vòng liên tiếp phải săn theme/đòi nợ). AUTO.md không đụng. Live regression: chính chuỗi dev-loop chạy trên plugin bản C11 (nudge vòng này = event hook sống) |
