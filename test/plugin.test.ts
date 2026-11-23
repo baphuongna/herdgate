@@ -6,7 +6,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync, writeFileSync, chmodSync, mkdtempSync, mkdirSync, rmSync, existsSync } from "node:fs";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { promisify } from "node:util";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -15,6 +16,7 @@ const run = promisify(execFile);
 const PLUGIN = new URL("../plugin/", import.meta.url).pathname;
 const MANIFEST = readFileSync(join(PLUGIN, "herdr-plugin.toml"), "utf8");
 const INDEX = join(PLUGIN, "server/index.mjs");
+import { WebSocketServer } from "ws";
 
 /** A fake `herdr` binary: stdout of `api snapshot` is the given JSON. */
 function fakeHerdr(dir: string, snapshot: unknown): string {
@@ -193,4 +195,15 @@ test("plugin: stop with nothing running says so, and clears a stale pid file", a
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("wedge guard: a hung attempt is abandoned, the chain keeps ticking (2026-11-23 laptop wedge)", async () => {
+  const { withTimeout } = (await import(new URL("../plugin/server/common.mjs", import.meta.url).href)) as { withTimeout: <T>(p: Promise<T>, ms: number, label?: string) => Promise<T> };
+  await assert.rejects(withTimeout(new Promise(() => {}), 40, "wedged"), (e: Error & { kind?: string }) => e.kind === "timeout_guard" && /timed out/.test(e.message));
+  assert.equal(await withTimeout(Promise.resolve(7), 100, "fast"), 7, "a healthy attempt passes through untouched");
+  // Source tripwire: the tick and the single-flight snapshot must both be guarded —
+  // one bare `await publish()` is exactly how 85 minutes of silence happened.
+  const src = readFileSync(INDEX, "utf8");
+  assert.match(src, /withTimeout\(publish\(wsRef\)/, "the tick's publish is guarded");
+  assert.match(src, /withTimeout\(snapshotPayload\(\)/, "the shared snapshot is guarded");
 });

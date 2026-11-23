@@ -268,3 +268,22 @@ esac
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("shell manager: Windows finds Git-for-Windows sh; a missing shell fails loudly, never code 1 (live laptop 2026-11-23)", async () => {
+  const { defaultShell, openShellManager } = (await import("../plugin/server/mobile-tui-stream.mjs")) as {
+    defaultShell: (platform?: string, env?: Record<string, string | undefined>, io?: { exists?: (p: string) => boolean }) => string | null;
+    openShellManager: (opts?: { shell?: string | null }) => { execute: (c: string) => Promise<{ stdout: Buffer; code: number }> };
+  };
+  assert.equal(defaultShell("linux", {}), "/bin/sh", "posix default unchanged");
+  assert.equal(defaultShell("linux", { HERDR_SHELL: "/opt/sh" }), "/opt/sh", "HERDR_SHELL always wins");
+  assert.equal(defaultShell("win32", { HERDR_SHELL: "C:\\tools\\sh.exe" }), "C:\\tools\\sh.exe");
+  const winJoin = (...parts: string[]) => parts.join("\\"); // path.join's separator follows the HOST; the candidate shape must not
+  // path.join's separator follows the HOST OS — compare on normalized slashes.
+  const found = defaultShell("win32", { ProgramFiles: "C:\\PF" }, { exists: () => true });
+  assert.equal((found ?? "").replaceAll("\\", "/"), "C:/PF/Git/bin/sh.exe", "auto-detect the common Git roots");
+  assert.equal(defaultShell("win32", { ProgramFiles: "C:\\PF", "ProgramFiles(x86)": "C:\\PF86" }, { exists: () => false }), null, "nothing found → null, not a bogus /bin/sh");
+  // The live failure mode: /bin/sh does not exist on Windows, every `herdr pane …`
+  // silently "exited 1". A null shell must reject with guidance instead.
+  const m = openShellManager({ shell: null });
+  await assert.rejects(m.execute("true"), (e: Error & { kind?: string }) => e.kind === "no_shell" && /HERDR_SHELL|Git for Windows/.test(e.message));
+});

@@ -1,10 +1,30 @@
 // Native Herdr terminal controller. Never interprets a shell command. --takeover makes the
 // latest viewer own the stream: Herdr allows one controller per terminal, and this way a
 // reconnect or a second viewer (phone, desktop) replaces the old one instead of failing.
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { execFile, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 
 const maxLine = 1024 * 1024;
+
+/** The persistent shell must be a real POSIX sh — the framing (`{ cmd ; }
+ *  </dev/null; printf …`) is sh syntax. On Windows that means Git-for-Windows'
+ *  sh.exe; auto-detect the common install roots, HERDR_SHELL wins. Return null
+ *  when nothing qualifies so the manager can fail loudly instead of exiting
+ *  code 1 on every `herdr pane …` (the live laptop failure: /bin/sh does not
+ *  exist there, so every mobile command died as "exited 1"). */
+export function defaultShell(platform = process.platform, env = process.env, io = {}) {
+  if (env.HERDR_SHELL) return env.HERDR_SHELL;
+  if (platform !== "win32") return "/bin/sh";
+  const exists = io.exists ?? ((p) => existsSync(p));
+  const roots = [env.ProgramFiles, env["ProgramFiles(x86)"], env.LOCALAPPDATA ? join(env.LOCALAPPDATA, "Programs") : null].filter(Boolean);
+  for (const root of roots) {
+    const candidate = join(root, "Git", "bin", "sh.exe");
+    if (exists(candidate)) return candidate;
+  }
+  return null;
+}
 
 export async function openTerminal(bin, id, cols, rows) {
   const child = spawn(bin, ["terminal", "session", "control", id, "--takeover", "--cols", String(cols), "--rows", String(rows)], {
@@ -94,12 +114,16 @@ const newMarker = () => "HC_" + randomBytes(16).toString("hex");
  *  and only an explicit reinit() may open the next generation. */
 export function openShellManager({
   exec,
-  shell = process.env.HERDR_SHELL || "/bin/sh",
+  shell = defaultShell(),
   probeCommand = "true",
   timeoutMs = 4_000,
   limitBytes = 8 * 1024 * 1024,
 } = {}) {
+  const noShell = shell == null
+    ? Object.assign(new Error("no POSIX shell found: install Git for Windows or set HERDR_SHELL"), { kind: "no_shell" })
+    : null;
   const fallbackRun = exec || ((command) => new Promise((resolve) => {
+    if (noShell) throw noShell;
     execFile(shell, ["-c", command], { timeout: timeoutMs, maxBuffer: 512 * 1024, windowsHide: true }, (err, stdout) => {
       resolve({ stdout: Buffer.from(stdout ?? ""), code: err && typeof err.code === "number" ? err.code : err ? 1 : 0 });
     });
@@ -131,6 +155,7 @@ export function openShellManager({
   };
 
   const open = () => {
+    if (noShell) { state = "dead"; return; }
     stats.shells++;
     state = "opening";
     const kid = spawn(shell, [], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
@@ -186,8 +211,10 @@ export function openShellManager({
 
   return {
     execute(command) {
-      if (state === "dead") { stats.fallbackRequests++; return fallbackRun(command); }
       if (state === "idle") open();
+      // Covers both a previously failed generation and open()'s no-shell guard:
+      // never queue a request no shell will ever answer (that would hang).
+      if (state === "dead") { stats.fallbackRequests++; return fallbackRun(command); }
       const req = { command, marker: newMarker(), written: false };
       req.delimiter = Buffer.from(`\n${req.marker} `);
       const promise = new Promise((resolve, reject) => { req.resolve = resolve; req.reject = reject; });

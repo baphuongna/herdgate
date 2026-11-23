@@ -13,7 +13,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, statSync, r
 import { join, dirname } from "node:path";
 import { hostname, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead, pkgVersion, nextPublishDelay } from "./common.mjs";
+import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead, pkgVersion, nextPublishDelay, withTimeout } from "./common.mjs";
 import { gitRead, diffRepoDir } from "./git-safe.mjs";
 import { createSshBridge } from "./ssh.mjs";
 import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
@@ -407,6 +407,9 @@ async function publisherLoop() {
   const PUBLISH_MS = Math.max(2_000, Number.parseInt(process.env.HERDGATE_PUBLISH_MS ?? "30000", 10) || 30000);
   const PUBLISH_MAX_MS = Math.max(PUBLISH_MS, Number.parseInt(process.env.HERDGATE_PUBLISH_MAX_MS ?? "60000", 10) || 60000);
   const SNAPSHOT_FRESH_MS = Math.max(0, Number.parseInt(process.env.HERDGATE_SNAPSHOT_FRESH_MS ?? "2000", 10) || 0);
+  // The wedge guard (2026-11-23): one hung tick must not kill the adaptive
+  // chain — abandon the attempt, log it, keep ticking with a fresh one.
+  const PUBLISH_GUARD_MS = Math.max(5_000, Number.parseInt(process.env.HERDGATE_PUBLISH_GUARD_MS ?? "20000", 10) || 20000);
   let snapshotInflight = null;
   let snapshotCached = null; // { payload, at }
   // Adaptive cadence state (nextPublishDelay decides every tick): busy agents
@@ -443,7 +446,12 @@ async function publisherLoop() {
    * share one `herdr api snapshot` spawn instead of stampeding. */
   const snapshotOnce = () => {
     if (!snapshotInflight) {
-      snapshotInflight = snapshotPayload().finally(() => { snapshotInflight = null; });
+      snapshotInflight = withTimeout(snapshotPayload(), PUBLISH_GUARD_MS, "snapshot")
+        .catch((e) => {
+          if (e?.kind === "timeout_guard") { log(`snapshot wedged — ${e.message}`); return null; }
+          throw e;
+        })
+        .finally(() => { snapshotInflight = null; });
     }
     return snapshotInflight;
   };
@@ -560,7 +568,8 @@ async function publisherLoop() {
     const delay = nextPublishDelay({ baseMs: PUBLISH_MS, maxMs: PUBLISH_MAX_MS, busy: cadenceBusy, quietStreak, changed: cadenceChanged });
     timer = setTimeout(() => {
       void (async () => {
-        await publish(wsRef);
+        await withTimeout(publish(wsRef), PUBLISH_GUARD_MS, "publish tick")
+          .catch((e) => { if (e?.kind === "timeout_guard") log(`publish tick wedged — ${e.message}`); else log(`publish failed: ${e?.message ?? e}`); });
         quietStreak = !cadenceBusy && !cadenceChanged ? quietStreak + 1 : 0;
         scheduleNext();
       })();

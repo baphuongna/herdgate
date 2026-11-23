@@ -7,6 +7,25 @@ import { promisify } from "node:util";
 
 const run = promisify(execFile);
 
+/** A hard upper bound for any single awaited step in a publish chain. The
+ *  2026-11-23 laptop wedge: one publish tick hung forever (snapshot spawn or
+ *  a send awaiting something that never came) and, because the adaptive chain
+ *  schedules the next tick only after `await publish()`, 85 minutes passed
+ *  with zero state on the gate while the SSH relay stayed alive. This guard
+ *  abandons the attempt (the hung promise leaks — that is fine and logged) so
+ *  the chain keeps ticking with a fresh attempt. */
+export function withTimeout(promise, ms, label = "operation") {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      // No unref: the guard must fire even when the raced promise is the only
+      // thing alive — an unref'd timer let the event loop exit first in tests,
+      // and in the publisher a 20s held timer is harmless (one per tick, self-clearing).
+      setTimeout(() => reject(Object.assign(new Error(`${label} timed out after ${ms}ms — abandoning this attempt`), { kind: "timeout_guard" })), ms);
+    }),
+  ]);
+}
+
 /** The version the hello advertises: the shipped package's own version, read
  *  from the package.json two levels up (same path in the repo and in the npm
  *  tarball). Never a hard-coded literal — stale ads are worse than none. */
