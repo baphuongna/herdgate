@@ -5,7 +5,7 @@
 // ever nudged (user panes exit silently). A settle (idle|done) sends the
 // next-cycle prompt into the same pane; a nudge is rate-limited to one per
 // minute — an agent flip-flopping statuses must not double-drive the loop.
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
@@ -32,6 +32,11 @@ function nudge(text) {
 }
 
 try {
+  // Interactive-work brake: the same flag the retired systemd driver used.
+  if (existsSync(join(homedir(), "source", "herdgate", "docs", "DEV-LOOP", "PAUSE"))) {
+    log("paused (PAUSE flag) — no nudge");
+    process.exit(0);
+  }
   const payload = JSON.parse(process.env.HERDR_PLUGIN_EVENT_JSON ?? "{}");
   const event = payload?.event ?? "";
   const data = payload?.data && typeof payload.data === "object" ? payload.data : {};
