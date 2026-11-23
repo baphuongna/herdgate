@@ -1,6 +1,6 @@
 id = "dev.herdgate.mirror"
 name = "herdgate-mirror"
-version = "0.9.47"
+version = "0.10.0"
 min_herdr_version = "0.9.0"
 description = "Mirror a herdgate room's fleet into this Herdr: a sidebar panel of agents, and per-pane terminal mirrors (typing needs an act grant)."
 platforms = ["linux", "macos", "windows"]
