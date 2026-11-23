@@ -1142,8 +1142,9 @@ process.stdin.on("data", (d) => {
   process.exit(0);
 });
 `);
-    const r = run(dirB, { cmd: ["deferred-nudge", "--id", c23Id], bin: flaky }, {
+    const r = run(dirB, { cmd: ["deferred-nudge", "--id", c23Id] }, {
       config: goodConfig(dirB),
+      bin: flaky,
       state: { paneId: "wB:p1", status: "running", armed: true, cycles: 3, noopStreak: 0, lastNudgeAt: Date.now() - 60_000, deferredUntil: Date.now() - 500, deferredId: c23Id },
     });
     assert.equal(r.code, 0, r.stderr);

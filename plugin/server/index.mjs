@@ -950,6 +950,10 @@ async function publisherLoop() {
                   pausedBy: typeof st.pausedBy === "string" ? st.pausedBy : null,
                   cycles: Number(st.cycles) || 0,
                   lastNudgeAt: Number(st.lastNudgeAt) > 0 ? Number(st.lastNudgeAt) : null,
+                  // C23: when the next deferred nudge fires (epoch ms | null) —
+                  // additive only; a cooldown-blocked settle now schedules one
+                  // instead of being dropped, and this is how a phone sees it.
+                  deferredUntil: Number(st.deferredUntil) > 0 ? Number(st.deferredUntil) : null,
                   logTail };
               }
             }
