@@ -149,8 +149,21 @@ test("client: the roster shows the publisher build when the room reports it", ()
   const src = codeOnly(readFileSync(join(WEB, "app.js"), "utf8"));
   // The devices block fetches /v1/devices (account lane, no new op); when the
   // gate answers with host info, one muted line names the running build.
-  assert.match(src, /host\?\.version/, "the roster line renders host?.version");
+  assert.match(src, /host\.version/, "the roster line renders host.version");
   assert.match(src, /v1\/devices/, "still the same roster fetch — no new wire surface");
+});
+
+test("client: the roster separates host-alive from device liveness", () => {
+  const src = codeOnly(readFileSync(join(WEB, "app.js"), "utf8"));
+  // Room rows name whose presence they report: the publisher's, not a bare
+  // "online" an operator can read as "the machine is connected" (2026-11-23:
+  // 0/6 live was read as "laptop disconnected" while the publisher was up).
+  assert.match(src, /host online/, "room rows say 'host online'");
+  // The devices block shows the host's own aliveness where the owner looks.
+  assert.match(src, /host\.connected/, "the roster line renders host.connected");
+  // Device liveness names its leg(s): web and ssh are different lanes, and an
+  // ssh-only device (the machine lane) is live too.
+  assert.match(src, /d\.legs/, "device lines render the legs they are live on");
 });
 
 test("client: review.send closes the loop — the phone learns when the agent is done", () => {

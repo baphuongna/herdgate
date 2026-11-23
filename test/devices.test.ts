@@ -83,7 +83,7 @@ test("devices: roster lists pairs; revoke kills access and the socket", async ()
     });
     const noInfo = await agentWs();
     const without = (await (await fetch(`${base}/v1/devices?room=${roomId}`, { headers: { authorization: `Bearer ${ACCOUNT}` } })).json()) as { host?: unknown };
-    assert.equal(without.host, undefined, "a no-info hello clears stale info — honest absence, not stale data");
+    assert.deepEqual(without.host, { connected: true }, "a no-info hello clears stale BUILD info — honest absence; aliveness is its own axis and survives");
     noInfo.close();
 
     const withInfo = await agentWs({ name: "new-build", version: "9.9.9" });

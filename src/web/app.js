@@ -338,7 +338,10 @@ function renderRooms() {
     const node = $("room-row").content.cloneNode(true);
     node.querySelector(".name").textContent = room.name || room.roomId;
     const meta = [];
-    meta.push(room.online ? "online" : "offline");
+    // Presence here is the PUBLISHER's websocket — name it, so nobody reads a
+    // room's "offline" as "the machine is disconnected" while its ssh-lane
+    // devices quietly carry traffic (the 2026-11-23 misread).
+    meta.push(room.online ? "host online" : "host offline");
     const scope = pairs.get(room.roomId)?.scope;
     if (scope) meta.push(`paired · ${scope}`);
     node.querySelector(".meta").textContent = meta.join(" · ");
@@ -2277,16 +2280,24 @@ function renderRoomControls(box) {
         const rosterJson = await r.json();
         const devices = rosterJson.devices ?? [];
         roster.replaceChildren();
-        // The publisher's own hello info, when the room reports it: one muted
-        // line — "which build is this machine running" without driving it.
-        if (rosterJson.host?.version) {
-          roster.append(note(`publisher ${rosterJson.host.version}${rosterJson.host.name ? ` · ${rosterJson.host.name}` : ""}`, "muted"));
+        // The publisher's own hello info AND aliveness, when the room reports
+        // it: "which build, is it connected" — the thing the operator actually
+        // came to check — right above the device dots that say something else.
+        if (rosterJson.host) {
+          const hostBits = [`publisher ${rosterJson.host.version ?? "?"}`];
+          if (rosterJson.host.name) hostBits.push(rosterJson.host.name);
+          hostBits.push(rosterJson.host.connected ? "host connected" : "host disconnected");
+          roster.append(note(hostBits.join(" · "), "muted"));
         }
         for (const d of devices) {
           const row = document.createElement("div");
           row.className = "keyrow";
           const pre = document.createElement("pre");
-          pre.textContent = `${d.name}  ·  ${d.scope}${d.connected ? "  ·  live" : ""}  ·  ${d.keys} key(s)  ·  ${d.id}${d.id === state.deviceId ? "  (this browser)" : ""}`;
+          // Liveness names its leg(s): web (this PWA lane) and ssh (machine
+          // lane, probes) are different roads to the same room.
+          const legs = Array.isArray(d.legs) ? d.legs : (d.connected ? ["web"] : []);
+          const live = legs.length ? `  ·  live(${legs.join("+")})` : "";
+          pre.textContent = `${d.name}  ·  ${d.scope}${live}  ·  ${d.keys} key(s)  ·  ${d.id}${d.id === state.deviceId ? "  (this browser)" : ""}`;
           row.append(pre);
           const rm = document.createElement("button");
           rm.type = "button";

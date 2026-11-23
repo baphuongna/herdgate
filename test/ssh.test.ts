@@ -308,6 +308,74 @@ test("translateBootstrap maps herdr-core probes to hc, refuses shell tricks", as
   assert.equal(translateBootstrap(`hc connect`), null); // not a wrapper — normal path
 });
 
+test("ssh leg: an authenticated connection is live in the roster — and the roster separates host-alive", async () => {
+  // Caught live on 2026-11-23: an ssh device (the herdr machine lane, ssh probes)
+  // never showed `connected` — the roster only counted the PWA websocket leg —
+  // and the operator reading 0/6 live concluded "laptop disconnected" while the
+  // publisher was connected with fresh hostInfo. Presence must count the ssh
+  // leg too, and the roster must carry the host's own aliveness separately.
+  const dir = mkdtempSync(join(tmpdir(), "herdgate-ssh-presence-"));
+  const ACCOUNT = "ssh-presence-tok";
+  const adapter: AgentAdapter = {
+    info: () => ({ name: "ssh-host", version: "0.0.0" }),
+    onFrame: () => {},
+    onDevices: () => {},
+    onPairAsk: (ask: PairAsk) => ask.scope === "act",
+  };
+  const cloud = await startCloud({
+    accounts: [{ id: "a1", name: "owner", token: ACCOUNT }],
+    log: () => {},
+    ssh: { port: 0, keyPath: join(dir, "hostkey.json") },
+  });
+  const base = `http://127.0.0.1:${cloud.port}`;
+  try {
+    const code = (await fetch(`${base}/v1/agent/code`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "presence-host" }) }).then((r) => r.json())) as { code: string };
+    await fetch(`${base}/v1/agent/approve`, { method: "POST", headers: { authorization: `Bearer ${ACCOUNT}`, "content-type": "application/json" }, body: JSON.stringify({ code: code.code }) });
+    const st = (await fetch(`${base}/v1/agent/code/${code.code}/status`).then((r) => r.json())) as { roomToken?: string };
+    const agent = new HerdGateAgent({ endpoint: base.replace("http", "ws") + "/v1/agent/ws", roomToken: st.roomToken!, adapter, log: () => {} });
+    agent.start();
+    await agent.firstHello;
+    const roomId = await roomIdOf(base, ACCOUNT);
+    const dev = await pairDevice(base, ACCOUNT, roomId, "ssh-probe", "read");
+    dev.sock.close(); // the pairing websocket is itself a live leg — we are testing the ssh one
+    await waitFor(300); // let the close reach the gate before asserting the baseline
+
+    const roster = async (): Promise<{ host?: { connected?: boolean }; devices: { id: string; connected: boolean; legs?: string[] }[] }> =>
+      (await fetch(`${base}/v1/devices?room=${roomId}`, { headers: { authorization: `Bearer ${ACCOUNT}` } }).then((r) => r.json()));
+
+    // Before any connection: not live, but the HOST is online — two different axes.
+    const r0 = await roster();
+    assert.equal(r0.devices.find((d) => d.id === dev.id)?.connected, false, "no connection, not live");
+    assert.equal(r0.host?.connected, true, "the roster carries publisher-alive (agent ws) separately");
+
+    // An authenticated ssh connection — held open, no exec needed.
+    const conn = new Client();
+    const ready = new Promise<void>((res, rej) => {
+      const t = setTimeout(() => rej(new Error("ssh connect timeout")), 8_000);
+      conn.on("ready", () => { clearTimeout(t); res(); }).on("error", rej);
+    });
+    conn.connect({ host: "127.0.0.1", port: cloud.ssh!.port!, username: dev.id, password: dev.secret, readyTimeout: 8_000 });
+    await ready;
+
+    const r1 = await roster();
+    const mine = r1.devices.find((d) => d.id === dev.id)!;
+    assert.equal(mine.connected, true, "an authenticated ssh connection counts as live");
+    assert.ok(mine.legs?.includes("ssh"), `legs names the ssh lane: ${JSON.stringify(mine.legs)}`);
+    assert.equal(r1.host?.connected, true);
+
+    conn.end();
+    await waitFor(400);
+    const r2 = await roster();
+    assert.equal(r2.devices.find((d) => d.id === dev.id)?.connected, false, "closing the ssh connection flips live off");
+    assert.equal(r2.host?.connected, true, "host liveness is its own axis — it never moved");
+
+    await agent.stop();
+  } finally {
+    await cloud.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("ssh leg: publickey auth — register a key, log in without a password", async () => {
   const dir = mkdtempSync(join(tmpdir(), "herdgate-sshkey-"));
   process.env.FAKE_HC_LOG = join(dir, "hc-methods.log");

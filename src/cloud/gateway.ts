@@ -125,6 +125,11 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
 
   const agentByRoom = new Map<string, AgentConn>(); // roomId → conn
   const deviceConns = new Set<DeviceConn>();
+  // Devices with >=1 authenticated ssh connection (the sshd leg reports
+  // presence): the roster's `connected` counts BOTH legs — a machine-lane
+  // device that never opens a PWA websocket is still live (2026-11-23: it
+  // never showed, and 0/6 live was misread as "laptop disconnected").
+  const sshLive = new Set<string>();
   const pendingPairs = new Map<string, { host: WebSocket; owner: WebSocket; finish: (ok: boolean, reason?: string) => void }>();
   const cancelPairs = (ws: WebSocket, side: "host" | "owner", reason?: string): void => {
     for (const pair of pendingPairs.values()) if (pair[side] === ws) pair.finish(false, reason);
@@ -323,7 +328,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       id: d.id,
       name: d.name,
       scope: d.scope,
-      connected: [...deviceConns].some((c) => c.device?.id === d.id),
+      connected: [...deviceConns].some((c) => c.device?.id === d.id) || sshLive.has(d.id),
     }));
 
   const pushRoomUpdate = (roomId: string): void => {
@@ -989,10 +994,21 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       const live = new Set<string>();
       for (const c of deviceConns) if (c.device) live.add(c.device.id);
       return json(res, 200, {
-        host: room.hostInfo ? { name: room.hostInfo.name, version: room.hostInfo.version } : undefined,
+        // The roster's host block separates publisher-alive (the agent's live
+        // websocket) from device liveness below — the two axes were conflated
+        // once too often in an incident (2026-11-23).
+        host: room.hostInfo
+          ? { name: room.hostInfo.name, version: room.hostInfo.version, connected: agentByRoom.has(room.id) }
+          : { connected: agentByRoom.has(room.id) },
         devices: state.devices
           .filter((d) => d.roomId === room.id)
-          .map((d) => ({ id: d.id, name: d.name, scope: d.scope, connected: live.has(d.id), keys: (d.sshKeys ?? []).length, created: d.created, push: !!d.push, payload: canPayload(d.push) })),
+          .map((d) => {
+            const legs = [
+              ...(live.has(d.id) ? ["web"] : []),
+              ...(sshLive.has(d.id) ? ["ssh"] : []),
+            ];
+            return { id: d.id, name: d.name, scope: d.scope, connected: legs.length > 0, legs, keys: (d.sshKeys ?? []).length, created: d.created, push: !!d.push, payload: canPayload(d.push) };
+          }),
       });
     }
     if (path === "/v1/device/revoke") {
@@ -1109,6 +1125,15 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
               return true;
             },
             deviceOnline: (deviceId) => [...deviceConns].some((c) => c.device?.id === deviceId),
+            onPresence: (deviceId, online) => {
+              const had = sshLive.has(deviceId);
+              if (online) sshLive.add(deviceId);
+              else sshLive.delete(deviceId);
+              if (had !== online) {
+                const roomId = state.deviceById(deviceId)?.roomId;
+                if (roomId) pushRoomUpdate(roomId);
+              }
+            },
           }).catch((e) => {
             log(`ssh: failed to start (${e instanceof Error ? e.message : String(e)})`);
             return null;

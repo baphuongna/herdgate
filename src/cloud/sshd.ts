@@ -123,6 +123,9 @@ export interface SshDeps {
   sendAsDevice(deviceId: string, payload: Record<string, unknown>): boolean;
   /** Gateway: is that device's socket open right now? */
   deviceOnline(deviceId: string): boolean;
+  /** Gateway: an ssh connection authenticated (or the last one closed) for this
+   *  device — the roster counts the ssh leg as device liveness too. */
+  onPresence?: (deviceId: string, online: boolean) => void;
 }
 
 export interface SshHandle {
@@ -196,8 +199,24 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
     deadline: NodeJS.Timeout | null;
     deviceId?: string;
     fingerprint?: string;
+    /** Auth succeeded and this peer is counted in sshPresence — close must decrement. */
+    counted?: boolean;
   }
   const peers = new Map<Transport, Peer>();
+  // Authenticated-connection refcount per device: presence is ">=1 live ssh
+  // connection", so several concurrent sessions (or a reconnect overlap)
+  // stay online until the LAST one closes. The roster used to count only the
+  // PWA websocket leg — ssh-only devices (the machine lane) never showed live
+  // (caught live 2026-11-23: an operator read 0/6 as "laptop disconnected").
+  const sshPresence = new Map<string, number>();
+  const bumpPresence = (deviceId: string, delta: number): void => {
+    const n = (sshPresence.get(deviceId) ?? 0) + delta;
+    const was = sshPresence.has(deviceId);
+    if (n <= 0) sshPresence.delete(deviceId);
+    else sshPresence.set(deviceId, n);
+    const now = sshPresence.has(deviceId);
+    if (was !== now) deps.onPresence?.(deviceId, now);
+  };
   const authTimeoutMs = deps.config.authTimeoutMs ?? 12_000;
 
   const channelKey = (deviceId: string, ch: string): string => `${deviceId}:${ch}`;
@@ -239,6 +258,7 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
         }
         peer.deviceId = rec.id;
         peer.fingerprint = sshKeyFingerprint(entry.b64);
+        if (!peer.counted) { peer.counted = true; bumpPresence(rec.id, 1); }
         deps.log(`ssh: device ${rec.id} (${rec.name}, ${rec.scope}) authenticated with key ${peer.fingerprint} from ${ip}`);
         return ctx.accept();
       }
@@ -254,6 +274,7 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
       }
       peer.deviceId = ok.id;
       peer.fingerprint = undefined;
+      if (!peer.counted) { peer.counted = true; bumpPresence(ok.id, 1); }
       deps.log(`ssh: device ${ok.id} (${ok.name}, ${ok.scope}) authenticated from ${ip}`);
       ctx.accept();
     });
@@ -340,6 +361,7 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
     peers.set(socket, peer);
     socket.once("close", () => {
       if (peer.deadline) clearTimeout(peer.deadline);
+      if (peer.counted && peer.deviceId) bumpPresence(peer.deviceId, -1);
       peers.delete(socket);
     });
     socket.on("error", () => socket.destroy());
