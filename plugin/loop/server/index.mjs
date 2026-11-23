@@ -118,7 +118,13 @@ function cmdStart() {
   const cfgErr = cfg ? validateConfig(cfg) : "loop.json not found — write it in the plugin CONFIG_DIR first";
   if (cfgErr || !cfg) return die(2, cfgErr);
   const s = loadState();
-  if (s.paneId && s.status === "running" && paneAlive(s.paneId)) return die(1, `already running: pane ${s.paneId} (${s.cycles ?? 0} cycles) — stop it first`);
+  // A live pane we still own blocks a new run — whatever the status. "done"
+  // leaves the final answer on screen for the owner to read; restarting on
+  // top of it used to orphan that pane (its tab stayed open forever, events
+  // swallowed by the foreign check). Refuse and name the way out: stop first.
+  if (s.paneId && paneAlive(s.paneId)) {
+    return die(1, `pane ${s.paneId} still open (status: ${s.status ?? "?"}${s.cycles ? `, ${s.cycles} cycles` : ""}) — stop it first`);
+  }
 
   // Reuse our workspace by label; create it only if missing.
   const label = wsLabel(cfg.label);

@@ -269,8 +269,46 @@ test("loop start: boots the pane with a shell-neutral pi command, born in cfg.cw
     // Idempotent while alive: one pane.list, then refuses.
     const again = run(dir, { cmd: ["start"], stubReplies: { "pane.list": { result: { panes: [{ pane_id: "w7:p3" }] } } } }, { config: goodConfig(dir), state: st });
     assert.equal(again.code, 1);
-    assert.match(again.stderr, /already running/);
+    assert.match(again.stderr, /stop/, "running or done, the way out is the same: stop first");
     assert.equal(again.calls.length, 1, "the refusal costs exactly one pane.list");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop start: a live pane from a finished run is not garbage — refuse until stopped", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe prompt");
+    const r = run(dir, { cmd: ["start"], stubReplies: { "pane.list": { result: { panes: [{ pane_id: "w7:p3" }] } } } }, {
+      config: goodConfig(dir),
+      // maxCycles reached, but the pane (and its final answer) is still on screen.
+      state: { paneId: "w7:p3", workspaceId: "w7", status: "done", cycles: 2, lastNudgeAt: 0 },
+    });
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /status: done/, "the refusal names the state it saw");
+    assert.match(r.stderr, /stop/, "the message must name the way out");
+    assert.deepEqual(r.calls.map((c) => c.split(" ")[0]), ["pane.list"], "the refusal costs exactly one pane.list — no tab.create, no boot text");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop start: a broken chain with a dead pane restarts cleanly", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe prompt");
+    const replies = {
+      "pane.list": { result: { panes: [] } }, // the old pane is gone
+      "workspace.list": { result: { workspaces: [{ workspace_id: "w7", label: "⚙ probe" }] } },
+      "tab.create": { result: { root_pane: { pane_id: "w7:p9" } } },
+      "pane.send_text": { result: { type: "ok" } },
+    };
+    const r = run(dir, { cmd: ["start"], stubReplies: replies }, {
+      config: goodConfig(dir),
+      state: { paneId: "w7:p3", workspaceId: "w7", status: "chain-broke", cycles: 2, lastNudgeAt: 0 },
+    });
+    assert.equal(r.code, 0, r.stderr);
+    const st = JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8"));
+    assert.equal(st.paneId, "w7:p9", "a fresh pane takes over the same owned workspace");
+    assert.equal(st.status, "running");
+    assert.equal(st.cycles, 0, "a restart counts from zero");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
