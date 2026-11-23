@@ -7,8 +7,8 @@
  * implementation can replace it without touching the gateway.
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import type { Scope } from "../protocol/envelope.ts";
 import { randomId, randomToken, sameSecret, sha256Hex } from "./util.ts";
 
@@ -63,7 +63,31 @@ export class State {
   constructor(accounts: Account[], path?: string) {
     this.accounts = accounts;
     this.#path = path ?? null;
-    if (this.#path) this.#load();
+    if (this.#path) {
+      this.#load();
+      this.#sweepOrphanedTmp();
+    }
+  }
+
+  /** #save() is tmp+rename; a kill between the two lines strands a
+   *  `<file>.tmp-<rand>` forever (observed live: a 3-day-old orphan in the
+   *  home gate's state dir). Single-instance per state dir (README), so any
+   * tmp left at OUR exact prefix when we boot is debris from a dead run —
+   * sweep it. Exact-prefix match only: strangers' files are not ours. */
+  #sweepOrphanedTmp(): void {
+    const dir = dirname(this.#path!);
+    const prefix = `${basename(this.#path!)}.tmp-`;
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return; // no dir yet — nothing to sweep
+    }
+    for (const name of names) {
+      if (name.startsWith(prefix)) {
+        try { rmSync(join(dir, name), { force: true }); } catch { /* best effort */ }
+      }
+    }
   }
 
   #load(): void {
