@@ -476,6 +476,9 @@ async function publisherLoop() {
    *  is the honest baseline: every settle records HEAD; `turn` diffs the two
    *  newest anchors = exactly the last settled agent turn. */
   const gitAnchorsFile = () => (D.statePath ? join(D.statePath, "..", "git-anchors.json") : "");
+  // Phone-opened tabs (ownership map): a device may close only the tabs it
+  // created — the user's own tabs are never touchable from a phone.
+  const phoneTabsFile = () => (D.statePath ? join(D.statePath, "..", "phone-tabs.json") : "");
   const recordGitAnchor = async (reason) => {
     const file = gitAnchorsFile();
     if (!file) return;
@@ -1236,9 +1239,61 @@ async function publisherLoop() {
           log(`review: ${m.device} sent ${comments.length} comment(s) as job ${jobId}`);
           return void replyTo({ op: "review.sent", id: jobId, state: "queued", count: comments.length });
         }
+        if (op === "tab.create" || op === "tab.close") {
+          // ACT — phone-opened tabs, with ownership: the publisher remembers
+          // which device opened which tab (state file, capped) and a device
+          // may only close its own. Nothing else on this Herdr is touchable.
+          if (devices.find((d) => d.id === m.device)?.scope !== "act") {
+            return void replyTo({ op: "error", code: "requires-act", message: `${op} needs an act device` });
+          }
+          const map = readState(phoneTabsFile());
+          const tabs = Array.isArray(map.tabs) ? map.tabs : [];
+          if (op === "tab.create") {
+            const label = typeof payload.label === "string" && payload.label.trim() ? payload.label : "phone";
+            // No control characters — the label becomes a tab title on a real screen.
+            if (label.length > 64 || /[\u0000-\u001f\u007f]/.test(label)) {
+              return void replyTo({ op: "error", code: "bad-label", message: "tab.create label: 1..64 chars, no control characters" });
+            }
+            try {
+              const { stdout } = await run(D.herdrBin, ["tab", "create", "--label", label], { timeout: 8_000 });
+              const parsed = JSON.parse(stdout);
+              const tabId = parsed?.result?.tab?.tab_id;
+              const paneId = parsed?.result?.root_pane?.pane_id;
+              if (typeof tabId !== "string" || typeof paneId !== "string") throw new Error("unexpected tab create output");
+              tabs.push({ tabId, device: m.device, at: Date.now() });
+              while (tabs.length > 64) tabs.shift(); // FIFO — a map, not a ledger
+              writeState(phoneTabsFile(), { v: 1, tabs });
+              log(`tab: ${m.device} created ${tabId} (pane ${paneId}) label ${JSON.stringify(label)}`);
+              return void replyTo({ op: "tab.created", tabId, paneId, label });
+            } catch (e) {
+              return void replyTo({ op: "error", code: "herdr", message: `tab.create failed: ${e instanceof Error ? e.message : String(e)}` });
+            }
+          }
+          const tabId = typeof payload.tabId === "string" ? payload.tabId : "";
+          if (!/^[A-Za-z0-9_:.-]{1,64}$/.test(tabId)) {
+            return void replyTo({ op: "error", code: "bad-tab", message: "tab.close needs a tab id" });
+          }
+          const mine = tabs.find((t) => t && t.tabId === tabId && t.device === m.device);
+          if (!mine) {
+            return void replyTo({ op: "error", code: "not-yours", message: "that tab was not opened by this device" });
+          }
+          try {
+            await run(D.herdrBin, ["tab", "close", tabId], { timeout: 8_000 });
+            writeState(phoneTabsFile(), { v: 1, tabs: tabs.filter((t) => t !== mine) });
+            log(`tab: ${m.device} closed ${tabId}`);
+            return void replyTo({ op: "tab.closed", tabId });
+          } catch (e) {
+            return void replyTo({ op: "error", code: "herdr", message: `tab.close failed: ${e instanceof Error ? e.message : String(e)}` });
+          }
+        }
         if (op === "pane.focus") {
-          // Focus a pane on the host's Herdr. Fire-and-forget spawn, never awaited:
-          // a phone must not hang on a TUI command. argv comes from the --help probe.
+          // ACT — steering the user's screen is an intervention; read devices
+          // must not be able to yank focus. Fire-and-forget spawn, never
+          // awaited: a phone must not hang on a TUI command. argv comes from
+          // the --help probe.
+          if (devices.find((d) => d.id === m.device)?.scope !== "act") {
+            return void replyTo({ op: "error", code: "requires-act", message: "pane.focus needs an act device" });
+          }
           const paneId = typeof payload.paneId === "string" ? payload.paneId : "";
           if (!/^[A-Za-z0-9_:.-]{1,64}$/.test(paneId)) {
             return void replyTo({ op: "error", code: "bad-pane", message: "pane.focus needs a pane id" });

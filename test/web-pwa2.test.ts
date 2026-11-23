@@ -94,12 +94,14 @@ test('pwa2 ops: usage.rollup, diff.get, pane.focus over the device channel', { s
     ].join('\n'));
     chmodSync(stub, 0o755);
 
-    // --- local cloud with one room and one read-scoped device
+    // --- local cloud with one room: a read device and an act device
     const accounts = [{ id: 'a1', name: 'test', token: 'pwa2-owner' }];
     const statePath = join(dir, 'state.json');
     const state = new State(accounts, statePath);
     const { room, token } = state.addRoom('a1', 'pwa2-host');
     const { device, secret } = state.addDevice(room, 'pwa2-device', 'read');
+    const actPair = state.addDevice(room, 'pwa2-act', 'act');
+    const act = { device: actPair.device.id, secret: actPair.secret };
     cloud = await startCloud({ accounts, statePath, log: entry => log.push(entry) });
     const gate = `ws://127.0.0.1:${cloud.port}`;
 
@@ -123,10 +125,10 @@ test('pwa2 ops: usage.rollup, diff.get, pane.focus over the device channel', { s
     await waitFor('publisher connected', () => log.some(entry => entry.includes('herdgate: connected to')));
 
     // One device socket per question; skip unsolicited frames until the answer.
-    const ask = async (payload: Record<string, unknown>, expectOp: string): Promise<Record<string, unknown>> => {
+    const ask = async (payload: Record<string, unknown>, expectOp: string, as: { device: string; secret: string } = { device: device.id, secret }): Promise<Record<string, unknown>> => {
       const sock = new DeviceSock(`${gate}/v1/device/ws`);
       try {
-        const hello = await sock.hello({ device: device.id, deviceSecret: secret });
+        const hello = await sock.hello({ device: as.device, deviceSecret: as.secret });
         assert.equal(hello.t, 'hello', JSON.stringify(hello));
         await sock.send({ t: 'frame', payload });
         const deadline = performance.now() + 10_000;
@@ -173,20 +175,148 @@ test('pwa2 ops: usage.rollup, diff.get, pane.focus over the device channel', { s
     assert.equal(after.op, 'usage.rollup.result');
     assert.equal(after.total.requests, 2);
 
-    t.diagnostic('pane.focus: format-gated, fire-and-forget spawn through herdr');
-    const badPane = await ask({ op: 'pane.focus', paneId: 'nope; rm -rf /' }, 'pane.focused');
+    t.diagnostic('pane.focus: act-gated, format-gated, fire-and-forget spawn through herdr');
+    const readTry = await ask({ op: 'pane.focus', paneId: 'w1:p2' }, 'pane.focused');
+    assert.equal(readTry.op, 'error', 'a read device must not steer the user\u2019s screen');
+    assert.equal(readTry.code, 'requires-act');
+    const badPane = await ask({ op: 'pane.focus', paneId: 'nope; rm -rf /' }, 'pane.focused', act);
     assert.equal(badPane.op, 'error');
     assert.equal(badPane.code, 'bad-pane');
-    const focused = await ask({ op: 'pane.focus', paneId: 'w1:p2' }, 'pane.focused');
+    const focused = await ask({ op: 'pane.focus', paneId: 'w1:p2' }, 'pane.focused', act);
     assert.equal(focused.op, 'pane.focused');
     assert.equal(focused.paneId, 'w1:p2');
     assert.equal(focused.via, 'pane focus');
     await waitFor('the stub herdr received pane focus w1:p2',
       () => readFileSync(callsFile, 'utf8').split('\n').includes('pane focus w1:p2'));
     t.diagnostic('pane.focus: herdr pane ids are not all digits (wG:p1) — the charset matches the term ops');
-    const lettered = await ask({ op: 'pane.focus', paneId: 'wG:p1' }, 'pane.focused');
+    const lettered = await ask({ op: 'pane.focus', paneId: 'wG:p1' }, 'pane.focused', act);
     assert.equal(lettered.op, 'pane.focused');
     assert.equal(lettered.paneId, 'wG:p1');
+  } catch (err) {
+    t.diagnostic(log.join('\n').slice(-4000));
+    throw err;
+  } finally {
+    await stop(publisher);
+    await cloud?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pwa2 act ops: tab.create/tab.close — a phone owns only the tabs it made', { skip: !hasGit && 'git is required' }, async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'hg-pwa2-tabs-'));
+  const log: string[] = [];
+  let cloud: Awaited<ReturnType<typeof startCloud>> | undefined;
+  let publisher: ChildProcess | undefined;
+  const stop = async (p?: ChildProcess) => { if (p) { p.kill('SIGKILL'); await new Promise(r => setTimeout(r, 200)); } };
+  try {
+    const callsFile = join(dir, 'herdr-calls.log');
+    const stub = join(dir, 'herdr-stub.sh');
+    writeFileSync(stub, [
+      '#!/bin/sh',
+      'echo "$@" >> "$HERDR_STUB_CALLS"',
+      'case "$1" in',
+      '  tab)',
+      '    case "$2" in',
+      '      create) printf \'{"id":"cli:tab:create","result":{"tab":{"tab_id":"w8:tP1"},"root_pane":{"pane_id":"w8:pP1"},"type":"tab_created"}}\\n\' ;;',
+      '      close) printf \'{"id":"cli:tab:close","result":{"type":"ok"}}\\n\' ;;',
+      '    esac ;;',
+      'esac',
+      'exit 0',
+      '',
+    ].join('\n'));
+    chmodSync(stub, 0o755);
+
+    const accounts = [{ id: 'a1', name: 'test', token: 'pwa2-tabs-owner' }];
+    const statePath = join(dir, 'state.json');
+    const state = new State(accounts, statePath);
+    const { room, token } = state.addRoom('a1', 'tabs-host');
+    const read = state.addDevice(room, 'reader', 'read');
+    const asRead = { device: read.device.id, secret: read.secret };
+    const act1 = state.addDevice(room, 'act-one', 'act');
+    const asAct1 = { device: act1.device.id, secret: act1.secret };
+    const act2 = state.addDevice(room, 'act-two', 'act');
+    const asAct2 = { device: act2.device.id, secret: act2.secret };
+    cloud = await startCloud({ accounts, statePath, log: () => {} });
+    const gate = `ws://127.0.0.1:${cloud.port}`;
+
+    const config = join(dir, 'publisher');
+    mkdirSync(config);
+    writeFileSync(join(config, 'herdgate.env'), `HERDGATE_URL=http://127.0.0.1:${cloud.port}\nHERDGATE_ROOM_TOKEN=${token}\n`, { mode: 0o600 });
+    const spawnPub = () => {
+      const p = spawn(process.execPath, [join(root, 'plugin/server/index.mjs'), 'serve'], {
+        cwd: dir,
+        env: {
+          PATH: process.env.PATH, HOME: dir,
+          HERDR_BIN_PATH: stub, HERDR_PLUGIN_ID: 'dev.herdgate.host',
+          HERDR_PLUGIN_CONFIG_DIR: config, HERDR_PLUGIN_STATE_DIR: config,
+          HERDGATE_PUBLISHER_CHILD: '1', HERDGATE_TUI_ONLY: '1', HERDR_STUB_CALLS: callsFile,
+        },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      p.stderr!.setEncoding('utf8').on('data', chunk => log.push(chunk));
+      return p;
+    };
+    publisher = spawnPub();
+    await waitFor('publisher connected', () => log.some(entry => entry.includes('herdgate: connected to')));
+
+    const ask = async (payload: Record<string, unknown>, expectOp: string, as: { device: string; secret: string }): Promise<Record<string, unknown>> => {
+      const sock = new DeviceSock(`${gate}/v1/device/ws`);
+      try {
+        const hello = await sock.hello({ device: as.device, deviceSecret: as.secret });
+        assert.equal(hello.t, 'hello', JSON.stringify(hello));
+        await sock.send({ t: 'frame', payload });
+        const deadline = performance.now() + 10_000;
+        for (;;) {
+          const frame = await sock.expect('frame');
+          const reply = frame.payload as { op?: string } | undefined;
+          if (reply?.op === expectOp || reply?.op === 'error') return reply as Record<string, unknown>;
+          if (performance.now() > deadline) throw new Error(`no ${expectOp} frame in time (got ${String(reply?.op)})`);
+        }
+      } finally { sock.close(); }
+    };
+
+    // Read devices cannot open tabs.
+    const readTry = await ask({ op: 'tab.create', label: 'nope' }, 'tab.created', asRead);
+    assert.equal(readTry.op, 'error');
+    assert.equal(readTry.code, 'requires-act');
+
+    // A junk label is refused before any herdr call.
+    const junk = await ask({ op: 'tab.create', label: 'bad\u0007label' }, 'tab.created', asAct1);
+    assert.equal(junk.code, 'bad-label');
+
+    // act1 creates a tab: the stub herdr receives tab create --label, the reply
+    // carries the ids, and the ownership map remembers whose tab it is.
+    const made = await ask({ op: 'tab.create', label: 'phone-notes' }, 'tab.created', asAct1);
+    assert.equal(made.op, 'tab.created');
+    assert.equal(made.tabId, 'w8:tP1');
+    assert.equal(made.paneId, 'w8:pP1');
+    await waitFor('the stub herdr received tab create --label phone-notes',
+      () => readFileSync(callsFile, 'utf8').split('\n').some(l => l.includes('tab create --label phone-notes')));
+
+    // Nobody else may close it — not another act device.
+    const stranger = await ask({ op: 'tab.close', tabId: 'w8:tP1' }, 'tab.closed', asAct2);
+    assert.equal(stranger.op, 'error');
+    assert.equal(stranger.code, 'not-yours', 'another act device does not own the tab');
+    // Nor an unknown tab id.
+    const alien = await ask({ op: 'tab.close', tabId: 'w8:tZZZ' }, 'tab.closed', asAct1);
+    assert.equal(alien.code, 'not-yours');
+
+    // The owner closes it: herdr tab close runs, the map entry is retired.
+    const closed = await ask({ op: 'tab.close', tabId: 'w8:tP1' }, 'tab.closed', asAct1);
+    assert.equal(closed.op, 'tab.closed');
+    await waitFor('the stub herdr received tab close w8:tP1',
+      () => readFileSync(callsFile, 'utf8').split('\n').some(l => l.includes('tab close w8:tP1')));
+    const again = await ask({ op: 'tab.close', tabId: 'w8:tP1' }, 'tab.closed', asAct1);
+    assert.equal(again.code, 'not-yours', 'a closed tab is no longer owned by anyone');
+
+    // Ownership survives a publisher restart: create, restart, close.
+    const kept = await ask({ op: 'tab.create', label: 'keepme' }, 'tab.created', asAct1);
+    assert.equal(kept.op, 'tab.created');
+    await stop(publisher);
+    publisher = spawnPub();
+    await waitFor('publisher reconnected', () => log.filter(e => e.includes('herdgate: connected to')).length >= 2);
+    const afterRestart = await ask({ op: 'tab.close', tabId: 'w8:tP1' }, 'tab.closed', asAct1);
+    assert.equal(afterRestart.op, 'tab.closed', 'the map lives in the state file, not in memory');
   } catch (err) {
     t.diagnostic(log.join('\n').slice(-4000));
     throw err;
