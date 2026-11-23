@@ -799,3 +799,7 @@ button.attach {
 }
 .rev-send:disabled { opacity: 0.45; cursor: default; }
 .rev-sent { color: #7fd962; }
+
+/* One-line typing into a live pane (act devices only) — no client echo. */
+.termtype { display: flex; gap: 6px; margin-left: auto; min-width: 0; }
+.termtype input { flex: 1; min-width: 80px; }

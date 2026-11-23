@@ -128,10 +128,15 @@ test("client: renders text only, and sends nothing but view", () => {
   assert.ok(!src.includes("insertAdjacentHTML"), "no HTML injection helpers");
   assert.ok(!src.includes("document.write"), "no document.write");
 
-  // The only op this client asks a host for. `ping` is answered by the protocol layer,
-  // not something the UI needs: asking for it would be a second thing to trust.
-  const ops = [...src.matchAll(/op:\s*"([a-z]+)"/g)].map((m) => m[1]);
-  assert.deepEqual([...new Set(ops)].sort(), ["view"], "the client asks for views and nothing else");
+  // Every op this client may send, dot-names included — an explicit allowlist,
+  // not a shape accident. tab.*/term.send/term.keys run only when the device
+  // holds an act grant; the host refuses the rest.
+  const ops = [...src.matchAll(/op:\s*"([a-z][a-z.]*)"/g)].map((m) => m[1]);
+  const allowed = ["receipt.ack", "receipt.get", "receipt.watch", "review.send", "tab.close", "tab.create", "term.list", "term.read", "term.send", "view"];
+  assert.deepEqual([...new Set(ops)].sort(), allowed, "the client sends exactly the allowlisted ops");
+  // The typing lane and the phone-tab chips exist only behind the act check.
+  assert.match(src, /state\.deviceScope === "act"/, "typing and tab creation are act-gated in the UI");
+  assert.match(src, /hg-phone-tabs:/, "phone-opened tabs are tracked session-side");
 
   // The token goes to the cloud's WS endpoint only: no fetch/beacon to anywhere else.
   assert.ok(!/fetch\([^)]*token/i.test(src), "the token is never put in a URL");

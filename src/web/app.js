@@ -2299,7 +2299,21 @@ function renderRoomControls(box) {
   return updateSshHint;
 }
 
-// ---- live terminals (read-only) ---------------------------------------------
+// ---- live terminals (read; typing when this browser holds an act grant) ----
+
+/** Tabs this browser opened on the machine (session-only memory): the server
+ *  enforces ownership; this is just the UI's own note of what to offer. */
+function phoneTabs() {
+  try {
+    const raw = JSON.parse(sessionStorage.getItem(`hg-phone-tabs:${state.deviceRoom}`) ?? "[]");
+    return new Map(Array.isArray(raw) ? raw.filter((e) => Array.isArray(e) && typeof e[0] === "string") : []);
+  } catch {
+    return new Map();
+  }
+}
+function savePhoneTabs(map) {
+  try { sessionStorage.setItem(`hg-phone-tabs:${state.deviceRoom}`, JSON.stringify([...map.entries()])); } catch { /* private mode: the server still owns the truth */ }
+}
 
 function startTerm(target) {
   stopTerm(false);
@@ -2338,6 +2352,30 @@ function renderTerms() {
     stop.textContent = "close";
     stop.addEventListener("click", () => stopTerm());
     bar.append(name, stop);
+    if (state.deviceScope === "act") {
+      // One-line typing: the text rides term.send, the next frame shows the
+      // result — no client-side echo, the screen stays authoritative.
+      const form = document.createElement("form");
+      form.className = "termtype";
+      const input = document.createElement("input");
+      input.type = "text";
+      input.placeholder = "gõ một dòng lệnh…";
+      input.maxLength = 2000;
+      input.autocomplete = "off";
+      const send = document.createElement("button");
+      send.type = "submit";
+      send.className = "primary";
+      send.textContent = "Gửi";
+      form.append(input, send);
+      form.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const text = input.value;
+        if (!text || !state.termTarget) return;
+        sendPayload({ op: "term.send", target: state.termTarget, text: text + "\n" });
+        input.value = "";
+      });
+      bar.append(form);
+    }
     body.append(bar);
     const pre = document.createElement("pre");
     pre.className = "termscreen";
@@ -2355,6 +2393,14 @@ function renderTerms() {
   btn.textContent = "refresh the pane list";
   btn.addEventListener("click", () => sendPayload({ op: "term.list" }));
   list.append(btn);
+  if (state.deviceScope === "act") {
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "link";
+    open.textContent = "+ tab trên máy";
+    open.addEventListener("click", () => sendPayload({ op: "tab.create" }));
+    list.append(open);
+  }
   const panes = state.terms ?? null;
   if (panes === null) {
     list.append(note("loading…", "muted"));
@@ -2376,6 +2422,33 @@ function renderTerms() {
       list.append(row);
     }
   }
+  const mine = phoneTabs();
+  if (mine.size) {
+    list.append(note("tab bạn mở từ điện thoại:", "muted"));
+    for (const [tabId, t] of mine) {
+      const row = document.createElement("div");
+      row.className = "keyrow";
+      const pre = document.createElement("pre");
+      pre.textContent = `${t.label} · ${t.paneId ?? tabId}`;
+      row.append(pre);
+      if (t.paneId) {
+        const view = document.createElement("button");
+        view.type = "button";
+        view.className = "link";
+        view.textContent = "xem";
+        view.addEventListener("click", () => startTerm(t.paneId));
+        row.append(view);
+      }
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "link danger";
+      rm.textContent = "đóng";
+      rm.addEventListener("click", () => sendPayload({ op: "tab.close", tabId }));
+      row.append(rm);
+      list.append(row);
+    }
+  }
+  if (state.termError) list.append(note(state.termError, "muted"));
   body.append(list);
 }
 
@@ -2494,6 +2567,7 @@ function dropDevice() {
   disconnect();
   state.deviceRoom = null;
   state.deviceId = "";
+  state.deviceScope = null;
   state.deviceSecret = "";
   goMachines();
   connect();
@@ -2576,6 +2650,7 @@ async function onMessage(m, ws) {
       state.hello = { agents: Array.isArray(m.agents) ? m.agents : [] };
       if (m.device?.id) {
         const { roomId, id, scope } = m.device;
+        state.deviceScope = scope === "act" ? "act" : "read";
         if (!state.deviceRoom) {
           // Migrate the legacy single pairing only after the gate identifies its room.
           savePair(roomId, { id, secret: state.deviceSecret, scope });
@@ -2728,6 +2803,25 @@ function applyPayload(payload) {
   } else if (payload && typeof payload === "object" && payload.op === "term.list") {
     state.terms = Array.isArray(payload.panes) ? payload.panes : [];
     renderTerms();
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "tab.created") {
+    if (typeof payload.tabId === "string") {
+      const map = phoneTabs();
+      map.set(payload.tabId, { paneId: typeof payload.paneId === "string" ? payload.paneId : null, label: typeof payload.label === "string" ? payload.label : "phone", at: Date.now() });
+      savePhoneTabs(map);
+      renderTerms();
+    }
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "tab.closed") {
+    const map = phoneTabs();
+    map.delete(payload.tabId);
+    savePhoneTabs(map);
+    renderTerms();
+    return;
+  } else if (payload && typeof payload === "object" && payload.op === "error" && ["not-yours", "bad-tab", "bad-label"].includes(payload.code)) {
+    state.termError = payload.message ?? payload.code;
+    renderTerms();
+    setTimeout(() => { state.termError = null; renderTerms(); }, 6_000);
     return;
   } else if (payload && typeof payload === "object" && payload.op === "term.read") {
     if (payload.target === state.termTarget && typeof payload.ansi === "string") {
@@ -3290,6 +3384,7 @@ document.addEventListener("click", (event) => {
 function forgetToken() {
   state.token = "";
   state.deviceId = "";
+  state.deviceScope = null;
   state.deviceSecret = "";
   state.deviceRoom = null;
   state.hello = null;
