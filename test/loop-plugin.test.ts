@@ -242,7 +242,7 @@ test("loop event: paused mutes, maxCycles finishes the loop honestly", () => {
 
 // ---- actions ----------------------------------------------------------------
 
-test("loop start: boots the pane with a properly escaped pi command", () => {
+test("loop start: boots the pane with a shell-neutral pi command, born in cfg.cwd", () => {
   const dir = tmp();
   try {
     writeFileSync(join(dir, "prompt.md"), "probe prompt");
@@ -254,9 +254,13 @@ test("loop start: boots the pane with a properly escaped pi command", () => {
     const r = run(dir, { cmd: ["start"], stubReplies: replies }, { config: goodConfig(dir) });
     assert.equal(r.code, 0, r.stderr);
     assert.deepEqual(r.calls.map((c) => c.split(" ")[0]), ["workspace.list", "tab.create", "pane.send_text"], "reuses the labeled workspace, one request per process");
+    const create = r.calls.find((c) => c.startsWith("tab.create"));
+    assert.deepEqual(JSON.parse(create.slice("tab.create ".length)), { workspace_id: "w7", label: "probe", cwd: dir }, "the pane is born in cfg.cwd — the boot text carries no `cd`");
     const send = r.calls.find((c) => c.startsWith("pane.send_text"));
     const text = JSON.parse(send.slice("pane.send_text ".length)).text;
-    assert.equal(text, `cd ${dir} && pi "$(cat ${join(dir, "prompt.md")})"\r`);
+    // C11: `pi "$(cat …)"` was POSIX-only; @file is a plain quoted path —
+    // passed verbatim by sh, PowerShell (quotes kill @ splatting) and cmd.
+    assert.equal(text, `pi "@${join(dir, "prompt.md")}"\r`);
     const st = JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8"));
     assert.equal(st.paneId, "w7:p3");
     assert.equal(st.status, "running");
@@ -279,6 +283,33 @@ test("loop start: fail closed on bad owner input", () => {
     const missing = run(dir, { cmd: ["start"] }, {});
     assert.equal(missing.code, 2);
     assert.match(missing.stderr, /loop\.json/);
+    // A bootCommand with a newline would type a half-command plus Enter.
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const badBoot = run(dir, { cmd: ["start"], stubReplies: { "tab.create": { result: { root_pane: { pane_id: "w7:p3" } } } } },
+      { config: goodConfig(dir, { bootCommand: "pi one\ntwo" }) });
+    assert.equal(badBoot.code, 2, "untypeable bootCommand dies before touching the bridge");
+    assert.match(badBoot.stderr, /bootCommand/);
+    assert.deepEqual(badBoot.calls, []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop start: bootCommand override reaches the pane verbatim (substituted)", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe prompt");
+    const replies = {
+      "workspace.list": { result: { workspaces: [] } },
+      "workspace.create": { result: { workspace: { workspace_id: "w9" } } },
+      "workspace.rename": { result: { type: "ok" } },
+      "tab.create": { result: { root_pane: { pane_id: "w9:p1" } } },
+      "pane.send_text": { result: { type: "ok" } },
+    };
+    const r = run(dir, { cmd: ["start"], stubReplies: replies },
+      { config: goodConfig(dir, { bootCommand: 'cd /d {cwd} && pi "@{promptFile}" --mode text' }) });
+    assert.equal(r.code, 0, r.stderr);
+    const send = r.calls.find((c) => c.startsWith("pane.send_text"));
+    const text = JSON.parse(send.slice("pane.send_text ".length)).text;
+    assert.equal(text, `cd /d ${dir} && pi "@${join(dir, "prompt.md")}" --mode text\r`, "the owner's shell gets the owner's syntax; Enter still ours");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -315,6 +346,7 @@ test("loop status: honest JSON for humans and scripts", () => {
     const j = JSON.parse(r.stdout);
     assert.equal(j.config.ok, true);
     assert.equal(j.config.maxCycles, 5);
+    assert.equal(j.config.boot, `pi "@${join(dir, "prompt.md")}"`, "operators can see exactly what will be typed");
     assert.equal(j.state.cycles, 2);
     assert.equal(j.state.armed, true);
     assert.equal(j.state.paneAlive, true);

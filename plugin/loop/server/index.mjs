@@ -17,6 +17,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { bootText, buildBoot, validateBootCommand } from "./boot.mjs";
 
 const CONFIG_DIR = process.env.HERDR_PLUGIN_CONFIG_DIR || join(homedir(), ".config", "herdgate-loop");
 const STATE_DIR = process.env.HERDR_PLUGIN_STATE_DIR || join(homedir(), ".local", "state", "herdgate-loop");
@@ -68,6 +69,8 @@ function validateConfig(c) {
   const maxCycles = c.maxCycles ?? 0;
   if (!Number.isInteger(maxCycles) || maxCycles < 0) return "loop.json: `maxCycles` must be an integer >= 0";
   if (c.nudgeText !== undefined && (typeof c.nudgeText !== "string" || c.nudgeText.length > 2000)) return "loop.json: `nudgeText` must be a string <= 2000 chars";
+  const bootErr = validateBootCommand(c.bootCommand);
+  if (bootErr) return bootErr;
   return null;
 }
 
@@ -104,7 +107,7 @@ function cmdStatus() {
   const s = loadState();
   const alive = s.paneId ? paneAlive(s.paneId) : false;
   out({
-    config: cfgErr ? { ok: false, error: cfgErr, path: CONFIG } : { ok: true, label: cfg.label, promptFile: cfg.promptFile, cwd: cfg.cwd, cooldownMs: cfg.cooldownMs ?? MIN_COOLDOWN_MS, maxCycles: cfg.maxCycles ?? 0 },
+    config: cfgErr ? { ok: false, error: cfgErr, path: CONFIG } : { ok: true, label: cfg.label, promptFile: cfg.promptFile, cwd: cfg.cwd, boot: buildBoot(cfg), cooldownMs: cfg.cooldownMs ?? MIN_COOLDOWN_MS, maxCycles: cfg.maxCycles ?? 0 },
     state: { paneId: s.paneId ?? null, workspaceId: s.workspaceId ?? null, status: s.status ?? "idle", paused: s.paused === true, armed: s.armed === undefined ? true : s.armed === true, cycles: s.cycles ?? 0, lastNudgeAt: s.lastNudgeAt ?? 0, paneAlive: alive },
     log: LOG,
   });
@@ -131,15 +134,17 @@ function cmdStart() {
     const renamed = herdr("workspace.rename", { workspace_id: wsId, label });
     if (!renamed.ok) log(`warn: workspace.rename failed: ${renamed.error?.message}`);
   }
-  const tab = herdr("tab.create", { workspace_id: wsId, label: cfg.label });
+  const tab = herdr("tab.create", { workspace_id: wsId, label: cfg.label, cwd: cfg.cwd });
   if (!tab.ok) return die(3, `tab.create failed: ${tab.error?.message}`);
   const paneId = tab.result?.root_pane?.pane_id;
   if (!paneId) return die(3, "tab.create returned no root_pane.pane_id");
 
-  // Boot the agent. JSON.stringify escapes the nested quotes correctly —
-  // the printf-built variant of this line mangled them in production once.
-  const boot = `cd ${cfg.cwd} && pi "$(cat ${cfg.promptFile})"\r`;
-  const sent = herdr("pane.send_text", { pane_id: paneId, text: boot });
+  // Boot the agent. The line is shell-free by construction (boot.mjs):
+  // pi reads the prompt through its @file argument — a quoted path every
+  // shell (sh, PowerShell, cmd.exe) passes verbatim — and the pane is born
+  // in cfg.cwd via tab.create, so there is no `cd` to spell per platform.
+  // Owners with a different shell/agent override via loop.json bootCommand.
+  const sent = herdr("pane.send_text", { pane_id: paneId, text: bootText(cfg) });
   if (!sent.ok) return die(3, `pane.send_text failed: ${sent.error?.message}`);
 
   saveState({ paneId, workspaceId: wsId, status: "running", paused: false, armed: false, cycles: 0, lastNudgeAt: 0, startedAt: Date.now() });
