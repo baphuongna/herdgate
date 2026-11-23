@@ -115,10 +115,12 @@ test("gateway: serves the PWA but never shadows /v1", async () => {
   }
 });
 
-/** The source with comments removed: prose about a rule is not a violation of it. */
+/** The source with comments removed: prose about a rule is not a violation of it.
+ *  Block comments are stripped only at line starts — a string may legally
+ *  contain "image/*" (found live: the old rule swallowed half the file). */
 function codeOnly(src: string): string {
   return src
-    .replace(/\/\*[\s\S]*?\*\//g, "") // /* block */
+    .replace(/(^|\n)[ \t]*\/\*[\s\S]*?\*\//g, "\n") // /* block */ at line start
     .replace(/(^|[^:])\/\/.*$/gm, "$1"); // // line (leaving "https://" intact)
 }
 
@@ -132,7 +134,7 @@ test("client: renders text only, and sends nothing but view", () => {
   // not a shape accident. tab.*/term.send/term.keys run only when the device
   // holds an act grant; the host refuses the rest.
   const ops = [...src.matchAll(/op:\s*"([a-z][a-z.]*)"/g)].map((m) => m[1]);
-  const allowed = ["receipt.ack", "receipt.get", "receipt.watch", "review.send", "tab.close", "tab.create", "term.list", "term.read", "term.send", "view"];
+  const allowed = ["receipt.ack", "receipt.get", "receipt.watch", "review.send", "tab.close", "tab.create", "term.list", "term.read", "term.send", "view", "worker.health", "worker.submit"];
   assert.deepEqual([...new Set(ops)].sort(), allowed, "the client sends exactly the allowlisted ops");
   // The typing lane and the phone-tab chips exist only behind the act check.
   assert.match(src, /state\.deviceScope === "act"/, "typing and tab creation are act-gated in the UI");
@@ -149,6 +151,17 @@ test("client: the roster shows the publisher build when the room reports it", ()
   // gate answers with host info, one muted line names the running build.
   assert.match(src, /host\?\.version/, "the roster line renders host?.version");
   assert.match(src, /v1\/devices/, "still the same roster fetch — no new wire surface");
+});
+
+test("client: review.send closes the loop — the phone learns when the agent is done", () => {
+  const src = codeOnly(readFileSync(join(WEB, "app.js"), "utf8"));
+  // The reply handler subscribes the review job like a typed one.
+  assert.match(src, /payload\.op === "review\.sent"[\s\S]{0,900}receipt\.watch/, "review.sent registers a receipt.watch");
+  assert.match(src, /r\.linkedJob = \{ id: payload\.id, status: "queued" \}/, "the Review tab links to its job");
+  assert.match(src, /linked\.id === id && fields\.status/, "workerJobTouched mirrors the status into the Review tab");
+  // The chip renders the lifecycle, not a static "sent".
+  assert.match(src, /agent đang xử lý/, "a pending chip names the wait");
+  assert.match(src, /agent đã xử lý/, "a done chip names the outcome");
 });
 
 test("client: handles the refusal paths honestly", () => {

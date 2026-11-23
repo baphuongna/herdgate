@@ -1405,8 +1405,21 @@ function renderWorkerReview(out, w) {
   if (r.open) { renderReviewDiff(out, r); return; }
   if (r.loading) { out.append(note("đang đọc danh sách thay đổi…")); return; }
   if (r.sent) {
-    const sent = note(`đã gửi ${r.sent.count} comment — job ${String(r.sent.id).slice(0, 8)} (xem Jobs/Chat)`);
+    const st = r.linkedJob?.status;
+    const done = st === "replied" || st === "failed" || st === "canceled";
+    const text = done
+      ? `${st === "replied" ? "✓ agent đã xử lý" : `✗ job ${st}`} ${r.sent.count} comment — xem trong Jobs/Chat`
+      : `⏳ agent đang xử lý ${r.sent.count} comment (job ${String(r.sent.id).slice(0, 8)}) — sẽ báo khi xong`;
+    const sent = note(text);
     sent.classList.add("rev-sent");
+    if (done) {
+      const go = document.createElement("button");
+      go.type = "button";
+      go.className = "link";
+      go.textContent = "mở Jobs →";
+      go.addEventListener("click", () => { state.worker.tab = "jobs"; state.roomUi?.updateWorker?.(true); });
+      sent.append(" ", go);
+    }
     out.append(sent);
   }
   if (!r.files) {
@@ -2000,7 +2013,11 @@ function renderWorkerBox(box) {
 
 function workerJobTouched(id, fields) {
   const job = state.worker.jobs.get(id);
-  if (!job) return;
+  // The Review tab tracks its own sent job — mirror the status even before
+  // any Jobs render, so the chip tells the owner the agent finished.
+  const linked = state.worker.review?.linkedJob;
+  if (linked && linked.id === id && fields.status) linked.status = fields.status;
+  if (!job) { state.roomUi?.updateWorker?.(true); return; }
   const prevStatus = job.status;
   Object.assign(job, fields);
   if (fields.status && fields.status !== prevStatus) {
@@ -2850,10 +2867,23 @@ function applyPayload(payload) {
     if (r) {
       r.sending = false;
       r.sent = { id: payload.id, count: payload.count, at: Date.now() };
+      r.linkedJob = { id: payload.id, status: "queued" };
       r.comments = {}; // delivered — the queue owns them now
       r.boxLine = null;
       r.open = null; // back to the list; the job lands in Jobs/Chat like any turn
     }
+    // Close the loop: watch the review job exactly like a typed one, so the
+    // settle (and the wake push, app closed or not) reaches this phone.
+    state.worker.jobs.set(payload.id, {
+      id: payload.id,
+      status: "queued",
+      hasBody: false,
+      ts: Date.now(),
+      principal: state.deviceId ? `device:${state.deviceId}` : null,
+      kind: "review",
+      events: [],
+    });
+    sendPayload({ op: "receipt.watch", id: payload.id, wantBody: true });
     state.roomUi?.updateWorker?.(true);
     return;
   } else if (payload && typeof payload === "object" && payload.op === "worker.submitted") {
