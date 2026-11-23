@@ -69,11 +69,15 @@
 
 | # | Vòng | Chủ đề | Giá trị | Trạng thái |
 |---|------|--------|---------|------------|
-| C1 | v0.9.43 | **Operability pack**: setup-tui idempotent với `.setup` mồ côi; publisher gửi version thật (bỏ hard-code 0.9.38) + gate lưu `hostInfo` + PWA roster hiển thị; mirror `[[startup]]` one-shot reconcile opt-in (`mirror autostart on/off`) | Cao (vết đứt vận hành đã gặp thật: EEXIST giữa update; không biết máy nào chạy bản nào; watch phải gọi tay) | 🔄 đang chạy |
-| C2 | sau C1 | **Predictive echo enable path**: harness thu evidence typing (pane thử nghiệm riêng, không đụng pane user), auto-enable khi đủ 2 confirm như thiết kế predict.mjs; dashboard trạng thái echo | Trung bình–cao (UX typing mirror) | queued |
-| C3 | sau C2 | **Security pass STRIDE** trên toàn bộ surface mới (fleet.detail, term.send/keys, file.*, review.*, mirror device identity, push payload) — findings → fix ngay trong vòng nếu nhỏ | Cao (surface mới chưa được audit) | queued |
-| C4 | sau C3 | **Cadence thích ứng** (5s cố định → backoff khi yên tĩnh, burst khi settle) + sysmon khi herdr lộ `pid` | Trung bình | queued (sysmon blocked) |
-| C5 | nhu cầu | **EXCAVATION chọn lọc** (collie harness grammars, 5 repo Rust) — chỉ đào khi vòng trước sinh nhu cầu thật | Tham khảo | parked |
+| C1 | v0.9.43 | **Operability pack** | Cao | ✅ xong |
+| C2 | v0.9.45 | **Predictive echo enable path** | Trung bình–cao | ✅ xong |
+| C3 | v0.9.46 | **Security pass STRIDE** surface mới | Cao | ✅ xong |
+| C4 | v0.9.47 | **Cadence thích ứng** (sysmon khi herdr lộ pid) | Trung bình | ✅ xong (sysmon vẫn chờ pid) |
+| C5 | v0.10.0 | **Fleet control từ PWA** (theme 2b đầu tiên) | Cao | ✅ xong |
+| C6 | — | **Review loop trọn vòng** (client-only) | Trung bình | ✅ xong |
+| C7 | — | **Publisher watchdog** (serve path tự chữa) | Cao | ✅ xong |
+| C8 | kế tiếp | **Windows TUI publisher watchdog** (lock run-id riêng) HOẶC **Jobs/results phong phú** khi có bằng chứng nhu cầu | Trung bình–cao | 🔄 chọn khi mở |
+| C9 | nhu cầu | **EXCAVATION chọn lọc** (collie harness grammars, 5 repo Rust) — chỉ đào khi vòng trước sinh nhu cầu thật | Tham khảo | parked |
 | — | blocked | VPS cutover (việc user — `docs/plans/vps-cutover.md`); herdr > 0.9.5 lộ pid | — | blocked |
 
 ## Cycle Log
@@ -86,7 +90,8 @@
 | C4 | 2026-11-23 | ✅ xong — v0.9.47 (bump cuối theo kiểu cũ) | feat + tag v0.9.47 | Suite 310/0 (4 test mới). Adaptive cadence (busy/changed=5s, quiet ×1.5→60s, timer chain — log `adaptive→60000ms`, chain sống >60s live); pane.focus nhận `wG:p1`; attachment.list cap 200; invariant tripwire. Từ C5 áp dụng chính sách release 2b |
 | C5 | 2026-11-23 | ✅ xong — **theme lớn đầu tiên theo chính sách 2b**, v0.10.0 (1 bump duy nhất cho 3 milestone) | spec `c9b3f16` → M1 `57ed477` → M2 `aacb3fd` → tag v0.10.0 | **Fleet control từ PWA**: bug sống pane.focus từng trả lời device read (đã act-gate); tab.create/tab.close ownership-map (phone-tabs.json, FIFO 64, sống qua restart — unit test); PWA typing 1 dòng vào pane sống (term.send, không client echo) + nút "+ tab" + chip tab mình mở (session-side); web rules nâng allowlist tường minh. Suite 311/0. **Live trên máy thật**: read bị chặn cả 3 op; act mở tab thật w8:t2N, gõ echo marker hiện trên pane thật, đóng sạch; probe revoked. Laptop 0.10.0 |
 | C6 | 2026-11-23 | ✅ xong — review loop trọn vòng (client-only, **không bump** theo 2b) | spec + feat chung commit | review.sent giờ đăng ký receipt.watch như job thường — settle push + wake về phone đúng hạ tầng sẵn; chip Review tab sống theo trạng thái (⏳ → ✓ + nút mở Jobs). **Bug thật bắt thêm**: test utility `codeOnly` nuốt nửa app.js vì string `"image/*"` bị tưởng block comment — strip giờ chỉ ăn comment đầu dòng; allowlist ops lộ thêm worker.health/submit (12 op tường minh). Suite 312/0. Live: probe c6-fence đã revoke, room sạch 5; fence pi_worker_disabled phủ bởi e2e |
-| C7 | kế tiếp | 🔄 theme: Jobs/results phong phú trên phone (body job dài, recap theo ngày) HOẶC watchdog publisher tự chữa — chọn khi mở | — | theo 2b: không release riêng |
+| C7 | 2026-11-23 | ✅ xong — publisher watchdog (serve path), **không bump** theo 2b | spec `fb5629f` + feat `0549842` | Chọn watchdog thay cho jobs-rich (lý do trong spec: điểm hỏng đơn + lớp sự cố đã gặp). Suite **315/0** (3 test mới: respawn sau SIGKILL, budget give-up, adopt child bản cũ). **Live verify theo ràng buộc auto-run**: đường serve thật từ source, state scratch + stub gate localhost, thông số MẶC ĐỊNH (poll 1s, budget 5/10min): SIGKILL → respawn pid mới + hello#2 sau 1.8s; stop → supervisor drain sạch, không reconnect; publisher.log ghi đủ dấu vết (exit SIGKILL, respawn 1/5, stop). Service thật không đụng (publisher home nằm dưới systemd Restart=always, ngoài scope). Bug thật bắt thêm: child detached+unref không reap → zombie khiến kill(pid,0) vẫn "alive" — exit listener vừa reap vừa log. READY-TO-RELEASE: publisher-self-healing (chủ sở hữu review + publish khi gộp theme kế hoặc gọi riêng) |
+| C8 | kế tiếp | 🔄 theme: Windows TUI publisher watchdog (lock model run-id riêng — nối theme C7) HOẶC Jobs/results phong phú trên phone khi có bằng chứng nhu cầu — chọn khi mở | — | theo 2b: không release riêng |
 
 ### Bài học C1 (nuôi vòng sau)
 - Drive laptop: lệnh đúng là `herdgate update` (không phải `setup update`); flow transaction của setup-tui chết an toàn ở bước `check` trước khi đụng publisher — đã chứng minh trên máy thật.
@@ -104,3 +109,7 @@
 ### Bài học C4 (phản hồi user)
 - Version không phải tiến độ: 5 bump/ngày là nhiễu (npm flip chờ 2-3 phút mỗi lần, laptop update mỗi lần). Release theo chủ đề người-dùng, việc nhỏ nằm gọn trong theme.
 - Vòng nhỏ chỉ hợp lệ khi nó là bước NHỎ trong chủ đề lớn (như C3 review là bước của chủ đề ổn định).
+
+### Bài học C7
+- Zombie là trạng thái "alive": child spawn detached+unref mà không có exit listener sẽ thành zombie khi chết, `kill(pid,0)` vẫn trả sống — poller tưởng publisher sống mãi. Mọi supervisor phải reap (giữ exit listener); signal-alive không phân biệt được zombie.
+- Pidfile trễ một chu kỳ poll là hợp lệ về mặt thiết kế — test phải chờ "pid ĐỔI" chứ không phải "pid alive", nếu không sẽ giết zombie và đếm nhầm số death.
