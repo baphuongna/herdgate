@@ -50,25 +50,25 @@ bất kỳ cloud công cộng nào; rsync về máy của owner nếu cần offs
 
 ## 2. Diễn tập restore (sandbox — không đụng gate thật)
 
-Đã chứng minh sống 2026-11-23 (Cycle Log C11d). Tóm tắt:
+Đã chứng minh sống 2026-11-23 (Cycle Log C11d) bằng gate từ source;
+ngày cùng hôm đã diễn tập TIẾP với **artifact đúng hình deploy** (compiled
+runtime + `npm ci --omit=dev` + `patch-ssh2.mjs`, đúng README templates/
+cloud) restore state THẬT: 5/5 rooms device+hostInfo khớp gate thật,
+PWA serve 200 (Cycle Log C11e). Tóm tắt các bước:
 
 ```bash
 # 2.1 Backup + verify bản vừa tạo (mục 1).
-# 2.2 Restore vào scratch
-mkdir -p ~/.cache/gate-drill && cd ~/.cache/gate-drill
-cp -r ~/.local/state/herdgate/backups/$(cat ~/.local/state/herdgate/backups/_latest)/state.json .
-# 2.3 Gate scratch: port khác, NO_SSH, NO_PUSH, state scratch; token qua env
-TOKEN=$(systemctl --user show herdgate.service -p Environment --value \
-  | grep -oP 'HERDGATE_ACCOUNT_TOKEN=\K[^ ]+' )   # không echo
-HERDGATE_PORT=8899 HERDGATE_BIND=127.0.0.1 HERDGATE_NO_SSH=1 HERDGATE_NO_PUSH=1 \
-HERDGATE_STATE=$PWD/state.json HERDGATE_ACCOUNT_TOKEN="$TOKEN" \
-  node ~/source/herdgate/src/cloud/main.ts &   # log stderr
-# 2.4 Verify
-curl -s http://127.0.0.1:8899/healthz
-curl -s -H "Authorization: Bearer $TOKEN" \
-  'http://127.0.0.1:8899/v1/devices?room=<room-id>' | jq '.devices | length'
-# 2.5 Dọn: kill gate scratch, rm -rf ~/.cache/gate-drill
-```
+# 2.2 Dựng artifact (giữ nguyên thứ tự — build-release cloud stage):
+#   npm run build:cloud -- --outDir <cloud>/runtime
+#   cp src/web/{index.html,app.js,app.css,app.webmanifest,sw.js,e2e.js,push-decision.js} <cloud>/runtime/web/
+#   cp src/web/icons/* <cloud>/runtime/web/icons/; cp scripts/patch-ssh2.mjs <cloud>/scripts/
+#   cp package-lock.json <cloud>/; viết <cloud>/package.json như build-release.sh
+#   cd <cloud> && npm ci --omit=dev --omit=optional --ignore-scripts && node scripts/patch-ssh2.mjs
+# ⚠️ Archive KHÔNG bundle node_modules: thiếu npm ci là crash ngay cửa
+#   (ERR_MODULE_NOT_FOUND: ws) — đã từng bắt trong diễn tập C11e.
+# 2.3 Restore state scratch + boot (port khác, NO_SSH, NO_PUSH; token qua env)
+# 2.4 Verify: /healthz; /v1/devices TỪNG room khớp gate thật; PWA HTML 200.
+# 2.5 Dọn: kill gate scratch, rm scratch.
 
 ## 3. Cutover thật (Pha B — CHỦ SỞ HỮU)
 
@@ -90,6 +90,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Chưa phủ (nợ owner)
 
-- Leg "Cloud archive 0.9.38 → 0.11.0" của Pha A (diễn tập với đúng
-  bản npm sẽ chạy trên VPS) — diễn tập C11d dùng source→source.
+- Diễn tập với tarball phát hành thật (giải nén `herdgate-cloud-<ver>.tar.gz`
+  thay vì dựng tay cloud stage) — C11d/C11e phủ source và compiled stage,
+  tarball-packing được cloud-release.test canh.
 - Pha C standby ấm — plan chốt cold standby đủ cho hệ 1 người dùng.
