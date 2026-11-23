@@ -1,0 +1,19 @@
+id = "dev.herdgate.devloop"
+name = "herdgate-devloop"
+version = "1.0.0"
+min_herdr_version = "0.9.0"
+description = "Chain the herdgate DEV-LOOP herdr-natively: when the loop pane's agent settles, nudge it into the next cycle. Local experiment — never shipped."
+platforms = ["linux", "macos"]
+
+# The loop pane is an agent pane in workspace '⚙ dev-loop'. Herdr reports its
+# lifecycle; on a settle (idle|done) we send the next-cycle prompt into that
+# same pane — back-to-back cycles, no timer, visible in the TUI.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["node", "loop-event.mjs"]
+
+# A dead loop pane means the chain broke: log it loudly (the owner restarts
+# with loop-pane.sh); auto-respawn could fight a legitimately stopped loop.
+[[events]]
+on = "pane.exited"
+command = ["node", "loop-event.mjs"]
