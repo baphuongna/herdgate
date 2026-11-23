@@ -1008,6 +1008,8 @@ test("c23 T6: fences honored at wake — bookkeeping never re-runs (F3/F6)", () 
     const st = c23State({ cycles: 3, noopStreak: 1, lastAuditAt: 123456, lastNudgeAt: Date.now() - 60_000, deferredUntil: Date.now() - 500, deferredId: c23Id });
     const cases: Array<[string, Record<string, unknown>]> = [
       ["paused by owner", { paused: true, pausedBy: "owner", pausedAt: 5 }],
+      ["paused by auto", { paused: true, pausedBy: "auto", pausedAt: 5 }],
+      ["not armed", { armed: false }],
       ["audit hold", { auditHold: { rules: ["forbidden-scope"], at: 5 } }],
       ["status=stopped", { status: "stopped" }],
     ];
@@ -1099,6 +1101,91 @@ test("c23 T9: a real nudge, stop and start each clear a stale schedule (R5/F8)",
     assert.equal(start.code, 0, start.stderr);
     assert.ok(noSchedule(readState(dir)), "start begins with no schedule");
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c23 T11: a refused send_text keeps the schedule and retries — never a silent drop", () => {
+  const dir = tmp();
+  let dirB = "";
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    // A send failure at wake used to clear the schedule silently, leaving only
+    // `nudge #N FAIL` — exactly the stall C23 exists to prevent. Now the send
+    // is a bridge failure like any other: keep the schedule, retry per F5.
+    // (a) one refused send → retry → exactly one successful nudge.
+    const callsA = join(dir, "calls.log");
+    const flaky = join(dir, "flaky-send.mjs");
+    writeFileSync(flaky, `#!/usr/bin/env node
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+let buf = "";
+process.stdin.on("data", (d) => {
+  buf += d;
+  const nl = buf.indexOf("\\n");
+  if (nl === -1) return;
+  const req = JSON.parse(buf.slice(0, nl));
+  appendFileSync(${JSON.stringify(callsA)}, req.method + " " + JSON.stringify(req.params) + "\\n");
+  const marker = ${JSON.stringify(join(dir, "send.marker"))};
+  if (req.method === "pane.send_text" && !existsSync(marker)) {
+    writeFileSync(marker, "1");
+    process.stdout.write(JSON.stringify({ id: req.id, error: { code: "bridge-down", message: "send refused once" } }) + "\\n");
+    process.exit(0);
+  }
+  const result = req.method === "pane.list" ? { panes: [{ pane_id: "wA:p1", agent_status: "idle" }] } : {};
+  process.stdout.write(JSON.stringify({ id: req.id, result }) + "\\n");
+  process.exit(0);
+});
+`);
+    const a = run(dir, { cmd: ["deferred-nudge", "--id", c23Id] }, {
+      config: goodConfig(dir),
+      bin: flaky,
+      state: c23State({ cycles: 3, lastNudgeAt: Date.now() - 60_000, deferredUntil: Date.now() - 500, deferredId: c23Id }),
+    });
+    assert.equal(a.code, 0, a.stderr);
+    assert.equal(a.calls.filter((c) => c.startsWith("pane.send_text")).length, 2, "one refused send, then the successful retry");
+    assert.match(readLog(dir), /deferred nudge retry: bridge bridge-down \(n=1, 5s\)/);
+    assert.match(readLog(dir), /nudge #4 rc=ok/, "the retry lands exactly one successful nudge");
+    assert.equal(readState(dir).cycles, 4);
+    assert.ok(noSchedule(readState(dir)), "cleared by the successful nudge, not by a silent drop");
+
+    // (b) a permanently refusing send → at most 3 retries, then dropped: bridge <code>.
+    dirB = tmp();
+    writeFileSync(join(dirB, "prompt.md"), "probe");
+    const callsB = join(dirB, "calls.log");
+    const dead = join(dirB, "dead-send.mjs");
+    writeFileSync(dead, `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+let buf = "";
+process.stdin.on("data", (d) => {
+  buf += d;
+  const nl = buf.indexOf("\\n");
+  if (nl === -1) return;
+  const req = JSON.parse(buf.slice(0, nl));
+  appendFileSync(${JSON.stringify(callsB)}, req.method + " " + JSON.stringify(req.params) + "\\n");
+  if (req.method === "pane.list") {
+    process.stdout.write(JSON.stringify({ id: req.id, result: { panes: [{ pane_id: "wA:p1", agent_status: "idle" }] } }) + "\\n");
+  } else {
+    process.stdout.write(JSON.stringify({ id: req.id, error: { code: "bridge-down", message: "send refused" } }) + "\\n");
+  }
+  process.exit(0);
+});
+`);
+    const b = run(dirB, { cmd: ["deferred-nudge", "--id", c23Id] }, {
+      config: goodConfig(dirB),
+      bin: dead,
+      state: c23State({ cycles: 3, lastNudgeAt: Date.now() - 60_000, deferredUntil: Date.now() - 500, deferredId: c23Id }),
+    });
+    assert.equal(b.code, 0, b.stderr);
+    const logB = readLog(dirB);
+    assert.match(logB, /deferred nudge retry: bridge bridge-down \(n=1, 5s\)/);
+    assert.match(logB, /deferred nudge retry: bridge bridge-down \(n=3, 5s\)/);
+    assert.doesNotMatch(logB, /\(n=4, 5s\)/, "at most 3 retries (F5)");
+    assert.match(logB, /deferred nudge dropped: bridge bridge-down/);
+    assert.equal(b.calls.filter((c) => c.startsWith("pane.send_text")).length, 4, "1 try + 3 retries, then the honest drop");
+    assert.ok(noSchedule(readState(dirB)), "the drop clears the schedule");
+    assert.equal(readState(dirB).status, "running", "lifecycle untouched");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (dirB) rmSync(dirB, { recursive: true, force: true });
+  }
 });
 
 test("c23 T10: same window never re-spawns; a bridge failure retries then fires (F1/F5)", () => {

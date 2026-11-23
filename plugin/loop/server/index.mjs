@@ -566,9 +566,9 @@ async function cmdDeferredNudge(id) {
   // here (F10/F11): they belong to the bookkeeping that already ran.
   const fence =
     cfgErr ? "config invalid"
-    : !armed ? "armed=false"
+    : !armed ? "not armed"
     : s.status !== "running" ? `status=${s.status}`
-    : s.paused === true ? "paused by owner"
+    : s.paused === true ? (s.pausedBy === "auto" ? "paused by auto" : "paused by owner")
     : s.auditHold ? `audit hold ${s.auditHold.rules?.join(",")}`
     : null;
   if (fence) return dropDeferred(s, fence);
@@ -588,13 +588,22 @@ async function cmdDeferredNudge(id) {
     if (observed === "working" || observed === "blocked") return dropDeferred(s, "pane working"); // a real settle will arrive
     log(`deferred nudge: firing (id ${shortId})`);
     const v = await nudgeNow({ state: s, cfg, paneId: s.paneId, agentStatus: observed });
-    if (!v.verdict.nudged) {
-      // Only the cooldown guard can land here (a kick/nudge slipped in while
-      // we slept): the schedule is stale — clear it silently; cooldown is
-      // never a `dropped` reason (F11).
+    if (v.verdict.nudged) process.exit(0);
+    if (v.verdict.reason === "cooldown") {
+      // A kick/nudge slipped in while we slept: the schedule is stale — clear
+      // it silently; cooldown is never a `dropped` reason (F11).
       saveState({ ...s, deferredUntil: undefined, deferredId: undefined });
+      process.exit(0);
     }
-    process.exit(0);
+    // A refused send is exactly the stall C23 exists to prevent: clearing the
+    // schedule here would consume the settle with nothing (review round 2).
+    // Keep the schedule and retry like any bridge failure (F5): 5s apart, at
+    // most DEFER_RETRY_MAX times, then an honest `dropped: bridge <code>`.
+    const code = v.verdict.reason ?? "send-failed";
+    if (n > DEFER_RETRY_MAX) return dropDeferred(s, `bridge ${code}`);
+    log(`deferred nudge retry: bridge ${code} (n=${n}, 5s)`);
+    await new Promise((resolve) => setTimeout(resolve, DEFER_RETRY_MS));
+    return fire(n + 1);
   };
   await fire(1);
 }

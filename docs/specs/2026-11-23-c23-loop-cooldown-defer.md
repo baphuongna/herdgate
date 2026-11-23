@@ -47,7 +47,7 @@ R7. Chạy được trên **Linux và Windows** (C12): dùng `spawn(process.exec
 R8. Log thật, một dòng mỗi việc (để `loop.status` logTail của C21 đọc được):
     `deferred nudge scheduled in Ns (id <8 ký tự>)` · `deferred nudge: firing (id …)` ·
     `deferred nudge dropped: <lý do> (id …)` với lý do ∈ {superseded, pane working, pane gone, status=<s>,
-    paused by owner, audit hold, config invalid, bridge <code>}. `maxCycles`/`cooldown` **không** là lý do
+    paused by owner, paused by auto, not armed, audit hold, config invalid, bridge <code>}. `maxCycles`/`cooldown` **không** là lý do
     dropped: chúng thuộc bookkeeping đã xử lý ở settle (F10/F11).
 R9. `loop.status` (C21) **thêm** `deferredUntil` (epoch ms | null) — additive, không đổi field cũ.
 R10. Hành vi cũ giữ nguyên khi cooldown đã qua (nudge ngay) và khi `cooldownMs` không đổi (không có
@@ -131,6 +131,8 @@ Sau đó `stop` (đóng workspace). Loop dev-loop thật: `kick` một lần, qu
 
 ## 8. Changelog
 
+- v1.2 (sau review độc lập vòng 2): R8 enum thêm `not armed` và `paused by auto` (phân biệt theo `pausedBy`);
+  lỗi `send_text` lúc wake giữ lịch và retry theo mẫu F5 thay vì xoá im lặng (tránh tái diễn dạng kẹt C23).
 - v1.1 (sau critic `c23-critic`, 14 finding): F1 spawn chỉ khi mint id mới · F2 hàm dùng chung trả verdict, không
   `process.exit` · F3 bookkeeping chạy một lần ở settle, nudge hoãn chỉ kiểm hàng rào (tránh đếm kép `noopStreak`) ·
   F4 superseded trước ngủ = im lặng · F5 lỗi bridge ≠ pane gone (retry 5s ×3) · F6 hàng rào gồm config/armed ·
