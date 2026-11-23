@@ -25,6 +25,10 @@
 - Guardrails AUTO.md: KHÔNG npm publish/tag (ghi `READY-TO-RELEASE`
   khi theme trọn — chủ sở liệu publish), KHÔNG đụng service/pane user,
   KHÔNG in token, đúng 1 vòng/lần.
+- **Cycle audit (C18 — cơ chế, không chỉ lời)**: mỗi settle trước nudge,
+  plugin đối chiếu git của `cwd` trong window vòng với các luật (bump
+  version, tag mới, token commit — `AUDIT ok/VIOLATION` trong loop.log);
+  vi phạm → giữ chuỗi (`auditHold`, không nudge) tới khi owner `resume`.
 - Theo dõi: `tail -f ~/.local/state/herdr/plugins/dev.herdgate.loop/loop.log`;
   trạng thái: action `status` của plugin.
 - **Backlog trống** (hết mục 🔄/queued, không nợ giao/nghiệm thu nào trả

@@ -18,6 +18,7 @@ import { isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { bootText, buildBoot, validateBootCommand } from "./boot.mjs";
+import { auditWindow } from "./audit.mjs";
 
 const CONFIG_DIR = process.env.HERDR_PLUGIN_CONFIG_DIR || join(homedir(), ".config", "herdgate-loop");
 const STATE_DIR = process.env.HERDR_PLUGIN_STATE_DIR || join(homedir(), ".local", "state", "herdgate-loop");
@@ -144,7 +145,7 @@ async function cmdStatus() {
   const alive = s.paneId ? await paneAlive(s.paneId) : false;
   out({
     config: cfgErr ? { ok: false, error: cfgErr, path: CONFIG } : { ok: true, label: cfg.label, promptFile: cfg.promptFile, cwd: cfg.cwd, boot: buildBoot(cfg), cooldownMs: cfg.cooldownMs ?? MIN_COOLDOWN_MS, maxCycles: cfg.maxCycles ?? 0 },
-    state: { paneId: s.paneId ?? null, workspaceId: s.workspaceId ?? null, status: s.status ?? "idle", paused: s.paused === true, armed: s.armed === undefined ? true : s.armed === true, cycles: s.cycles ?? 0, lastNudgeAt: s.lastNudgeAt ?? 0, paneAlive: alive },
+    state: { paneId: s.paneId ?? null, workspaceId: s.workspaceId ?? null, status: s.status ?? "idle", paused: s.paused === true, armed: s.armed === undefined ? true : s.armed === true, cycles: s.cycles ?? 0, lastNudgeAt: s.lastNudgeAt ?? 0, lastAuditAt: s.lastAuditAt ?? null, auditHold: s.auditHold ?? null, paneAlive: alive },
     log: LOG,
   });
 }
@@ -209,8 +210,10 @@ async function cmdStop() {
 function cmdPause(resume) {
   const s = loadState();
   if (!s.paneId && !s.workspaceId) return die(1, "no loop to pause/resume");
-  saveState({ ...s, paused: !resume });
-  log(resume ? "resume: nudges re-enabled" : "pause: nudges muted");
+  // resume = the owner reviewed the audit hold: cleared for good (undefined
+  // keys vanish from the JSON), while the audited window stays recorded.
+  saveState({ ...s, paused: !resume, ...(resume ? { auditHold: undefined } : {}) });
+  log(resume ? `resume: nudges re-enabled${s.auditHold ? " — audit hold cleared" : ""}` : "pause: nudges muted");
   out({ ok: true, paused: !resume });
 }
 
@@ -257,16 +260,39 @@ async function cmdEvent() {
 
   if (s.status !== "running") { log(`status=${s.status} — no nudge`); process.exit(0); }
   if (s.paused === true) { log("paused — no nudge"); process.exit(0); }
+  if (s.auditHold) { log(`audit hold ${s.auditHold.rules.join(",")} — no nudge until the owner resumes`); process.exit(0); }
+
+  // Cycle audit (C18): the guardrails as a mechanism, not a promise. The
+  // window is the work since the previous audit (or since this run started)
+  // — placed before the maxCycles/cooldown branches so the LAST settle (the
+  // one that flips the loop done) is audited too, and always before a nudge.
+  // Fail-open is for INFRASTRUCTURE failures only: a git error is not
+  // evidence of a violation, so the chain keeps feeding — and the window is
+  // NOT marked audited (lastAuditAt keeps its value) so the next settle
+  // re-audits it whole. A real violation holds the chain until resume.
+  const since = Number(s.lastAuditAt) || Number(s.startedAt) || 0;
+  const until = Date.now();
+  const audit = auditWindow({ cwd: cfg.cwd, since, until });
+  const auditMark = audit.ok ? { lastAuditAt: until } : {};
+  if (audit.ok && audit.violations.length > 0) {
+    const rules = [...new Set(audit.violations.map((v) => v.rule))];
+    saveState({ ...s, lastAuditAt: until, auditHold: { rules, at: until } });
+    log(`AUDIT VIOLATION ${rules.join(",")} — nudges held until resume`);
+    process.exit(0);
+  }
+  if (audit.ok) log(`AUDIT ok commits=${audit.commits.length} tags=${audit.tags.length}`);
+  else log(`AUDIT error ${audit.error} — fail-open: infra failure is not evidence of a violation; window re-audited next settle`);
+
   if (maxCycles > 0 && cycles >= maxCycles) {
-    if (s.status !== "done") { saveState({ ...s, status: "done" }); log(`maxCycles ${maxCycles} reached — loop done`); }
+    if (s.status !== "done") { saveState({ ...s, ...auditMark, status: "done" }); log(`maxCycles ${maxCycles} reached — loop done`); }
     process.exit(0);
   }
   const last = Number(s.lastNudgeAt) || 0;
-  if (Date.now() - last < cooldown) { log(`nudge suppressed (cooldown ${cooldown}ms)`); process.exit(0); }
+  if (until - last < cooldown) { saveState({ ...s, ...auditMark }); log(`nudge suppressed (cooldown ${cooldown}ms)`); process.exit(0); }
 
   const text = cfg?.nudgeText ?? DEFAULT_NUDGE;
   const r = await herdr("pane.send_text", { pane_id: paneId, text });
-  saveState({ ...s, armed: true, cycles: cycles + 1, lastNudgeAt: Date.now() });
+  saveState({ ...s, armed: true, cycles: cycles + 1, lastNudgeAt: Date.now(), ...auditMark });
   log(`nudge #${cycles + 1} rc=${r.ok ? "ok" : `FAIL ${r.error?.code}`} (pane ${paneId})`);
 }
 
