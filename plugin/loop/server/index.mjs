@@ -105,7 +105,7 @@ function cmdStatus() {
   const alive = s.paneId ? paneAlive(s.paneId) : false;
   out({
     config: cfgErr ? { ok: false, error: cfgErr, path: CONFIG } : { ok: true, label: cfg.label, promptFile: cfg.promptFile, cwd: cfg.cwd, cooldownMs: cfg.cooldownMs ?? MIN_COOLDOWN_MS, maxCycles: cfg.maxCycles ?? 0 },
-    state: { paneId: s.paneId ?? null, workspaceId: s.workspaceId ?? null, status: s.status ?? "idle", paused: s.paused === true, cycles: s.cycles ?? 0, lastNudgeAt: s.lastNudgeAt ?? 0, paneAlive: alive },
+    state: { paneId: s.paneId ?? null, workspaceId: s.workspaceId ?? null, status: s.status ?? "idle", paused: s.paused === true, armed: s.armed === undefined ? true : s.armed === true, cycles: s.cycles ?? 0, lastNudgeAt: s.lastNudgeAt ?? 0, paneAlive: alive },
     log: LOG,
   });
 }
@@ -142,7 +142,7 @@ function cmdStart() {
   const sent = herdr("pane.send_text", { pane_id: paneId, text: boot });
   if (!sent.ok) return die(3, `pane.send_text failed: ${sent.error?.message}`);
 
-  saveState({ paneId, workspaceId: wsId, status: "running", paused: false, cycles: 0, lastNudgeAt: 0, startedAt: Date.now() });
+  saveState({ paneId, workspaceId: wsId, status: "running", paused: false, armed: false, cycles: 0, lastNudgeAt: 0, startedAt: Date.now() });
   log(`start: pane ${paneId} in ${label} (workspace ${wsId})`);
   out({ ok: true, paneId, workspaceId: wsId });
 }
@@ -184,7 +184,24 @@ function cmdEvent() {
     process.exit(0);
   }
   const status = typeof data.agent_status === "string" ? data.agent_status : "";
-  if (status !== "idle" && status !== "done") process.exit(0); // working/blocked: hands off
+  if (status !== "idle" && status !== "done") {
+    // working/blocked: hands off — but the FIRST work this run arms the loop:
+    // only after work does a settle mean "finished a turn" instead of
+    // "herdr reporting the pane's birth idle".
+    if ((status === "working" || status === "blocked") && s.armed !== true && s.status === "running") {
+      saveState({ ...s, armed: true });
+      log(`armed: pane ${paneId} seen ${status} — settles count from now on`);
+    }
+    process.exit(0);
+  }
+  // A settle only counts once the pane has done work in this run. Herdr
+  // also reports idle around pane birth (before any turn); the pre-arming
+  // build nudged on it — observed live: nudge #1 fired 1.77s after start,
+  // injecting the nudge text into a newborn task. States written before
+  // `armed` existed (undefined) stay armed: a loop upgraded in place must
+  // not stall mid-chain.
+  const armed = s.armed === undefined ? true : s.armed === true;
+  if (!armed) { log(`settle ignored — pane ${paneId} has done no work yet (birth idle is not a cycle)`); process.exit(0); }
   const cfg = loadConfig();
   if (cfg && validateConfig(cfg)) { log("config became invalid — nudges muted until fixed"); process.exit(0); }
   const cooldown = (cfg?.cooldownMs ?? MIN_COOLDOWN_MS);
@@ -202,7 +219,7 @@ function cmdEvent() {
 
   const text = cfg?.nudgeText ?? DEFAULT_NUDGE;
   const r = herdr("pane.send_text", { pane_id: paneId, text });
-  saveState({ ...s, cycles: cycles + 1, lastNudgeAt: Date.now() });
+  saveState({ ...s, armed: true, cycles: cycles + 1, lastNudgeAt: Date.now() });
   log(`nudge #${cycles + 1} rc=${r.ok ? "ok" : `FAIL ${r.error?.code}`} (pane ${paneId})`);
 }
 

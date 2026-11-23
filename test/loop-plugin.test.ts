@@ -118,7 +118,7 @@ test("loop event: settle nudges our pane, counts the cycle, respects cooldown", 
   try {
     writeFileSync(join(dir, "prompt.md"), "probe");
     const base = { config: goodConfig(dir), event: { event: "pane.agent_status_changed", data: { pane_id: "wA:p1", agent_status: "idle" } } };
-    const a = run(dir, { cmd: ["event"], stubReplies: { "pane.send_text": { result: { type: "ok" } } } }, { ...base, state: { paneId: "wA:p1", status: "running", cycles: 0, lastNudgeAt: 0 } });
+    const a = run(dir, { cmd: ["event"], stubReplies: { "pane.send_text": { result: { type: "ok" } } } }, { ...base, state: { paneId: "wA:p1", status: "running", armed: true, cycles: 0, lastNudgeAt: 0 } });
     assert.equal(a.code, 0);
     assert.equal(a.calls.length, 1);
     assert.ok(a.calls[0].startsWith("pane.send_text"), "the nudge is the only bridge call");
@@ -137,6 +137,64 @@ test("loop event: settle nudges our pane, counts the cycle, respects cooldown", 
     st.lastNudgeAt = Date.now() - 60_000;
     const c = run(dir, { cmd: ["event"], stubReplies: { "pane.send_text": { result: { type: "ok" } } } }, { ...base, state: st });
     assert.equal(c.calls.length, 1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop event: a settle at birth is not work — no nudge until armed", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const r = run(dir, { cmd: ["event"], stubReplies: { "pane.send_text": { result: { type: "ok" } } } }, {
+      config: goodConfig(dir),
+      state: { paneId: "wA:p1", status: "running", armed: false, cycles: 0, lastNudgeAt: 0 },
+      event: { event: "pane.agent_status_changed", data: { pane_id: "wA:p1", agent_status: "idle" } },
+    });
+    assert.equal(r.code, 0);
+    assert.deepEqual(r.calls, [], "herdr's birth-idle must not earn a nudge");
+    const st = JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8"));
+    assert.equal(st.cycles, 0, "an unarmed settle counts nothing");
+    assert.equal(st.armed, false);
+    assert.match(readFileSync(join(dir, "state", "loop.log"), "utf8"), /no work/, "the skip is logged honestly");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop event: work arms the loop, then a settle nudges", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const w = run(dir, { cmd: ["event"] }, {
+      config: goodConfig(dir),
+      state: { paneId: "wA:p1", status: "running", armed: false, cycles: 0, lastNudgeAt: 0 },
+      event: { event: "pane.agent_status_changed", data: { pane_id: "wA:p1", agent_status: "working" } },
+    });
+    assert.equal(w.code, 0);
+    assert.deepEqual(w.calls, []);
+    assert.equal(JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8")).armed, true, "seeing work arms the loop");
+
+    const s = run(dir, { cmd: ["event"], stubReplies: { "pane.send_text": { result: { type: "ok" } } } }, {
+      config: goodConfig(dir),
+      state: JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8")),
+      event: { event: "pane.agent_status_changed", data: { pane_id: "wA:p1", agent_status: "idle" } },
+    });
+    assert.equal(s.calls.length, 1, "the settle after real work is the one that nudges");
+    assert.equal(JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8")).cycles, 1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop event: grandfathered pre-arming state still nudges (upgrade continuity)", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const r = run(dir, { cmd: ["event"], stubReplies: { "pane.send_text": { result: { type: "ok" } } } }, {
+      config: goodConfig(dir),
+      // Exactly the shape the live pre-C10 build writes: no `armed` field.
+      state: { paneId: "wA:p1", status: "running", cycles: 1, lastNudgeAt: Date.now() - 60_000 },
+      event: { event: "pane.agent_status_changed", data: { pane_id: "wA:p1", agent_status: "done" } },
+    });
+    assert.equal(r.calls.length, 1, "a running loop upgraded in place must not stall");
+    const st = JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8"));
+    assert.equal(st.cycles, 2);
+    assert.equal(st.armed, true, "the upgrade persists the grandfathered arm");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -202,6 +260,7 @@ test("loop start: boots the pane with a properly escaped pi command", () => {
     const st = JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8"));
     assert.equal(st.paneId, "w7:p3");
     assert.equal(st.status, "running");
+    assert.equal(st.armed, false, "a fresh run must prove itself before settles count");
 
     // Idempotent while alive: one pane.list, then refuses.
     const again = run(dir, { cmd: ["start"], stubReplies: { "pane.list": { result: { panes: [{ pane_id: "w7:p3" }] } } } }, { config: goodConfig(dir), state: st });
@@ -250,13 +309,14 @@ test("loop status: honest JSON for humans and scripts", () => {
     writeFileSync(join(dir, "prompt.md"), "probe");
     const r = run(dir, { cmd: ["status"], stubReplies: { "pane.list": { result: { panes: [{ pane_id: "w7:p3" }] } } } }, {
       config: goodConfig(dir, { cooldownMs: 30_000, maxCycles: 5 }),
-      state: { paneId: "w7:p3", workspaceId: "w7", status: "running", cycles: 2, lastNudgeAt: 123 },
+      state: { paneId: "w7:p3", workspaceId: "w7", status: "running", armed: true, cycles: 2, lastNudgeAt: 123 },
     });
     assert.equal(r.code, 0);
     const j = JSON.parse(r.stdout);
     assert.equal(j.config.ok, true);
     assert.equal(j.config.maxCycles, 5);
     assert.equal(j.state.cycles, 2);
+    assert.equal(j.state.armed, true);
     assert.equal(j.state.paneAlive, true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
