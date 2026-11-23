@@ -55,6 +55,8 @@
     "plugin/server/*.d.mts",
     "plugin/mirror/herdr-plugin.toml",
     "plugin/mirror/server/*.mjs",
+    "plugin/loop/herdr-plugin.toml",
+    "plugin/loop/server/*.mjs",
     "scripts/*.mjs",
     "scripts/*.sh",
     "DEPLOY.md",
