@@ -130,3 +130,4 @@
 - Chính session đang chạy là nguồn bằng chứng tốt nhất: nudge arrives làm input #2 lúc sinh lộ bug mà không log nào ghi. Đọc log loop thật TRƯỚC khi chọn theme vòng.
 - Nâng cấp tại chỗ của máy trạng thái phải grandfather state cũ: thêm trường `armed` mà coi state thiếu trường là unarmed = giết chuỗi đang chạy trên máy thật ở event kế tiếp. Mặc định nâng cấp = giữ hành vi cũ cho dữ liệu cũ.
 - Một plugin-id = một state = một loop: event hook của herdr luôn đọc state dir chuẩn — probe song song phải bơm event tay đúng form; foreign-check nuốt event pane lạ (đúng thiết kế, và cũng là rào an toàn cho probe).
+| v0.11.0 | 2026-11-23 | 🚀 RELEASE "Self-healing + Loop" — gộp theme: C7 publisher watchdog (serve) + C8 TUI watchdog (run-id lock) + C9 plugin/loop shipped + C10 arming | bump + tag v0.11.0 | Đủ điều kiện 2b(a): trọn theme lớn user-facing. Suite 333/0. Windows-on-metal verify TUI watchdog đá ngay sau publish (nợ C8) |
