@@ -110,7 +110,26 @@ trong test cooldown cũ — không sleep).
 
 ## Nghiệm thu (điền khi xong)
 
-- (đang thực hiện)
+- **Red-first**: sau bước test-trước, `node --test test/loop-plugin.test.ts`
+  → 21 pass / 5 fail, ĐỎ đúng chỗ: hai settle fail ở `noopStreak expected 1,
+  actual 0` (chưa đếm), 3-no-op fail ở `expected 3, actual 0`, resume/start
+  fail ở "resume clears pausedBy", config fail ở default chưa lộ trong status.
+  Trung thực: test thứ 6 (cwd không phải repo → unknown → nudge như cũ) xanh
+  SẴN cả trước lẫn sau implement — nó là regression guard cho hành vi cũ,
+  không phải red-first.
+- **Green**: sau implement, `node --test test/loop-plugin.test.ts` →
+  **26 pass / 0 fail** (tuyệt đối, gồm 6 test C17 + 20 test cũ);
+  `node --test test/loop-boot.test.ts` → 4 pass / 0 fail.
+  Một vòng sửa test trong quá trình đỏ→xanh: lệnh `start` trong test E thiếu
+  fixture config (harness xoá loop.json khi không truyền tuỳ chọn) — lỗi harness,
+  không phải code plugin.
+- Docs: đúng 1 câu trong `docs/DEV-LOOP.md` mục "Tự vận hành" đã thay
+  (cấm tự-pause → tự pause sau 2 no-op + log `auto-pause` + resume của owner);
+  `git diff main --stat` chỉ gồm spec + test + plugin/loop/server/index.mjs
+  + DEV-LOOP.md.
+- Verify sống: KHÔNG làm (ràng buộc vòng cấm restart service / can thiệp pane
+  herdr) — đã nêu trong "Ghi chú cho reviewer"; suite targeted là bằng chứng
+  của vòng này.
 
 ## Ghi chú cho reviewer
 

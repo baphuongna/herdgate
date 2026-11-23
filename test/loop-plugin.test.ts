@@ -492,6 +492,218 @@ test("loop stop/pause/resume: owned workspace only, already-gone is success", ()
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+// ---- C17: auto-pause after consecutive no-op cycles -------------------------
+
+// A throwaway repo for the commit-subject classifier. `commit --allow-empty`
+// works on the unborn branch too, but the seeded first commit (dated 2h ago,
+// OUTSIDE every classification window) keeps the fixture independent of git
+// versions and keeps the window clean of setup noise.
+function gitSeed(dir) {
+  const old = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  const init = spawnSync("git", ["init", "-q", "-b", "main", dir], { encoding: "utf8" });
+  assert.equal(init.status, 0, init.stderr);
+  writeFileSync(join(dir, ".seed"), "fixture");
+  const add = spawnSync("git", ["-C", dir, "add", "-A"], { encoding: "utf8" });
+  assert.equal(add.status, 0, add.stderr);
+  const c = spawnSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t.t", "commit", "-q", "-m", "seed"], {
+    encoding: "utf8", env: { ...process.env, GIT_AUTHOR_DATE: old, GIT_COMMITTER_DATE: old },
+  });
+  assert.equal(c.status, 0, c.stderr);
+}
+
+function gitCommit(dir, subject) {
+  const c = spawnSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t.t", "commit", "--allow-empty", "-q", "-m", subject], { encoding: "utf8" });
+  assert.equal(c.status, 0, c.stderr);
+}
+
+const idleEvent = { event: "pane.agent_status_changed", data: { pane_id: "wA:p1", agent_status: "idle" } };
+const nudgeReply = { "pane.send_text": { result: { type: "ok" } } };
+
+function c17State(over = {}) {
+  // lastNudgeAt 60s back so the first settle is past cooldown; startedAt even
+  // further back — the classifier window starts at the newer of the two.
+  return { paneId: "wA:p1", status: "running", armed: true, cycles: 0, noopStreak: 0, lastNudgeAt: Date.now() - 60_000, startedAt: Date.now() - 120_000, ...over };
+}
+
+function readState(dir) {
+  return JSON.parse(readFileSync(join(dir, "state", "state.json"), "utf8"));
+}
+
+function readLog(dir) {
+  return readFileSync(join(dir, "state", "loop.log"), "utf8");
+}
+
+test("c17 config: noopPauseAfter/noopPattern validate fail-closed; defaults visible in status", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const bad = [
+      [{ noopPauseAfter: -1 }, /noopPauseAfter/],
+      [{ noopPauseAfter: 1.5 }, /noopPauseAfter/],
+      [{ noopPattern: "(" }, /noopPattern/],
+      [{ noopPattern: "x".repeat(121) }, /noopPattern/],
+    ];
+    for (const [over, re] of bad) {
+      const r = run(dir, { cmd: ["start"] }, { config: goodConfig(dir, over) });
+      assert.equal(r.code, 2, `expected exit 2 for ${JSON.stringify(over)}: ${r.stderr}`);
+      assert.match(r.stderr, re, `the error must name the field: ${JSON.stringify(over)}`);
+      assert.deepEqual(r.calls, [], "a rejected config never reaches the bridge");
+    }
+    // Absent fields: the default threshold (2) is visible in status, and a
+    // valid pair passes start.
+    const s = run(dir, { cmd: ["status"] }, {
+      config: goodConfig(dir),
+      state: { paneId: "wA:p1", status: "running", noopStreak: 2, pausedBy: "auto" },
+    });
+    assert.equal(s.code, 0, s.stderr);
+    const j = JSON.parse(s.stdout);
+    assert.equal(j.config.ok, true);
+    assert.equal(j.config.noopPauseAfter, 2, "the default shows in status");
+    assert.equal(j.state.noopStreak, 2);
+    assert.equal(j.state.pausedBy, "auto");
+    const empty = run(dir, { cmd: ["status"] }, { config: goodConfig(dir), state: { paneId: "wA:p1", status: "running" } });
+    const e = JSON.parse(empty.stdout);
+    assert.equal(e.state.noopStreak, 0);
+    assert.equal(e.state.pausedBy, null);
+    const replies = {
+      "workspace.list": { result: { workspaces: [{ workspace_id: "w7", label: "⚙ probe" }] } },
+      "tab.create": { result: { root_pane: { pane_id: "w7:p3" } } },
+      "pane.send_text": { result: { type: "ok" } },
+    };
+    const ok = run(dir, { cmd: ["start"], stubReplies: replies }, { config: goodConfig(dir, { noopPauseAfter: 5, noopPattern: "^no-op" }) });
+    assert.equal(ok.code, 0, ok.stderr);
+    assert.equal(readState(dir).noopStreak, 0, "a fresh run starts with a clean streak");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c17: two no-op settles in a row auto-pause the loop (no second nudge)", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    gitSeed(dir);
+    gitCommit(dir, "no-op — backlog trống");
+    const cfg = goodConfig(dir);
+    const a = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, { config: cfg, state: c17State(), event: idleEvent });
+    assert.equal(a.code, 0, a.stderr);
+    assert.equal(a.calls.length, 1, "streak 1 < 2: the first no-op settle still nudges");
+    const st1 = readState(dir);
+    assert.equal(st1.noopStreak, 1, "the no-op cycle is counted");
+    assert.notEqual(st1.paused, true);
+
+    gitCommit(dir, "no-op — backlog trống");
+    // The harness cannot sleep through the cooldown: move the window back,
+    // exactly like the existing cooldown test does.
+    st1.lastNudgeAt = Date.now() - 60_000;
+    const b = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, { config: cfg, state: st1, event: idleEvent });
+    assert.equal(b.code, 0, b.stderr);
+    assert.deepEqual(b.calls, [], "streak 2 reached the threshold: no second nudge");
+    const st2 = readState(dir);
+    assert.equal(st2.paused, true);
+    assert.equal(st2.pausedBy, "auto");
+    assert.equal(st2.noopStreak, 2);
+    assert.equal(st2.status, "running", "auto-pause keeps status running — resume re-arms the same loop");
+    assert.match(readLog(dir), /auto-pause: 2 no-op cycles in a row — resume with the resume action/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c17: a real commit between no-ops resets the streak and nudges", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    gitSeed(dir);
+    gitCommit(dir, "no-op — backlog trống");
+    const cfg = goodConfig(dir);
+    const a = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, { config: cfg, state: c17State(), event: idleEvent });
+    assert.equal(a.calls.length, 1);
+    assert.equal(readState(dir).noopStreak, 1);
+
+    gitCommit(dir, "feat(c17): real work — one SDD cycle");
+    const st1 = readState(dir);
+    st1.lastNudgeAt = Date.now() - 60_000;
+    const b = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, { config: cfg, state: st1, event: idleEvent });
+    assert.equal(b.code, 0, b.stderr);
+    assert.equal(b.calls.length, 1, "a working cycle nudges as always");
+    const st2 = readState(dir);
+    assert.equal(st2.noopStreak, 0, "real work resets the streak");
+    assert.equal(st2.cycles, 2);
+    assert.notEqual(st2.paused, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c17: noopPauseAfter 0 disables auto-pause — no-op cycles keep nudging", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    gitSeed(dir);
+    gitCommit(dir, "no-op — backlog trống");
+    gitCommit(dir, "no-op — backlog trống");
+    gitCommit(dir, "no-op — backlog trống");
+    const cfg = goodConfig(dir, { noopPauseAfter: 0 });
+    let st = c17State();
+    for (let i = 1; i <= 3; i++) {
+      const r = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, { config: cfg, state: st, event: idleEvent });
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(r.calls.length, 1, `settle #${i} nudges — auto-pause is off`);
+      st = readState(dir);
+      st.lastNudgeAt = Date.now() - 60_000;
+      assert.notEqual(st.paused, true);
+    }
+    assert.equal(st.noopStreak, 3, "no-op cycles are still counted, just never pausing");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c17: resume clears pausedBy and the streak; owner pause stamps pausedBy; start starts clean", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const res = run(dir, { cmd: ["resume"] }, { state: { paneId: "wA:p1", workspaceId: "w7", status: "running", paused: true, pausedBy: "auto", noopStreak: 2, cycles: 2 } });
+    assert.equal(res.code, 0, res.stderr);
+    assert.match(res.stdout, /"paused":false/);
+    const st1 = readState(dir);
+    assert.equal(st1.paused, false);
+    assert.ok(!("pausedBy" in st1), "resume clears pausedBy");
+    assert.equal(st1.noopStreak, 0, "resume resets the streak");
+
+    const p = run(dir, { cmd: ["pause"] }, { state: st1 });
+    assert.equal(p.code, 0, p.stderr);
+    assert.match(p.stdout, /"paused":true/);
+    const st2 = readState(dir);
+    assert.equal(st2.pausedBy, "owner", "a manual pause is stamped as the owner's");
+
+    const replies = {
+      "workspace.list": { result: { workspaces: [] } },
+      "workspace.create": { result: { workspace: { workspace_id: "w9" } } },
+      "workspace.rename": { result: { type: "ok" } },
+      "tab.create": { result: { root_pane: { pane_id: "w9:p1" } } },
+      "pane.send_text": { result: { type: "ok" } },
+    };
+    const s = run(dir, { cmd: ["start"], stubReplies: replies }, { config: goodConfig(dir), state: st2 });
+    assert.equal(s.code, 0, s.stderr);
+    const st3 = readState(dir);
+    assert.equal(st3.noopStreak, 0);
+    assert.ok(!("pausedBy" in st3), "a fresh start has no pausedBy");
+    assert.equal(st3.paused, false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c17: cwd without git is 'unknown' — streak untouched, nudge as before, no pause", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    // No git repo here. A stale streak (from an older, stricter config) must
+    // neither grow nor trigger a pause: unknown evidence punishes nobody.
+    const r = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, {
+      config: goodConfig(dir), state: c17State({ noopStreak: 5 }), event: idleEvent,
+    });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.calls.length, 1, "unknown still nudges per cooldown — old behavior");
+    const st = readState(dir);
+    assert.equal(st.noopStreak, 5, "unknown evidence must not move the streak");
+    assert.notEqual(st.paused, true);
+    assert.ok(!("pausedBy" in st));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("loop status: honest JSON for humans and scripts", () => {
   const dir = tmp();
   try {

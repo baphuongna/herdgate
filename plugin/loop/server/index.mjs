@@ -16,7 +16,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { bootText, buildBoot, validateBootCommand } from "./boot.mjs";
 import { auditWindow } from "./audit.mjs";
 
@@ -81,6 +81,14 @@ function validateConfig(c) {
   if (c.nudgeText !== undefined && (typeof c.nudgeText !== "string" || c.nudgeText.length > 2000)) return "loop.json: `nudgeText` must be a string <= 2000 chars";
   const bootErr = validateBootCommand(c.bootCommand);
   if (bootErr) return bootErr;
+  // C17: auto-pause tuning. Defaults live here (not at the read sites) so
+  // status, the event engine and validation agree on one number/pattern.
+  const noopPauseAfter = c.noopPauseAfter ?? 2;
+  if (!Number.isInteger(noopPauseAfter) || noopPauseAfter < 0) return "loop.json: `noopPauseAfter` must be an integer >= 0 (0 disables auto-pause)";
+  if (c.noopPattern !== undefined) {
+    if (typeof c.noopPattern !== "string" || c.noopPattern.length < 1 || c.noopPattern.length > 120) return "loop.json: `noopPattern` must be a string of 1-120 chars";
+    try { new RegExp(c.noopPattern); } catch { return "loop.json: `noopPattern` is not a valid JS regex"; }
+  }
   return null;
 }
 
@@ -131,6 +139,22 @@ function herdr(method, params) {
 
 const wsLabel = (label) => `⚙ ${label}`;
 
+// C17: was the finished cycle work or a no-op? The honest witness is git —
+// the dev-loop protocol has every cycle leave a commit, and a no-op cycle
+// leaves a `no-op …` subject by convention. Read-only (`git log`), bounded
+// (10s timeout), and agnostic to what the agent claims about itself.
+// "unknown" (no repo, git failure, empty window) never moves the streak:
+// without evidence the old nudge behavior stands — no punishment by guesswork.
+function classifyCycle(cfg, sinceMs, now) {
+  const r = spawnSync("git", ["-C", cfg.cwd, "log", `--since=${new Date(sinceMs).toISOString()}`, `--until=${new Date(now).toISOString()}`, "--format=%s"], { timeout: 10_000, encoding: "utf8" });
+  if (r.error || r.status !== 0) return "unknown";
+  const subjects = r.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (subjects.length === 0) return "unknown";
+  let pattern;
+  try { pattern = new RegExp(cfg?.noopPattern ?? "no-op"); } catch { return "unknown"; }
+  return subjects.every((s) => pattern.test(s)) ? "no-op" : "work";
+}
+
 async function paneAlive(paneId) {
   const r = await herdr("pane.list", {});
   return r.ok && Array.isArray(r.result?.panes) && r.result.panes.some((p) => p?.pane_id === paneId);
@@ -144,8 +168,8 @@ async function cmdStatus() {
   const s = loadState();
   const alive = s.paneId ? await paneAlive(s.paneId) : false;
   out({
-    config: cfgErr ? { ok: false, error: cfgErr, path: CONFIG } : { ok: true, label: cfg.label, promptFile: cfg.promptFile, cwd: cfg.cwd, boot: buildBoot(cfg), cooldownMs: cfg.cooldownMs ?? MIN_COOLDOWN_MS, maxCycles: cfg.maxCycles ?? 0 },
-    state: { paneId: s.paneId ?? null, workspaceId: s.workspaceId ?? null, status: s.status ?? "idle", paused: s.paused === true, armed: s.armed === undefined ? true : s.armed === true, cycles: s.cycles ?? 0, lastNudgeAt: s.lastNudgeAt ?? 0, lastAuditAt: s.lastAuditAt ?? null, auditHold: s.auditHold ?? null, paneAlive: alive },
+    config: cfgErr ? { ok: false, error: cfgErr, path: CONFIG } : { ok: true, label: cfg.label, promptFile: cfg.promptFile, cwd: cfg.cwd, boot: buildBoot(cfg), cooldownMs: cfg.cooldownMs ?? MIN_COOLDOWN_MS, maxCycles: cfg.maxCycles ?? 0, noopPauseAfter: cfg.noopPauseAfter ?? 2 },
+    state: { paneId: s.paneId ?? null, workspaceId: s.workspaceId ?? null, status: s.status ?? "idle", paused: s.paused === true, pausedBy: s.pausedBy ?? null, armed: s.armed === undefined ? true : s.armed === true, cycles: s.cycles ?? 0, noopStreak: Number(s.noopStreak) || 0, lastNudgeAt: s.lastNudgeAt ?? 0, lastAuditAt: s.lastAuditAt ?? null, auditHold: s.auditHold ?? null, paneAlive: alive },
     log: LOG,
   });
 }
@@ -190,7 +214,7 @@ async function cmdStart() {
   const sent = await herdr("pane.send_text", { pane_id: paneId, text: bootText(cfg) });
   if (!sent.ok) return die(3, `pane.send_text failed: ${sent.error?.message}`);
 
-  saveState({ paneId, workspaceId: wsId, status: "running", paused: false, armed: false, cycles: 0, lastNudgeAt: 0, startedAt: Date.now() });
+  saveState({ paneId, workspaceId: wsId, status: "running", paused: false, armed: false, cycles: 0, noopStreak: 0, lastNudgeAt: 0, startedAt: Date.now() });
   log(`start: pane ${paneId} in ${label} (workspace ${wsId})`);
   out({ ok: true, paneId, workspaceId: wsId });
 }
@@ -210,10 +234,20 @@ async function cmdStop() {
 function cmdPause(resume) {
   const s = loadState();
   if (!s.paneId && !s.workspaceId) return die(1, "no loop to pause/resume");
-  // resume = the owner reviewed the audit hold: cleared for good (undefined
-  // keys vanish from the JSON), while the audited window stays recorded.
-  saveState({ ...s, paused: !resume, ...(resume ? { auditHold: undefined } : {}) });
-  log(resume ? `resume: nudges re-enabled${s.auditHold ? " — audit hold cleared" : ""}` : "pause: nudges muted");
+  // resume = the owner decided: the audit hold is cleared for good (undefined
+  // keys vanish from the JSON; the audited window stays recorded) and the
+  // no-op streak is forgiven — counting stale no-ops against a loop the owner
+  // just resumed would re-pause it on the very next quiet cycle.
+  const next = { ...s, paused: !resume };
+  if (resume) {
+    next.noopStreak = 0;
+    delete next.pausedBy;
+    next.auditHold = undefined;
+  } else {
+    next.pausedBy = "owner";
+  }
+  saveState(next);
+  log(resume ? `resume: nudges re-enabled (noop streak reset${s.auditHold ? ", audit hold cleared" : ""})` : "pause: nudges muted (pausedBy owner)");
   out({ ok: true, paused: !resume });
 }
 
@@ -283,6 +317,22 @@ async function cmdEvent() {
   if (audit.ok) log(`AUDIT ok commits=${audit.commits.length} tags=${audit.tags.length}`);
   else log(`AUDIT error ${audit.error} — fail-open: infra failure is not evidence of a violation; window re-audited next settle`);
 
+
+  // C17: the settle is a valid finished cycle — classify it by the commits
+  // it produced, BEFORE the nudge decision. "unknown" leaves the streak
+  // (and the pause verdict) untouched; only a counted no-op can pause.
+  const verdict = classifyCycle(cfg, Number(s.lastNudgeAt) || Number(s.startedAt) || 0, Date.now());
+  if (verdict === "no-op") {
+    s.noopStreak = (Number(s.noopStreak) || 0) + 1;
+    const noopPauseAfter = cfg?.noopPauseAfter ?? 2;
+    if (noopPauseAfter > 0 && s.noopStreak >= noopPauseAfter) {
+      saveState({ ...s, paused: true, pausedBy: "auto", pausedAt: Date.now(), status: "running", ...auditMark });
+      log(`auto-pause: ${s.noopStreak} no-op cycles in a row — resume with the resume action`);
+      process.exit(0);
+    }
+  } else if (verdict === "work") {
+    s.noopStreak = 0;
+  }
   if (maxCycles > 0 && cycles >= maxCycles) {
     if (s.status !== "done") { saveState({ ...s, ...auditMark, status: "done" }); log(`maxCycles ${maxCycles} reached — loop done`); }
     process.exit(0);

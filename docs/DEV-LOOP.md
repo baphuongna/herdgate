@@ -33,8 +33,9 @@
   trạng thái: action `status` của plugin.
 - **Backlog trống** (hết mục 🔄/queued, không nợ giao/nghiệm thu nào trả
   được ngay): vòng **no-op ngắn** — quét log sống (loop/gate/publisher)
-  + 1 dòng Cycle Log `no-op — backlog trống`; KHÔNG săn theme ép,
-  KHÔNG tự pause loop (quyết định dừng là của owner).
+  + 1 dòng Cycle Log `no-op — backlog trống`; KHÔNG săn theme ép;
+  loop tự pause sau 2 no-op liên tiếp (ghi log `auto-pause`),
+  resume vẫn là quyết định của owner.
 
 ## Nguyên tắc bất biến (mọi vòng đều chịu ràng buộc)
 
