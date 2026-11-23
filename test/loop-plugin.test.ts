@@ -50,35 +50,74 @@ test("loop plugin: self-contained, and shipped by npm", () => {
 function stubHerdr(dir, replies) {
   // One JSON-RPC request per process: the stub logs the method and answers
   // from the per-case reply map, exactly like the real bridge contract.
+  // It answers on the first complete line and exits — the EOF-answer shape
+  // (a bridge that waits for stdin to close before replying).
   const bin = join(dir, `herdr-stub-${Math.random().toString(36).slice(2)}.mjs`);
   const calls = join(dir, "calls.log");
   writeFileSync(bin, `#!/usr/bin/env node
-import { appendFileSync, readFileSync } from "node:fs";
-const req = JSON.parse(readFileSync(0, "utf8").split("\\n")[0]);
-appendFileSync(${JSON.stringify(calls)}, req.method + " " + JSON.stringify(req.params) + "\\n");
-const map = ${JSON.stringify(JSON.stringify(replies))};
-const r = JSON.parse(map)[req.method] ?? { result: {} };
-process.stdout.write(JSON.stringify({ id: req.id, ...r }) + "\\n");
+import { appendFileSync } from "node:fs";
+let buf = "";
+process.stdin.on("data", (d) => {
+  buf += d;
+  const nl = buf.indexOf("\\n");
+  if (nl === -1) return;
+  const req = JSON.parse(buf.slice(0, nl));
+  appendFileSync(${JSON.stringify(calls)}, req.method + " " + JSON.stringify(req.params) + "\\n");
+  const map = ${JSON.stringify(JSON.stringify(replies))};
+  const r = JSON.parse(map)[req.method] ?? { result: {} };
+  process.stdout.write(JSON.stringify({ id: req.id, ...r }) + "\\n");
+  process.exit(0);
+});
 `);
   return { bin, calls };
 }
 
-function run(dir, argv, { event, config, state } = {}) {
+// The real herdr 0.9.5 bridge shape, caught live on Windows: it replies on
+// its own schedule and does NOT exit on stdin EOF — a client that closes
+// stdin after writing (spawnSync `input`) races EOF against the reply and
+// loses (observed: the server executed the request, the plugin saw
+// "no-reply" and died). This stub delays its reply and stays alive.
+function holdingStubHerdr(dir, replies, delayMs = 250) {
+  const bin = join(dir, `herdr-hold-${Math.random().toString(36).slice(2)}.mjs`);
+  const calls = join(dir, "calls.log");
+  writeFileSync(bin, `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+let buf = "";
+const timer = setInterval(() => {}, 1 << 30);
+process.stdin.on("data", (d) => {
+  buf += d;
+  const nl = buf.indexOf("\\n");
+  if (nl === -1) return;
+  const req = JSON.parse(buf.slice(0, nl));
+  appendFileSync(${JSON.stringify(calls)}, req.method + " " + JSON.stringify(req.params) + "\\n");
+  const map = ${JSON.stringify(JSON.stringify(replies))};
+  const r = JSON.parse(map)[req.method] ?? { result: {} };
+  setTimeout(() => process.stdout.write(JSON.stringify({ id: req.id, ...r }) + "\\n"), ${delayMs});
+  process.stdin.resume();
+});
+`);
+  return { bin, calls };
+}
+
+function run(dir, argv, { event, config, state, bin } = {}) {
   const configDir = join(dir, "config");
   const stateDir = join(dir, "state");
   mkdirSync(configDir, { recursive: true });
   mkdirSync(stateDir, { recursive: true });
-  if (config !== undefined) writeFileSync(join(configDir, "loop.json"), JSON.stringify(config));
-  else rmSync(join(configDir, "loop.json"), { force: true });
+  if (config !== undefined) {
+    // A string is written raw (byte-exact fixtures — e.g. a UTF-8 BOM);
+    // anything else is serialized like the owner's real config.
+    writeFileSync(join(configDir, "loop.json"), typeof config === "string" ? config : JSON.stringify(config));
+  } else rmSync(join(configDir, "loop.json"), { force: true });
   if (state !== undefined) writeFileSync(join(stateDir, "state.json"), JSON.stringify(state));
   else rmSync(join(stateDir, "state.json"), { force: true });
-  const { bin } = stubHerdr(dir, (argv.stubReplies ?? {}));
+  const { bin: defaultBin } = stubHerdr(dir, (argv.stubReplies ?? {}));
   const child = spawnSync(process.execPath, [INDEX, ...argv.cmd], {
     env: {
       ...process.env,
       HERDR_PLUGIN_CONFIG_DIR: configDir,
       HERDR_PLUGIN_STATE_DIR: stateDir,
-      HERDR_BIN_PATH: bin,
+      HERDR_BIN_PATH: bin ?? defaultBin,
       HOME: dir, // cwd-under-home validation sees the sandbox as home
       ...(event ? { HERDR_PLUGIN_EVENT_JSON: JSON.stringify(event) } : {}),
     },
@@ -309,6 +348,87 @@ test("loop start: a broken chain with a dead pane restarts cleanly", () => {
     assert.equal(st.paneId, "w7:p9", "a fresh pane takes over the same owned workspace");
     assert.equal(st.status, "running");
     assert.equal(st.cycles, 0, "a restart counts from zero");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop start: a Windows-shaped cwd under home passes the under-home check", () => {
+  const dir = tmp();
+  try {
+    // 0.12.0 hardcoded home + "/": on Windows the separator is "\\", so every
+    // real cwd (C:\Users\x\proj) failed validation — the loop could only
+    // run with cwd == home exactly. A dir whose name contains a literal
+    // backslash reproduces the Windows path shape on Linux: <home>\proj.
+    const winDir = dir + "\\proj";
+    mkdirSync(winDir);
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const replies = {
+      "workspace.list": { result: { workspaces: [] } },
+      "workspace.create": { result: { workspace: { workspace_id: "w9" } } },
+      "workspace.rename": { result: { type: "ok" } },
+      "tab.create": { result: { root_pane: { pane_id: "w9:p1" } } },
+      "pane.send_text": { result: { type: "ok" } },
+    };
+    const r = run(dir, { cmd: ["start"], stubReplies: replies }, {
+      config: { v: 1, label: "probe", promptFile: join(dir, "prompt.md"), cwd: winDir, cooldownMs: 10_000, maxCycles: 1 },
+    });
+    assert.equal(r.code, 0, r.stderr);
+    assert.ok(r.calls.some((c) => c.startsWith("tab.create ") && JSON.parse(c.slice("tab.create ".length)).cwd === winDir),
+      "the Windows-shaped cwd reaches tab.create (pane born in it — no cd typed)");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop start: cwd outside home is still rejected, whatever the separator", () => {
+  const dir = tmp();
+  const outside = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const bad = run(dir, { cmd: ["start"] }, { config: goodConfig(dir, { cwd: outside }) });
+    assert.equal(bad.code, 2);
+    assert.match(bad.stderr, /must live under the owner's home/);
+    assert.deepEqual(bad.calls, [], "a rejected cwd never reaches the bridge");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("loop status: a UTF-8 BOM in loop.json still loads (Windows Notepad/PowerShell default)", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    // PowerShell 5.1 `Set-Content -Encoding utf8` and old Notepad write a
+    // UTF-8 BOM; JSON.parse chokes on it and the plugin reported the
+    // misleading "loop.json not found (CONFIG_DIR)" — caught live on the
+    // owner's Windows laptop during the C12 probe.
+    const bom = "\uFEFF" + JSON.stringify(goodConfig(dir));
+    const r = run(dir, { cmd: ["status"] }, { config: bom });
+    assert.equal(r.code, 0);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.config.ok, true, `config must load, got: ${out.config.error}`);
+    assert.equal(out.config.label, "probe");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loop start: a bridge that holds stdin open (real 0.9.5 shape) still gets its reply", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const { bin, calls } = holdingStubHerdr(dir, {
+      "workspace.list": { result: { workspaces: [] } },
+      "workspace.create": { result: { workspace: { workspace_id: "w9" } } },
+      "workspace.rename": { result: { type: "ok" } },
+      "tab.create": { result: { root_pane: { pane_id: "w9:p1" } } },
+      "pane.send_text": { result: { type: "ok" } },
+      "pane.list": { result: { panes: [] } },
+    });
+    // The stub replies after 250ms and never exits: spawnSync(input) would
+    // race its own EOF against the delayed reply and starve the start —
+    // exactly the Windows failure (request executed server-side, plugin
+    // died "no-reply"). The client must hold stdin open until the reply.
+    const r = run(dir, { cmd: ["start"] }, { config: goodConfig(dir), bin });
+    assert.equal(r.code, 0, r.stderr);
+    assert.ok(r.calls.some((c) => c.startsWith("workspace.create ")), "the request reached the bridge");
+    assert.ok(r.calls.some((c) => c.startsWith("pane.send_text ")), "boot was typed after the delayed replies");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -16,7 +16,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { bootText, buildBoot, validateBootCommand } from "./boot.mjs";
 
 const CONFIG_DIR = process.env.HERDR_PLUGIN_CONFIG_DIR || join(homedir(), ".config", "herdgate-loop");
@@ -46,7 +46,11 @@ function log(line) {
 
 function readJson(file, fallback) {
   try {
-    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    // Strip a UTF-8 BOM: Windows PowerShell 5.1 `-Encoding utf8` and legacy
+    // Notepad prepend one, and JSON.parse chokes on it — the plugin used to
+    // report a misleading "not found" for a file the owner had just written
+    // (caught live on the owner's laptop during the C12 probe).
+    const parsed = JSON.parse(readFileSync(file, "utf8").replace(/^\uFEFF/, ""));
     return parsed && typeof parsed === "object" ? parsed : fallback;
   } catch { return fallback; }
 }
@@ -63,7 +67,12 @@ function validateConfig(c) {
   if (typeof c.cwd !== "string" || !isAbsolute(c.cwd)) return "loop.json: `cwd` must be an absolute path";
   if (!existsSync(c.cwd)) return `loop.json: cwd not found: ${c.cwd}`;
   const home = homedir();
-  if (!(c.cwd === home || c.cwd.startsWith(home + "/"))) return "loop.json: `cwd` must live under the owner's home";
+  // Either separator after home: Windows paths use "\" (homedir() is
+  // drive-lettered there), POSIX uses "/" — node accepts both shapes on
+  // Windows, so a hardcoded "/" rejected every real cwd like
+  // C:\Users\x\proj (only cwd === home slipped through).
+  const underHome = c.cwd === home || c.cwd.startsWith(home + "/") || c.cwd.startsWith(home + "\\");
+  if (!underHome) return "loop.json: `cwd` must live under the owner's home";
   const cooldown = c.cooldownMs ?? MIN_COOLDOWN_MS;
   if (!Number.isInteger(cooldown) || cooldown < MIN_COOLDOWN_MS) return `loop.json: \`cooldownMs\` must be an integer >= ${MIN_COOLDOWN_MS}`;
   const maxCycles = c.maxCycles ?? 0;
@@ -75,37 +84,64 @@ function validateConfig(c) {
 }
 
 // One JSON-RPC request per process — the api-bridge contract.
+// The real bridge (herdr 0.9.5, seen live on Windows) replies on its own
+// schedule and does NOT exit on stdin EOF: it treats EOF as "disconnect
+// now" and drops a pending reply, while the server has already executed
+// the request. A one-shot `spawnSync` write-then-close races EOF against
+// the reply and loses — the start action died "no-reply" on a real laptop
+// while the server created the workspace anyway. So: write the request,
+// HOLD stdin open, take the first reply line, then kill the child.
 function herdr(method, params) {
   const bin = process.env.HERDR_BIN_PATH || "herdr";
   const argv = ["--session", process.env.HERDR_SESSION ?? "default", "remote-api-bridge"];
   const cmd = bin.endsWith(".mjs") ? [process.execPath, bin, ...argv] : [bin, ...argv];
-  const child = spawnSync(cmd[0], cmd.slice(1), {
-    input: JSON.stringify({ id: "r1", method, params }) + "\n",
-    encoding: "utf8",
-    timeout: BRIDGE_TIMEOUT_MS,
+  return new Promise((resolve) => {
+    const child = spawn(cmd[0], cmd.slice(1), { stdio: ["pipe", "pipe", "pipe"] });
+    let out = "", err = "", settled = false;
+    const finish = (r) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { child.kill(); } catch { /* already gone */ }
+      resolve(r);
+    };
+    const timer = setTimeout(
+      () => finish({ ok: false, error: { code: "no-reply", message: `herdr ${method}: no reply within ${BRIDGE_TIMEOUT_MS}ms` } }),
+      BRIDGE_TIMEOUT_MS,
+    );
+    child.stdout.on("data", (d) => {
+      out += d;
+      const nl = out.indexOf("\n");
+      if (nl === -1) return;
+      const line = out.slice(0, nl).trim();
+      if (!line) { out = out.slice(nl + 1); return; }
+      try {
+        const reply = JSON.parse(line);
+        finish(reply.error ? { ok: false, error: reply.error } : { ok: true, result: reply.result });
+      } catch { finish({ ok: false, error: { code: "bad-reply", message: line.slice(0, 120) } }); }
+    });
+    child.stderr.on("data", (d) => { err += d; });
+    child.on("error", (e) => finish({ ok: false, error: { code: "spawn", message: `herdr ${method}: ${String(e.message).slice(0, 120)}` } }));
+    child.on("exit", (code) => { if (!settled) finish({ ok: false, error: { code: "no-reply", message: `herdr ${method}: rc=${code} ${err.slice(0, 120)}` } }); });
+    child.stdin.on("error", () => {}); // EPIPE: the bridge exited before us
+    child.stdin.write(JSON.stringify({ id: "r1", method, params }) + "\n"); // no .end(): stdin stays open until the reply lands
   });
-  const line = String(child.stdout ?? "").split("\n")[0];
-  if (!line) return { ok: false, error: { code: "no-reply", message: `herdr ${method}: rc=${child.status} ${String(child.stderr ?? "").slice(0, 120)}` } };
-  try {
-    const reply = JSON.parse(line);
-    return reply.error ? { ok: false, error: reply.error } : { ok: true, result: reply.result };
-  } catch { return { ok: false, error: { code: "bad-reply", message: line.slice(0, 120) } }; }
 }
 
 const wsLabel = (label) => `⚙ ${label}`;
 
-function paneAlive(paneId) {
-  const r = herdr("pane.list", {});
+async function paneAlive(paneId) {
+  const r = await herdr("pane.list", {});
   return r.ok && Array.isArray(r.result?.panes) && r.result.panes.some((p) => p?.pane_id === paneId);
 }
 
 // ---- actions -------------------------------------------------------------
 
-function cmdStatus() {
+async function cmdStatus() {
   const cfg = loadConfig();
   const cfgErr = cfg ? validateConfig(cfg) : "loop.json not found (CONFIG_DIR)";
   const s = loadState();
-  const alive = s.paneId ? paneAlive(s.paneId) : false;
+  const alive = s.paneId ? await paneAlive(s.paneId) : false;
   out({
     config: cfgErr ? { ok: false, error: cfgErr, path: CONFIG } : { ok: true, label: cfg.label, promptFile: cfg.promptFile, cwd: cfg.cwd, boot: buildBoot(cfg), cooldownMs: cfg.cooldownMs ?? MIN_COOLDOWN_MS, maxCycles: cfg.maxCycles ?? 0 },
     state: { paneId: s.paneId ?? null, workspaceId: s.workspaceId ?? null, status: s.status ?? "idle", paused: s.paused === true, armed: s.armed === undefined ? true : s.armed === true, cycles: s.cycles ?? 0, lastNudgeAt: s.lastNudgeAt ?? 0, paneAlive: alive },
@@ -113,7 +149,7 @@ function cmdStatus() {
   });
 }
 
-function cmdStart() {
+async function cmdStart() {
   const cfg = loadConfig();
   const cfgErr = cfg ? validateConfig(cfg) : "loop.json not found — write it in the plugin CONFIG_DIR first";
   if (cfgErr || !cfg) return die(2, cfgErr);
@@ -122,25 +158,25 @@ function cmdStart() {
   // leaves the final answer on screen for the owner to read; restarting on
   // top of it used to orphan that pane (its tab stayed open forever, events
   // swallowed by the foreign check). Refuse and name the way out: stop first.
-  if (s.paneId && paneAlive(s.paneId)) {
+  if (s.paneId && (await paneAlive(s.paneId))) {
     return die(1, `pane ${s.paneId} still open (status: ${s.status ?? "?"}${s.cycles ? `, ${s.cycles} cycles` : ""}) — stop it first`);
   }
 
   // Reuse our workspace by label; create it only if missing.
   const label = wsLabel(cfg.label);
   let wsId = null;
-  const list = herdr("workspace.list", {});
+  const list = await herdr("workspace.list", {});
   const found = list.ok && Array.isArray(list.result?.workspaces) && list.result.workspaces.find((w) => w?.label === label);
   if (found) wsId = found.workspace_id;
   else {
-    const created = herdr("workspace.create", {});
+    const created = await herdr("workspace.create", {});
     if (!created.ok) return die(3, `workspace.create failed: ${created.error?.message}`);
     wsId = created.result?.workspace?.workspace_id;
     if (!wsId) return die(3, "workspace.create returned no workspace_id");
-    const renamed = herdr("workspace.rename", { workspace_id: wsId, label });
+    const renamed = await herdr("workspace.rename", { workspace_id: wsId, label });
     if (!renamed.ok) log(`warn: workspace.rename failed: ${renamed.error?.message}`);
   }
-  const tab = herdr("tab.create", { workspace_id: wsId, label: cfg.label, cwd: cfg.cwd });
+  const tab = await herdr("tab.create", { workspace_id: wsId, label: cfg.label, cwd: cfg.cwd });
   if (!tab.ok) return die(3, `tab.create failed: ${tab.error?.message}`);
   const paneId = tab.result?.root_pane?.pane_id;
   if (!paneId) return die(3, "tab.create returned no root_pane.pane_id");
@@ -150,7 +186,7 @@ function cmdStart() {
   // shell (sh, PowerShell, cmd.exe) passes verbatim — and the pane is born
   // in cfg.cwd via tab.create, so there is no `cd` to spell per platform.
   // Owners with a different shell/agent override via loop.json bootCommand.
-  const sent = herdr("pane.send_text", { pane_id: paneId, text: bootText(cfg) });
+  const sent = await herdr("pane.send_text", { pane_id: paneId, text: bootText(cfg) });
   if (!sent.ok) return die(3, `pane.send_text failed: ${sent.error?.message}`);
 
   saveState({ paneId, workspaceId: wsId, status: "running", paused: false, armed: false, cycles: 0, lastNudgeAt: 0, startedAt: Date.now() });
@@ -158,10 +194,10 @@ function cmdStart() {
   out({ ok: true, paneId, workspaceId: wsId });
 }
 
-function cmdStop() {
+async function cmdStop() {
   const s = loadState();
   if (!s.workspaceId) return die(1, "nothing to stop (no state)");
-  const r = herdr("workspace.close", { workspace_id: s.workspaceId });
+  const r = await herdr("workspace.close", { workspace_id: s.workspaceId });
   // A workspace that is already gone is a successful stop, not an error.
   const gone = r.ok || r.error?.code === "workspace_not_found" || /not found/i.test(r.error?.message ?? "");
   saveState({ ...s, status: gone ? "stopped" : "stop-failed", paneId: gone ? null : s.paneId });
@@ -180,7 +216,7 @@ function cmdPause(resume) {
 
 // ---- the engine: event hook ----------------------------------------------
 
-function cmdEvent() {
+async function cmdEvent() {
   let payload;
   try { payload = JSON.parse(process.env.HERDR_PLUGIN_EVENT_JSON ?? "{}"); } catch { process.exit(0); }
   const event = typeof payload?.event === "string" ? payload.event : "";
@@ -229,7 +265,7 @@ function cmdEvent() {
   if (Date.now() - last < cooldown) { log(`nudge suppressed (cooldown ${cooldown}ms)`); process.exit(0); }
 
   const text = cfg?.nudgeText ?? DEFAULT_NUDGE;
-  const r = herdr("pane.send_text", { pane_id: paneId, text });
+  const r = await herdr("pane.send_text", { pane_id: paneId, text });
   saveState({ ...s, armed: true, cycles: cycles + 1, lastNudgeAt: Date.now() });
   log(`nudge #${cycles + 1} rc=${r.ok ? "ok" : `FAIL ${r.error?.code}`} (pane ${paneId})`);
 }
@@ -246,4 +282,4 @@ const commands = {
   event: cmdEvent,
 };
 if (!commands[cmd]) die(2, `usage: index.mjs <${Object.keys(commands).join("|")}>`);
-commands[cmd]();
+await commands[cmd]();
