@@ -126,6 +126,12 @@ export interface SshDeps {
   /** Gateway: an ssh connection authenticated (or the last one closed) for this
    *  device — the roster counts the ssh leg as device liveness too. */
   onPresence?: (deviceId: string, online: boolean) => void;
+  /** Gateway: a successful authentication JUST happened — the device was seen
+   *  on the ssh leg. Short-lived clients (the mobile native app) re-authenticate
+   *  per 1–2s burst, so "seen" is its own signal, refreshed every burst; fired
+   *  once per connection, after signature/secret verification (PK_OK probes do
+   *  not count — a probe proves nothing). */
+  onSeen?: (deviceId: string) => void;
 }
 
 export interface SshHandle {
@@ -259,6 +265,7 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
         peer.deviceId = rec.id;
         peer.fingerprint = sshKeyFingerprint(entry.b64);
         if (!peer.counted) { peer.counted = true; bumpPresence(rec.id, 1); }
+        deps.onSeen?.(rec.id);
         deps.log(`ssh: device ${rec.id} (${rec.name}, ${rec.scope}) authenticated with key ${peer.fingerprint} from ${ip}`);
         return ctx.accept();
       }
@@ -275,6 +282,7 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
       peer.deviceId = ok.id;
       peer.fingerprint = undefined;
       if (!peer.counted) { peer.counted = true; bumpPresence(ok.id, 1); }
+      deps.onSeen?.(ok.id);
       deps.log(`ssh: device ${ok.id} (${ok.name}, ${ok.scope}) authenticated from ${ip}`);
       ctx.accept();
     });

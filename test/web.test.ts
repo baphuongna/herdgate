@@ -166,6 +166,17 @@ test("client: the roster separates host-alive from device liveness", () => {
   assert.match(src, /d\.legs/, "device lines render the legs they are live on");
 });
 
+test("client: a device that was just here says so — lastSeen names the leg and the age", () => {
+  const src = codeOnly(readFileSync(join(WEB, "app.js"), "utf8"));
+  // The mobile native app authenticates in 1–2s bursts every ~17s: `connected`
+  // sampled at a random moment misses it (caught live 2026-11-23 — the roster
+  // read `offline, legs []` while the owner was inside the app). Between
+  // bursts the row must say when the device was last seen, not bare silence.
+  assert.match(src, /d\.lastSeen/, "device rows read d.lastSeen");
+  assert.match(src, /lastSeen\.at/, "the age renders from lastSeen.at");
+  assert.match(src, /last seen /, "the wording says what it is");
+});
+
 test("client: review.send closes the loop — the phone learns when the agent is done", () => {
   const src = codeOnly(readFileSync(join(WEB, "app.js"), "utf8"));
   // The reply handler subscribes the review job like a typed one.

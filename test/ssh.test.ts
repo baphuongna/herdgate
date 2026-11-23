@@ -376,6 +376,96 @@ test("ssh leg: an authenticated connection is live in the roster — and the ros
   }
 });
 
+test("ssh leg: short-lived bursts stay visible as lastSeen (the mobile native pattern)", async () => {
+  // Caught live 2026-11-23 evening: the mobile native app reached the laptop
+  // (C14+C15) yet the roster kept reading `offline, legs []` — its ssh sessions
+  // are 1–2s bursts every ~17s, so "socket open right now" almost never catches
+  // one. The roster needs a third, honest axis — WHEN this device was last
+  // seen, on which leg — without lying `connected` (no linger, no grace).
+  const dir = mkdtempSync(join(tmpdir(), "herdgate-ssh-seen-"));
+  const ACCOUNT = "ssh-seen-tok";
+  const adapter: AgentAdapter = {
+    info: () => ({ name: "ssh-host", version: "0.0.0" }),
+    onFrame: () => {},
+    onDevices: () => {},
+    onPairAsk: (ask: PairAsk) => ask.scope === "act",
+  };
+  const cloud = await startCloud({
+    accounts: [{ id: "a1", name: "owner", token: ACCOUNT }],
+    log: () => {},
+    ssh: { port: 0, keyPath: join(dir, "hostkey.json") },
+  });
+  const base = `http://127.0.0.1:${cloud.port}`;
+  try {
+    const code = (await fetch(`${base}/v1/agent/code`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "seen-host" }) }).then((r) => r.json())) as { code: string };
+    await fetch(`${base}/v1/agent/approve`, { method: "POST", headers: { authorization: `Bearer ${ACCOUNT}`, "content-type": "application/json" }, body: JSON.stringify({ code: code.code }) });
+    const st = (await fetch(`${base}/v1/agent/code/${code.code}/status`).then((r) => r.json())) as { roomToken?: string };
+    const agent = new HerdGateAgent({ endpoint: base.replace("http", "ws") + "/v1/agent/ws", roomToken: st.roomToken!, adapter, log: () => {} });
+    agent.start();
+    await agent.firstHello;
+    const roomId = await roomIdOf(base, ACCOUNT);
+    const dev = await pairDevice(base, ACCOUNT, roomId, "burst-probe", "read");
+    dev.sock.close(); // the pairing websocket is itself a web-leg sighting
+    await waitFor(300);
+
+    const roster = async (): Promise<{ host?: { connected?: boolean }; devices: { id: string; connected: boolean; legs?: string[]; lastSeen?: { at: number; leg: string } | null }[] }> =>
+      (await fetch(`${base}/v1/devices?room=${roomId}`, { headers: { authorization: `Bearer ${ACCOUNT}` } }).then((r) => r.json()));
+
+    // An ssh connection — held open first, to see both axes at once.
+    let open: Client | null = null;
+    const connect = (): { conn: Client; ready: Promise<void> } => {
+      const conn = new Client();
+      const ready = new Promise<void>((res, rej) => {
+        const t = setTimeout(() => rej(new Error("ssh connect timeout")), 8_000);
+        conn.on("ready", () => { clearTimeout(t); res(); }).on("error", rej);
+      });
+      conn.connect({ host: "127.0.0.1", port: cloud.ssh!.port!, username: dev.id, password: dev.secret, readyTimeout: 8_000 });
+      open = conn;
+      return { conn, ready };
+    };
+
+    try {
+    const held = connect();
+    await held.ready;
+    const r1 = await roster();
+    const mine1 = r1.devices.find((d) => d.id === dev.id)!;
+    assert.equal(mine1.connected, true, "an open connection is still live(ssh)");
+    assert.ok(mine1.legs?.includes("ssh"));
+    assert.ok(mine1.lastSeen && mine1.lastSeen.leg === "ssh", "authenticating marks the device seen on the ssh leg");
+    assert.ok(Math.abs(Date.now() - (mine1.lastSeen?.at ?? 0)) < 15_000, `at is fresh: ${mine1.lastSeen?.at}`);
+    held.conn.end();
+    await waitFor(400);
+
+    // The exact production complaint: burst closed ⇒ offline, legs [] …
+    const r2 = await roster();
+    const mine2 = r2.devices.find((d) => d.id === dev.id)!;
+    assert.equal(mine2.connected, false, "between bursts the device is honestly not connected");
+    assert.deepEqual(mine2.legs, []);
+    // … but the roster now answers "was it just here?" instead of silence.
+    assert.ok(mine2.lastSeen, "a closed burst leaves lastSeen behind");
+    assert.equal(mine2.lastSeen!.leg, "ssh");
+    assert.ok(Math.abs(Date.now() - (mine2.lastSeen?.at ?? 0)) < 15_000, `at is still fresh after close: ${mine2.lastSeen?.at}`);
+
+    // The app keeps bursting — every authentication refreshes the trace.
+    await waitFor(1_200);
+    const burst = connect();
+    await burst.ready;
+    burst.conn.end();
+    await waitFor(400);
+    const r3 = await roster();
+    const mine3 = r3.devices.find((d) => d.id === dev.id)!;
+    assert.ok(mine3.lastSeen && mine3.lastSeen.at > (mine2.lastSeen?.at ?? 0), `a new burst refreshes at (${mine3.lastSeen?.at} > ${mine2.lastSeen?.at})`);
+    assert.equal(r3.host?.connected, true, "host-alive never moved — its own axis");
+    } finally {
+      open?.end();
+      await agent.stop();
+    }
+  } finally {
+    await cloud.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("ssh leg: publickey auth — register a key, log in without a password", async () => {
   const dir = mkdtempSync(join(tmpdir(), "herdgate-sshkey-"));
   process.env.FAKE_HC_LOG = join(dir, "hc-methods.log");

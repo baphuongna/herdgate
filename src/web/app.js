@@ -2297,7 +2297,16 @@ function renderRoomControls(box) {
           // lane, probes) are different roads to the same room.
           const legs = Array.isArray(d.legs) ? d.legs : (d.connected ? ["web"] : []);
           const live = legs.length ? `  ·  live(${legs.join("+")})` : "";
-          pre.textContent = `${d.name}  ·  ${d.scope}${live}  ·  ${d.keys} key(s)  ·  ${d.id}${d.id === state.deviceId ? "  (this browser)" : ""}`;
+          // Not live right now ≠ never here: short-lived clients (the mobile
+          // native app authenticates in 1–2s bursts) sit between sockets most
+          // of the time — say when they were last seen instead of silence.
+          let seen = "";
+          if (!legs.length && d.lastSeen && typeof d.lastSeen.at === "number") {
+            const s = Math.max(0, Math.round((Date.now() - d.lastSeen.at) / 1000));
+            const ago = s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}m` : s < 172800 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`;
+            seen = `  ·  last seen ${d.lastSeen.leg ?? "?"} ${ago} ago`;
+          }
+          pre.textContent = `${d.name}  ·  ${d.scope}${live}${seen}  ·  ${d.keys} key(s)  ·  ${d.id}${d.id === state.deviceId ? "  (this browser)" : ""}`;
           row.append(pre);
           const rm = document.createElement("button");
           rm.type = "button";

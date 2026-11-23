@@ -130,6 +130,17 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
   // device that never opens a PWA websocket is still live (2026-11-23: it
   // never showed, and 0/6 live was misread as "laptop disconnected").
   const sshLive = new Set<string>();
+  // Third presence axis (2026-11-23 evening): the mobile native app authenticates
+  // in 1–2s bursts every ~17s, so "socket open right now" (`connected`/`legs`)
+  // almost never catches it — the roster read `offline, legs []` while the owner
+  // was inside the app. `lastSeen` is the honest "it was just here": refreshed
+  // at every successful auth (ssh) and every device-ws hello (web), never faked
+  // into `connected`. Ephemeral RAM — a restart forgets, which is correct: this
+  // is the present tense, not history.
+  const deviceSeen = new Map<string, { at: number; leg: "web" | "ssh" }>();
+  const markSeen = (deviceId: string, leg: "web" | "ssh"): void => {
+    deviceSeen.set(deviceId, { at: Date.now(), leg });
+  };
   const pendingPairs = new Map<string, { host: WebSocket; owner: WebSocket; finish: (ok: boolean, reason?: string) => void }>();
   const cancelPairs = (ws: WebSocket, side: "host" | "owner", reason?: string): void => {
     for (const pair of pendingPairs.values()) if (pair[side] === ws) pair.finish(false, reason);
@@ -719,6 +730,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         clearTimeout(helloTimer);
         conn = { ws, account: account!, device, viaDeviceSecret };
         deviceConns.add(conn);
+        if (device) markSeen(device.id, "web");
         log(`device ${device ? device.id : "?"} (${account!.name}${viaDeviceSecret ? ", device key" : ""}) connected`);
         const agents = state.roomsOfAccount(account!.id).map((r) => {
           const mine = device && device.roomId === r.id ? device.scope : null;
@@ -832,6 +844,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       const { device: rec, secret } = state.addDevice(room, name, scope);
       conn.device = rec;
       deviceConns.add(conn);
+      markSeen(rec.id, "web");
       send(conn.ws, {
         t: "pair.granted",
         device: { id: rec.id, name: rec.name, scope: rec.scope, roomId: rec.roomId },
@@ -1007,7 +1020,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
               ...(live.has(d.id) ? ["web"] : []),
               ...(sshLive.has(d.id) ? ["ssh"] : []),
             ];
-            return { id: d.id, name: d.name, scope: d.scope, connected: legs.length > 0, legs, keys: (d.sshKeys ?? []).length, created: d.created, push: !!d.push, payload: canPayload(d.push) };
+            return { id: d.id, name: d.name, scope: d.scope, connected: legs.length > 0, legs, lastSeen: deviceSeen.get(d.id) ?? null, keys: (d.sshKeys ?? []).length, created: d.created, push: !!d.push, payload: canPayload(d.push) };
           }),
       });
     }
@@ -1022,6 +1035,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         if (!device || device.accountId !== account.id) return json(res, 404, { error: "no such device" });
         const gone = state.removeDevice(device.id);
         if (!gone) return json(res, 404, { error: "no such device" });
+        deviceSeen.delete(device.id);
         for (const c of deviceConns) {
           if (c.device?.id === device.id) {
             deviceConns.delete(c);
@@ -1134,6 +1148,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
                 if (roomId) pushRoomUpdate(roomId);
               }
             },
+            onSeen: (deviceId) => markSeen(deviceId, "ssh"),
           }).catch((e) => {
             log(`ssh: failed to start (${e instanceof Error ? e.message : String(e)})`);
             return null;
