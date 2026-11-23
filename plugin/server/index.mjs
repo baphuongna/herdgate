@@ -30,6 +30,9 @@ import { registerPublisher } from "./publisher-tui-lifecycle.mjs";
 import { HostChannel, b64d, b64e, fingerprint, generateKeyPair } from "./e2e.mjs";
 
 const D = dirs();
+// C24 — this file, resolvable as a plain path on every platform:
+// fileURLToPath, never a raw file-URL .pathname (F7, Windows: /C:/, %20).
+const SELF = fileURLToPath(import.meta.url);
 const execFile = promisify(execFileCb);
 const run = execFile; // term.send/term.keys: argv arrays, never a shell
 /** diff.get ships at most 128 KiB of `git show` output, marked truncated beyond. */
@@ -264,7 +267,7 @@ async function serve() {
   const logFd = openPublisherLog();
   let child;
   try {
-    child = spawn(process.execPath, [new URL("./index.mjs", import.meta.url).pathname, "serve"], {
+    child = spawn(process.execPath, [SELF, "serve"], {
       env: { ...process.env, HERDGATE_PUBLISHER_SUPERVISOR: "1" },
       detached: true,
       stdio: ["ignore", logFd, logFd],
@@ -346,7 +349,7 @@ async function supervisorLoop() {
     }
     const env = { ...process.env, HERDGATE_PUBLISHER_CHILD: "1" };
     delete env.HERDGATE_PUBLISHER_SUPERVISOR;
-    const child = spawn(process.execPath, [new URL("./index.mjs", import.meta.url).pathname, "serve"], {
+    const child = spawn(process.execPath, [SELF, "serve"], {
       env,
       detached: true,
       stdio: "inherit", // → publisher.log, via the fd serve handed down

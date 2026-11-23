@@ -8,7 +8,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { execFile, spawn } from "node:child_process";
 import { hostname, homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { drawFleet, sanitizeFleet } from "./panel.mjs";
 import { PredEcho, looksFullScreen } from "./predict.mjs";
@@ -335,7 +336,8 @@ async function cmdWatch(args) {
     return;
   }
   const once = args.includes("--once");
-  const selfDir = new URL(".", import.meta.url).pathname.replace(/\/$/, "");
+  // C24 — a plain path, not a file-URL .pathname (F7, Windows: /C:/, %20).
+  const selfDir = dirname(fileURLToPath(import.meta.url));
   const label = mirrorWorkspaceLabel(cfg.roomId);
   let wsId = null;
   const tabsByLabel = async () => {
