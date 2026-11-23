@@ -76,8 +76,8 @@
 | C5 | v0.10.0 | **Fleet control từ PWA** (theme 2b đầu tiên) | Cao | ✅ xong |
 | C6 | — | **Review loop trọn vòng** (client-only) | Trung bình | ✅ xong |
 | C7 | — | **Publisher watchdog** (serve path tự chữa) | Cao | ✅ xong |
-| C8 | kế tiếp | **Windows TUI publisher watchdog** (lock run-id riêng) HOẶC **Jobs/results phong phú** khi có bằng chứng nhu cầu | Trung bình–cao | 🔄 chọn khi mở |
-| C9 | nhu cầu | **EXCAVATION chọn lọc** (collie harness grammars, 5 repo Rust) — chỉ đào khi vòng trước sinh nhu cầu thật | Tham khảo | parked |
+| C8 | — | **Windows TUI publisher watchdog** (lock run-id riêng — nối theme C7) | Trung bình–cao | ✅ xong |
+| C9 | nhu cầu | **Jobs/results phong phú** — chỉ khi có bằng chứng nhu cầu quan sát được; **EXCAVATION chọn lọc** (collie harness grammars, 5 repo Rust) vẫn parked | Tham khảo | parked |
 | — | blocked | VPS cutover (việc user — `docs/plans/vps-cutover.md`); herdr > 0.9.5 lộ pid | — | blocked |
 
 ## Cycle Log
@@ -91,8 +91,9 @@
 | C5 | 2026-11-23 | ✅ xong — **theme lớn đầu tiên theo chính sách 2b**, v0.10.0 (1 bump duy nhất cho 3 milestone) | spec `c9b3f16` → M1 `57ed477` → M2 `aacb3fd` → tag v0.10.0 | **Fleet control từ PWA**: bug sống pane.focus từng trả lời device read (đã act-gate); tab.create/tab.close ownership-map (phone-tabs.json, FIFO 64, sống qua restart — unit test); PWA typing 1 dòng vào pane sống (term.send, không client echo) + nút "+ tab" + chip tab mình mở (session-side); web rules nâng allowlist tường minh. Suite 311/0. **Live trên máy thật**: read bị chặn cả 3 op; act mở tab thật w8:t2N, gõ echo marker hiện trên pane thật, đóng sạch; probe revoked. Laptop 0.10.0 |
 | C6 | 2026-11-23 | ✅ xong — review loop trọn vòng (client-only, **không bump** theo 2b) | spec + feat chung commit | review.sent giờ đăng ký receipt.watch như job thường — settle push + wake về phone đúng hạ tầng sẵn; chip Review tab sống theo trạng thái (⏳ → ✓ + nút mở Jobs). **Bug thật bắt thêm**: test utility `codeOnly` nuốt nửa app.js vì string `"image/*"` bị tưởng block comment — strip giờ chỉ ăn comment đầu dòng; allowlist ops lộ thêm worker.health/submit (12 op tường minh). Suite 312/0. Live: probe c6-fence đã revoke, room sạch 5; fence pi_worker_disabled phủ bởi e2e |
 | C7 | 2026-11-23 | ✅ xong — publisher watchdog (serve path), **không bump** theo 2b | spec `fb5629f` + feat `0549842` | Chọn watchdog thay cho jobs-rich (lý do trong spec: điểm hỏng đơn + lớp sự cố đã gặp). Suite **315/0** (3 test mới: respawn sau SIGKILL, budget give-up, adopt child bản cũ). **Live verify theo ràng buộc auto-run**: đường serve thật từ source, state scratch + stub gate localhost, thông số MẶC ĐỊNH (poll 1s, budget 5/10min): SIGKILL → respawn pid mới + hello#2 sau 1.8s; stop → supervisor drain sạch, không reconnect; publisher.log ghi đủ dấu vết (exit SIGKILL, respawn 1/5, stop). Service thật không đụng (publisher home nằm dưới systemd Restart=always, ngoài scope). Bug thật bắt thêm: child detached+unref không reap → zombie khiến kill(pid,0) vẫn "alive" — exit listener vừa reap vừa log. READY-TO-RELEASE: publisher-self-healing (chủ sở hữu review + publish khi gộp theme kế hoặc gọi riêng) |
-| C8 | kế tiếp | 🔄 theme: Windows TUI publisher watchdog (lock model run-id riêng — nối theme C7) HOẶC Jobs/results phong phú trên phone khi có bằng chứng nhu cầu — chọn khi mở | — | theo 2b: không release riêng |
 | C9 | queued | 🔄 **THEME: Loop như tính năng shipped** (`plugin/loop/`) — agent loop pane chung: start/stop/pause/resume/status actions + [[events]] chain + registry ownership + maxCycles; thay experiment local bằng bản shipped trên home (loop tự sản phẩm hoá chính nó). Spec sẵn: `docs/specs/2026-11-23-c9-loop-product.md` | — | release theo 2b |
+
+| C8 | 2026-11-23 | ✅ xong — TUI publisher watchdog (run-id lock model), **không bump** theo 2b | spec `4bc17ae` + feat `28946e5` | Chọn watchdog TUI (kế nhiệm được chỉ định của C7; jobs-rich vẫn chưa có bằng chứng nhu cầu). Suite **320/0** (5 test mới, process thật: SIGKILL → respawn pid mới + run-id mới có bằng chứng trong log; stop đứng xuống supervisor — marker sạch, không respawn; budget MAX=2 → giết 3 lần → `giving up`; adopt worker chạy sẵn không spawn đè; heal lock stale tự reap+respawn). Serve path C7 không đụng (hai model, hai cây state `publisher-tui.*` vs `publisher.*`). **Live Windows-on-metal trì hoãn trung thực**: laptop chỉ nhận code qua npm update, 2b cấm publish trong vòng tự chạy — verify thật đá tại lần owner publish theme. READY-TO-RELEASE: tui-publisher-self-healing (gộp với C7 thành theme self-healing trọn) |
 
 ### Bài học C1 (nuôi vòng sau)
 - Drive laptop: lệnh đúng là `herdgate update` (không phải `setup update`); flow transaction của setup-tui chết an toàn ở bước `check` trước khi đụng publisher — đã chứng minh trên máy thật.
@@ -114,3 +115,9 @@
 ### Bài học C7
 - Zombie là trạng thái "alive": child spawn detached+unref mà không có exit listener sẽ thành zombie khi chết, `kill(pid,0)` vẫn trả sống — poller tưởng publisher sống mãi. Mọi supervisor phải reap (giữ exit listener); signal-alive không phân biệt được zombie.
 - Pidfile trễ một chu kỳ poll là hợp lệ về mặt thiết kế — test phải chờ "pid ĐỔI" chứ không phải "pid alive", nếu không sẽ giết zombie và đếm nhầm số death.
+
+### Bài học C8
+- Trên Windows, pid-liveness là lời nói dối (pid tái sử dụng nhanh): heartbeat `{pid,pollMs,at}` + freshness là nguồn sự thật "còn đang canh"; chỉ signal pid do chính mình spawn (không thể tái sử dụng khi còn sống trong child handle).
+- "Lock biến mất" vẫn là MỘT LỚP CHẾT: uncaught exception vẫn chạy exit handler (release xoá lock sạch sẽ) — babysitter không được tin "clean exit = chủ ý dừng"; chỉ stop-marker + đứng xuống supervisor mới là dấu dừng hợp lệ.
+- startPublisher không trả lời trước khi thế giới nó mô tả tồn tại: đợi heartbeat claim (≤3s) để flag `supervised` trong status không nói dối ngay câu trả lời đầu tiên.
+- (test harness) waitFor với predicate async phải `await fn()` trong vòng lặp — trả về Promise đầu tiên là trả kết quả của lần gọi đầu (thường là null), không phải kết quả cuối.
