@@ -176,6 +176,9 @@ that leg smooth the publisher now:
 
 - pushes view snapshots every `HERDGATE_PUBLISH_MS` (default 30s; the home unit sets
   5s — a settle is visible on the phone within seconds, not half a minute);
+- pings the cloud every `HERDGATE_KEEPALIVE_MS` (default 20s) and redials after three
+  silent intervals — a path that died without a reset used to leave the socket "open"
+  for the 15–30 minutes TCP keeps retransmitting, the room offline at the gate throughout;
 - replays the last snapshot for a `view` op inside `HERDGATE_SNAPSHOT_FRESH_MS`
   (default 2s) instead of spawning `herdr api snapshot` again — a view op costs ~0
   server-side work when the cache is warm;

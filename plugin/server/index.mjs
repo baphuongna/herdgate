@@ -686,6 +686,8 @@ async function publisherLoop() {
     const ws = openSocket();
     wsRef = ws;
     let helloed = false;
+    // Any frame from the cloud is proof of life; the keepalive below reads it.
+    let lastInbound = Date.now();
     ws.onopen = () => {
       // Advertise honestly: `act` only when the owner's switch allows it.
       let allowAct = false;
@@ -693,6 +695,7 @@ async function publisherLoop() {
       ws.send(JSON.stringify({ v: 1, t: "hello", roomToken: token, info: { name: NAME, version: pkgVersion(), capabilities: ["dev.herdgate.host", allowAct ? "act" : "read-only"] } }));
     };
     ws.onmessage = (ev) => {
+      lastInbound = Date.now();
       void (async () => {
         try {
       let m;
@@ -1514,12 +1517,15 @@ async function publisherLoop() {
     // restarting and refuses) never produces a close event on this WebSocket
     // implementation — waiting for onclose alone stalled the publisher forever.
     let retried = false;
+    let ka = null;
     const retry = (why) => {
       if (retried) return;
       retried = true;
       lifecycle?.setConnected(false);
       if (timer) clearTimeout(timer);
       timer = null;
+      if (ka) clearInterval(ka);
+      ka = null;
       ssh.closeAll();
       e2eSessions.clear();
       devices = [];
@@ -1530,6 +1536,29 @@ async function publisherLoop() {
     };
     ws.onclose = () => retry("disconnected");
     ws.onerror = () => retry("ws error");
+    // Keepalive with a verdict (2026-11-24). The publisher used to rely on onclose/onerror
+    // alone, and a path that died without a reset produces neither: the socket stays OPEN,
+    // TCP retransmits for ~15–30 minutes, and the gate (8 s heartbeat, one missed pong) has
+    // dropped the room long before. In the journal, 2026-11-21: the gate lost this host at
+    // 23:07:55, the tunnel was back at 23:11:37, the publisher redialed at 23:21:04.
+    // A ping every interval; three silent intervals ⇒ redial now. The old socket is closed
+    // best-effort — the gate supersedes it on the new hello anyway.
+    const KEEPALIVE_MS = Math.max(250, Number.parseInt(process.env.HERDGATE_KEEPALIVE_MS ?? "20000", 10) || 20000);
+    ka = setInterval(() => {
+      if (ws.readyState !== 1) return clearInterval(ka);
+      try {
+        ws.send(JSON.stringify({ v: 1, t: "ping", n: Date.now() }));
+      } catch {
+        return retry("keepalive send failed");
+      }
+      const silent = Date.now() - lastInbound;
+      if (silent > 3 * KEEPALIVE_MS) {
+        log(`cloud silent for ${Math.round(silent / 1000)}s; redialing`);
+        retry("keepalive unanswered");
+        try { ws.terminate ? ws.terminate() : ws.close(); } catch { /* already gone */ }
+      }
+    }, KEEPALIVE_MS);
+    ka.unref?.();
   };
   if (tuiOnly) for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, shutdown);
   connect();

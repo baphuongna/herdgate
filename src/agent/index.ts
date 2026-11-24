@@ -19,6 +19,9 @@ export interface AgentOptions {
   backoff?: { minMs?: number; maxMs?: number };
   /** Passed to the underlying WebSocket (e.g. `rejectUnauthorized` for dev certs). */
   wsOptions?: Record<string, unknown>;
+  /** Keepalive interval (ms). A ping goes out every interval; three silent intervals mean
+   *  the cloud is gone and the socket is redialed. Default 25 s. */
+  keepaliveMs?: number;
 }
 
 export class HerdGateAgent {
@@ -90,12 +93,15 @@ export class HerdGateAgent {
     const ws = new WebSocket(this.#o.endpoint, { maxPayload: 256 * 1024, ...this.#o.wsOptions });
     this.#ws = ws;
     let helloed = false;
+    // Any frame from the cloud is proof of life; the keepalive below reads it.
+    let lastInbound = Date.now();
 
     ws.on("open", () => {
       const info = this.#o.adapter.info();
       ws.send(encode({ t: "hello", roomToken: this.#o.roomToken, info }));
     });
     ws.on("message", (data) => {
+      lastInbound = Date.now();
       let m: CloudToAgent;
       try {
         m = JSON.parse(String(data)) as CloudToAgent;
@@ -139,11 +145,23 @@ export class HerdGateAgent {
       setTimeout(() => this.#connect(), wait);
     });
 
-    // App-level keepalive (unref: a timer alone must not hold the process).
+    // Keepalive with a verdict. The ping alone was not one: a path that died without a
+    // reset leaves the socket "OPEN" and TCP retransmitting for ~15–30 minutes, so the host
+    // kept believing it was published while the gate (8 s heartbeat) had dropped the room
+    // minutes earlier (2026-11-21: tunnel back at 23:11:37, agent redialed at 23:21:04).
+    // Three silent intervals ⇒ terminate; `close` owns the redial and its backoff.
+    // (unref: a timer alone must not hold the process.)
+    const keepaliveMs = this.#o.keepaliveMs ?? 25_000;
     const iv = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) this.#send({ t: "ping", n: Date.now() } as unknown as AgentToCloud);
-      else clearInterval(iv);
-    }, 25_000);
+      if (ws.readyState !== WebSocket.OPEN) return clearInterval(iv);
+      ws.send(encode({ t: "ping", n: Date.now() } as unknown as Record<string, unknown>));
+      const silent = Date.now() - lastInbound;
+      if (silent > 3 * keepaliveMs) {
+        clearInterval(iv);
+        this.#log(`cloud silent for ${Math.round(silent / 1000)}s; redialing`);
+        ws.terminate();
+      }
+    }, keepaliveMs);
     iv.unref?.();
   }
 }

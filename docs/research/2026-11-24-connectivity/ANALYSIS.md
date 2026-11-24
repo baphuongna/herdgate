@@ -75,9 +75,37 @@ KEXINIT của client; OpenSSH còn giữ Nagle trong lúc KEX (chỉ tắt khi v
 phải chờ ACK delayed. Chỉ ảnh hưởng đường raw TCP — hiện không client production nào dùng (tất cả
 đi WS). Không làm mẹo cork/uncork cho 40 ms đó.
 
+### 3b. Phía nhà: kết nối chết im lặng và 20 lần offline dài (đo 7 ngày)
+
+Ghép `agent … disconnected` → `connected` theo room trong journal 7 ngày: **213 lần offline**,
+trong đó 184 lần <15s (bình thường), **20 lần từ 1 tới 38 phút**. Loại các lần do restart unit
+(dev/tôi), các lần dài còn lại rơi **đồng thời cho cả máy nhà lẫn laptop** (21/11 23:03–23:30,
+13:59–14:05) → sự kiện mạng. Nhưng câu hỏi quyết định là *mạng hồi phục rồi mà mất bao lâu để
+phía nhà nối lại*:
+
+| 21/11 | gate thấy máy nhà rơi | tunnel hồi phục | máy nhà nối lại | nhàn rỗi khi mạng đã lên |
+|---|---|---|---|---|
+| | 23:07:55 | 23:11:37 (lại 23:14:55, 23:15:48) | **23:21:04** | **~9 phút** |
+| | 23:22:38 | 23:24:09 | 23:24:51 | 42s (thang backoff) |
+| | 23:27:45 | 23:30:38 | 23:30:42 | 4s |
+
+Các lần 4–42s là khi client *nhận được* reset → `onclose` → nối lại ngay. Lần 9 phút là khi
+nó không nhận được gì: socket vẫn "OPEN", TCP retransmit cho tới khi từ bỏ (~15–30 phút) —
+đó là bộ phát hiện duy nhất phía nhà. Agent có gửi `ping` mỗi 25s nhưng **không đọc câu trả
+lời**; publisher thì không gửi gì cả. Gate thì bỏ phòng sau ~16s (heartbeat 8s) → phòng hiện
+offline trong khi máy nhà vẫn tưởng mình đang publish.
+
+**Đã sửa:** cả agent (`HerdGateAgent`, tuỳ chọn `keepaliveMs`, mặc định 25s) lẫn publisher
+(`HERDGATE_KEEPALIVE_MS`, mặc định 20s) gửi ping và **phán quyết**: ba chu kỳ im lặng →
+`terminate` → nối lại theo backoff sẵn có; gate thay thế kết nối cũ bằng luật "superseded"
+đã có. Giới hạn trên của một lần ngắt kiểu này: ~1 phút thay vì 15–30 phút.
+Test: `test/agent-keepalive.test.ts`, `test/publisher-keepalive.test.ts` (cloud giả giữ socket
+mở nhưng im lặng); mutation tắt riêng phán quyết → cả hai đỏ đúng chỗ. `src/cloud/ssh-bridge.ts`
+(bridge đứng danh cho dev, không trong đường production) chưa có luật này.
+
 ## 4. Hướng xử lý — theo thứ tự hiệu quả chia chi phí
 
-1. **Đã làm — NoDelay ở đường TCP** (0 rủi ro, đo được) **và host key sinh hỏng** (mục 3). Có ý nghĩa thật khi có đường thẳng
+1. **Đã làm — NoDelay ở đường TCP** (0 rủi ro, đo được), **host key sinh hỏng** (mục 3), **keepalive có phán quyết phía nhà** (mục 3b). Có ý nghĩa thật khi có đường thẳng
    (LAN, VPS): client Windows có delayed-ACK 200 ms nên stall có thể tới 200 ms/lần.
 2. **Danh tính kép của mobile TUI** (việc của chủ máy, 0 code): 68 lần attach × 2 kết nối.
    Hai device `herdr-mobile` và `herdr-mobile-home-act` dùng chung một key, cùng scope `act`.
