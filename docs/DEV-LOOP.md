@@ -114,6 +114,7 @@
 | C22 | — | **PWA hiển thị `loop.status`** — C21 để ngở: thêm 1 dòng trạng thái loop cạnh worker (`$("worker")`), allowlist tường minh trong app.js + test/web.test.ts; mobile: KHÔNG thêm verb ssh | Trung bình | ✅ xong |
 | C23 | — | **Cooldown loop hoãn nudge, không bỏ rơi** (liveness: settle < 60s sau nudge → im lặng vĩnh viễn) — SDD 3 vai: critic → implementer → reviewer | Cao | ✅ xong (wave 3 subagent) |
 | C24 | kế tiếp | **SELF path qua `fileURLToPath` ở `plugin/server/index.mjs`** — supervisor còn dùng `new URL(...).pathname` (hỏng Windows: `%20`, `/C:/`), phát hiện khi làm C23 (F7) | Thấp | ✅ xong (owner verify laptop) |
+| C26 | kế tiếp | **Trần chuỗi work — `workPauseAfter`** (C17 chỉ đếm no-op; chuỗi work tự sinh việc = chạy mãi, không trần chi phí): N chu kỳ work liên tiếp → auto-pause `pausedBy:auto` như C17; no-op xen giữa reset streak; `unknown` không đụng streak (không phạt bằng đoán); config `workPauseAfter`, chọn default có lý lẽ (gợi ý 0=tắt mặc định + dev-loop thật đặt ~12, hoặc mặc định ≥16) — test đối xứng `noopPauseAfter` trong loop-plugin | Trung bình | queued (PM, 2026-11-24) |
 | C13 | — | **Jobs/results phong phú** — chỉ khi có bằng chứng nhu cầu quan sát được; **EXCAVATION chọn lọc** vẫn parked; **multi-loop registry** (một plugin một loop — probe C10 phải bơm event tay) parked tới khi có nhu cầu thật hai loop song song | Tham khảo | parked |
 | — | blocked | VPS cutover (việc user — `docs/plans/vps-cutover.md`); herdr > 0.9.5 lộ pid | — | blocked |
 
