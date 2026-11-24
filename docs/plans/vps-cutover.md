@@ -6,11 +6,14 @@
 Noise E2E → VPS chỉ thấy ciphertext; độ tin yêu cầu thấp.
 
 ## Pha A — diễn tập + runbook (làm trên máy nhà, không cần VPS)
-- [ ] Dựng gate thứ 2 (port + state dir riêng) từ Cloud archive 0.9.38
+- [x] Dựng gate thứ 2 (port + state dir riêng) từ Cloud archive — 24/11: `herdgate-cloud-0.13.3.tar.gz`,
+      smoke trên state tạm, rồi boot từ bản khôi phục (port 18789)
 - [ ] Publisher test trỏ vào → probe toàn ops (view/ssh bridge/receipts/pair)
-- [ ] Runbook migration: stop → flush journal → backup (state.json + ssh_host_ed25519.json
-      + vapid.json + attachments/ + pi-receipts/) → restore → start → verify
+- [x] Runbook migration: backup → **đi qua đường off-site** (mã hóa, "VPS" là thư mục local, remote
+      sha256 khớp) → `gate-push decrypt` → byte-identical 120 file → start → verify: host key =
+      production (`SHA256:OCMQlB…`, fleet không ghim lại), 5 room / 13 device (24/11)
 - [x] Cron backup state hàng ngày — `herdgate-gate-backup.timer` 04:30 + bản mã hóa off-site `herdgate-gate-push.timer` 04:45 (`scripts/gate-push.mjs`, 24/11)
+- [x] Runbook Pha B: `docs/runbooks/vps-cutover.md`
 
 ## Pha B — cutover (cần user: root key, deploy key, DNS)
 

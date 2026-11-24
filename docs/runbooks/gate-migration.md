@@ -1,13 +1,19 @@
 # Runbook — Gate migration & backup (Pha A của docs/plans/vps-cutover.md)
 
-> Áp dụng cho gate chạy từ source trên máy nhà (`herdgate.service`).
+> Áp dụng cho gate trên máy nhà (`herdgate.service`). Từ 24/11/2026 gate **không còn chạy từ
+> source**: nó chạy bản release ghim (`~/apps/herdgate-gate/herdgate-cloud-0.13.3/`) qua drop-in
+> `~/.config/systemd/user/herdgate.service.d/pin.conf`; hai publisher máy nhà cũng ghim
+> (`~/apps/herdgate-release/v0.13.3/`, drop-in `pin.conf` trong `.d/` của từng unit). Mọi
+> đường dẫn `~/source/herdgate/...` dưới đây là vị trí *của mã nguồn*, dùng để đọc/tra cứu —
+> tiến trình đang chạy không đọc từ đó.
 > Mọi lệnh chạy trên máy nhà. KHÔNG chạy cutover (Pha B) khi chưa có
 > root key + deploy key + quyền DNS — đó là việc của chủ sở hữu.
 
 ## Hằng số
 
-- Source gate: `~/source/herdgate/src/cloud/main.ts`, port 8833,
-  bind 127.0.0.1 (sau cloudflared `gate.phuongnb.io.vn`).
+- Gate: `~/apps/herdgate-gate/herdgate-cloud-0.13.3/runtime/cloud/main.js` (drop-in pin),
+  port 8833, bind 127.0.0.1 (sau cloudflared `gate.phuongnb.io.vn`); bản trước còn trên đĩa
+  (`herdgate-cloud-0.13.2/`) để rollback 30 s.
 - State dir: `~/.local/state/herdgate/` — `state.json`,
   `ssh_host_ed25519.json` (host key — MẤT LÀ MẤT CẢ FLEET: mọi phone/
   laptop phải re-pair), `vapid.json` (push identity), `attachments/`,

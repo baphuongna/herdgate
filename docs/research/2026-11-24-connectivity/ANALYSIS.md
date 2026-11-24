@@ -107,10 +107,11 @@ mở nhưng im lặng); mutation tắt riêng phán quyết → cả hai đỏ �
 
 1. **Đã làm — NoDelay ở đường TCP** (0 rủi ro, đo được), **host key sinh hỏng** (mục 3), **keepalive có phán quyết phía nhà** (mục 3b). Có ý nghĩa thật khi có đường thẳng
    (LAN, VPS): client Windows có delayed-ACK 200 ms nên stall có thể tới 200 ms/lần.
-2. **Danh tính kép của mobile TUI** (việc của chủ máy, 0 code): 68 lần attach × 2 kết nối.
-   Hai device `herdr-mobile` và `herdr-mobile-home-act` dùng chung một key, cùng scope `act`.
-   Nếu Herdr trên điện thoại giữ hai "máy" trỏ về cùng một gate → gộp lại còn một.
-   Rủi ro: nếu một trong hai là hồ sơ LAN (home) có chủ đích thì phải giữ — cần chủ máy xác nhận.
+2. ~~Danh tính kép của mobile TUI~~ — **RÚT LẠI sau khi đo** (24/11 tối): hai hồ sơ đó thuộc *ba room
+   khác nhau*, không phải trùng. `herdr-mobile` → room máy nhà (`bom-Inspiron-7559`),
+   `herdr-mobile-home-act` (`d_1722e75b`) → room `home-tui-control` (chính là id trong
+   `HERDGATE_MOBILE_TUI_ACT_DEVICE` của `control.env`), `app mobile` (`d_0b441d88`) → room laptop.
+   Đi đôi 68/68 = TUI điện thoại attach hai room cùng lúc theo thiết kế. Không gộp.
 3. **Ổn định tunnel — A/B `protocol: http2` so với QUIC** (ops, cần đồng ý vì restart tunnel
    ~10 s gián đoạn): chạy mỗi cấu hình 24 h, so số `Retrying`/`Registered`/lỗi. Rủi ro: http2 qua
    TCP cũng có thể tệ hơn trên đường mất gói — nên đo, không nên đoán.
@@ -124,11 +125,14 @@ mở nhưng im lặng); mutation tắt riêng phán quyết → cả hai đỏ �
    (~70 ms Unix, nhiều hơn trên Windows) cho mỗi lệnh — có thể thay bằng forwarder cục bộ thường
    trú, nhưng thêm một daemon phía client; chưa đáng.
 
-## 5. Câu hỏi còn mở
+## 5. Trạng thái các quyết định (closing 24/11)
 
-- `herdr-mobile-home-act` là hồ sơ gì trên điện thoại (LAN hay trùng)?
-- Có VPS chưa (Hà Nội/HCM) để làm Pha B?
-- Cho phép chạy A/B tunnel http2 24 h?
+- Danh tính mobile: đã đo, không phải trùng — không làm gì (mục 4, điểm 2).
+- A/B tunnel: **đang chạy** — `protocol: http2` áp dụng 24/11 19:42, tự hoàn tác 25/11 19:42
+  (`~/.local/state/herdgate/tunnel-ab/compare.sh` để so; baseline QUIC ~101 ERR/24h).
+- VPS: chưa có. Pha A đã diễn tập thật (gate 0.13.3 boot từ bản backup đi qua đường
+  mã hóa off-site, host key = production, 5 room/13 device); runbook Pha B ở
+  `docs/runbooks/vps-cutover.md`.
 
 ---
 
