@@ -383,7 +383,13 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
     try { server.injectSocket(socket as Socket); }
     catch { socket.destroy(); }
   };
-  const tcp = tcpServer(inject);
+  // Nagle off on the TCP leg: ssh2 sends each packet as its own small write, and
+  // with Nagle on the second one waits ~40 ms for the client's delayed ACK
+  // (measured on loopback: KEX 59 ms here vs 10 ms over the WS leg, a Duplex).
+  const tcp = tcpServer((sock) => {
+    sock.setNoDelay(true);
+    inject(sock);
+  });
   await new Promise<void>((resolve, reject) => {
     tcp.once("error", reject);
     tcp.listen(port, bind, () => resolve());
