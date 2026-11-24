@@ -72,3 +72,19 @@ Wake notifications are off by default. Only opt in with `HERDGATE_ENABLE_PUSH=1`
 ## Back up, upgrade or migrate
 
 Stop only the Gate to take a consistent **private** backup of `state.json`, `ssh_host_ed25519.json`, `vapid.json` (if present) and the owner-token file. Keep the same public origin when moving an existing Gate. Never use a staging archive as a backup, and never run a new instance alongside the old one against the same state. An upgrade replaces application files/image only; use the original state directory and token, not a fresh one. For Compose, retain `data/`, `.env` and `owner-token` and rebuild from the new archive; use the previous image/archive with that same data if rollback is needed and the state format is compatible. Verify `/healthz`, PWA sign-in, publisher reconnect and the pinned SSH host key. Publisher/CLI updates do not upgrade the Gate or TCP edge.
+
+### Off-site copy (encrypted)
+
+A backup kept on the Gate machine dies with it. `scripts/gate-push.mjs` (shipped in the npm package) pushes the newest `gate-backup` archive to any host reachable over plain ssh as an AES-256-GCM blob (`HGP1`): the remote needs only `mkdir`, `cat`, `sha256sum`, `ls` and `rm`, holds ciphertext only, and a push counts only when the remote checksum matches. The 32-byte key lives on the Gate machine (`~/.config/herdgate/backup.key`, 0600) — run `node scripts/gate-push.mjs export-key` once and keep the printed base64 in a password manager; without it the copies are unreadable.
+
+```sh
+# one-time, on the Gate machine
+printf '%s\n' '{"host":"backup@vps","port":22,"path":"/srv/herdgate-backup","keep":14}' \
+  > ~/.config/herdgate/backup-remote.json && chmod 600 ~/.config/herdgate/backup-remote.json
+node scripts/gate-push.mjs push        # or: auto (reads the file above)
+node scripts/gate-push.mjs check       # list what the remote holds
+# restore drill: what is on the remote must come back byte-identical
+node scripts/gate-push.mjs decrypt --in gate-YYYY-MM-DDTHH-MM-SS-000Z.tar.gz.enc --out /tmp/restored
+```
+
+Without `backup-remote.json`, `auto` exits 0 and does nothing, so a nightly timer stays green before a remote exists.

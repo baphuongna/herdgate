@@ -295,6 +295,12 @@ share tokens or keys. Use `herdgate update` for later main-publisher updates.
 - Preserve the Gate state and SSH host key in protected backups. Deleting
   state loses room/device registrations; replacing the host key invalidates
   clients' pins.
+- **Keep a copy off the machine.** `node scripts/gate-push.mjs push --to <user@host>
+  --path <dir>` ships the newest `gate-backup` archive as an AES-256-GCM blob and
+  verifies the remote sha256; `auto` reads `~/.config/herdgate/backup-remote.json`
+  and is a no-op until that file exists (the `herdgate-gate-push.timer` pattern).
+  Run `export-key` once and store the base64 key in a password manager — the remote
+  only ever holds ciphertext, so the key is the only way back.
 - **Rotate the account token** by replacing the private token file (or old token environment value) and restarting the Gate. Update browsers that use the owner token.
 - **Logs** go to stderr (agent connect/pair events). Payloads are never logged — keep it that way.
 - **Watch the exposure**: `curl -s https://host/healthz` public; everything else needs tokens.
