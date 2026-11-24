@@ -27,7 +27,7 @@ WS ping 8s (`gateway.ts`, `heartbeatMs ?? 8_000`) — dưới ngưỡng idle 100
 
 Tức là: gate xử lý trong 1 ms, nhưng mỗi kết nối **mới** phải trả 0.4–2.7 s cho chặng
 điện thoại → Cloudflare (SIN hoặc HKG) → máy nhà (hairpin: cả hai đầu ở Việt Nam, đi vòng
-qua Hồng Kông/Singapore; 7 ngày log, phía nhà đăng ký 4 lần HKG, 4 lần SIN — edge do lần
+qua Hồng Kông/Singapore; 7 ngày log, phía nhà đăng ký 52 lần HKG, 4 lần SIN — edge do lần
 đăng ký quyết định, không do giao thức tunnel), và chặng này biến thiên 7 lần giữa các lần đo
 (mất gói/tắc trên ISP↔Cloudflare).
 
@@ -131,7 +131,10 @@ mở nhưng im lặng); mutation tắt riêng phán quyết → cả hai đỏ �
 
 - Danh tính mobile: đã đo, không phải trùng — không làm gì (mục 4, điểm 2).
 - A/B tunnel: **đang chạy** — `protocol: http2` áp dụng 24/11 19:42, tự hoàn tác 25/11 19:42
-  (`~/.local/state/herdgate/tunnel-ab/compare.sh` để so; baseline QUIC ~101 ERR/24h).
+  (`~/.local/state/herdgate/tunnel-ab/compare.sh` để so; baseline QUIC ~101 ERR/24h, trong đó
+  ~67 là `context canceled` lành tính và ~10 là gate restart — tín hiệu mạng thật ≈ 9 lần nối
+  lại/24h; phân loại ở `PERF-REVIEW.md` mục 4).
+- Đánh giá hiệu năng sâu và kế hoạch tối ưu: `PERF-REVIEW.md` (24/11 23:55).
 - VPS: chưa có. Pha A đã diễn tập thật (gate 0.13.3 boot từ bản backup đi qua đường
   mã hóa off-site, host key = production, 5 room/13 device); runbook Pha B ở
   `docs/runbooks/vps-cutover.md`.
