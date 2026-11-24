@@ -10,9 +10,12 @@ Noise E2E → VPS chỉ thấy ciphertext; độ tin yêu cầu thấp.
 - [ ] Publisher test trỏ vào → probe toàn ops (view/ssh bridge/receipts/pair)
 - [ ] Runbook migration: stop → flush journal → backup (state.json + ssh_host_ed25519.json
       + vapid.json + attachments/ + pi-receipts/) → restore → start → verify
-- [ ] Cron backup state hàng ngày (hiện chỉ có 1 bản thủ công backup-pre-0.9.35)
+- [x] Cron backup state hàng ngày — `herdgate-gate-backup.timer` 04:30 + bản mã hóa off-site `herdgate-gate-push.timer` 04:45 (`scripts/gate-push.mjs`, 24/11)
 
 ## Pha B — cutover (cần user: root key, deploy key, DNS)
+
+Lý do đo được 24/11: mọi kết nối mới đang đi vòng Cloudflare SIN (hairpin), 0.4–2.7 s chỉ để thiết lập,
+~10 RTT/hành động — xem `docs/research/2026-11-24-connectivity/ANALYSIS.md`. VPS trong nước = thay đổi kích cỡ duy nhất.
 - [ ] VPS: Node 22 + Cloud archive (templates/cloud: compose hoặc systemd + Caddy)
 - [ ] Restore snapshot; GIỮ NGUYÊN hostname gate.phuongnb.io.vn (chỉ flip DNS, hạ TTL trước)
 - [ ] ssh leg: herdgate-tcp-edge template; ssh host key giữ nguyên → phone không config lại
