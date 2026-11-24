@@ -15,7 +15,8 @@ Nhiệm vụ: chạy đúng **một vòng phát triển** theo protocol đã đ�
 2. Chọn vòng: mục backlog đầu tiên có trạng thái 🔄/queued. Nếu bảng ghi
    BLOCKED ở đầu — dừng ngay, exit 0, không cố.
 3. Viết spec `docs/specs/<hôm nay>-c<N>-<tên>.md` (mẫu: các spec cũ) — gọn,
-   tiêu chí nghiệm thu đo được.
+   tiêu chí nghiệm thu đo được; dòng đầu: quy mô + mục Phân tích (mục "Cổng
+   chất lượng theo quy mô" bên dưới là BẮT BUỘC).
 4. Test TRƯỚC (red), implement (green), chạy suite:
    `TEST_PI_BIN=$(which pi) TEST_HERDR_BIN=$(which herdr) npm test`
    (khoảng 15 phút — kiên nhẫn chờ, không bỏ giữa chừng).
@@ -25,6 +26,42 @@ Nhiệm vụ: chạy đúng **một vòng phát triển** theo protocol đã đ�
 6. Commit tách docs/impl như các vòng trước (xem `git log --oneline -20`
    để bắt giọng commit message). Update Cycle Log + bài học.
 7. `git push origin main` (KHÔNG tag).
+
+## Cổng chất lượng theo quy mô (bắt buộc từ C27)
+
+Phân loại ngay khi chọn việc, ghi ở dòng đầu spec: **NHỎ / VỪA / LỚN**.
+
+- **NHỎ** (docs, tripwire, 1 file, rủi ro thấp): spec ngắn (vẫn có mục Phân tích
+  2–3 câu) → đỏ/xanh nếu đụng test → `node --test` các file liên quan → docs. Không subagent.
+- **VỪA** (code 1–2 module đã có test): spec → **critic** → đỏ → xanh → suite file
+  → **reviewer** → fix finding → docs.
+- **LỚN** (protocol/production/đa module): spec → critic → plan chi tiết → đỏ →
+  xanh → **e2e** (harness sẵn có: `test/e2e*.test.ts`, `ssh-ws`, `edge`) →
+  **try-run thật** trên scratch (không đụng hệ thật; bằng chứng = log) → reviewer
+  → fix → full suite MỘT lần → docs.
+
+Mọi spec bắt đầu bằng mục **Phân tích** (brainstorm): đọc code thật liên quan,
+nêu ≥2 hướng + rủi ro của từng hướng trước khi chốt.
+
+**Critic/reviewer = subagent pi, read-only ép bằng cấu hình:**
+```
+node experiments/pi-spawn/task.mjs start c<N>-critic <brief.md> --cwd <repo> --tab --   --model zai/glm-5.3-flash --thinking max --tools read
+herdr agent wait <pane> --until idle --until done --timeout 600000   # không poll
+# đọc câu trả lời cuối từ session jsonl (~/.pi/agent/sessions/...), rồi:
+node experiments/pi-spawn/task.mjs close c<N>-critic
+```
+- Brief critic: spec + đường dẫn file liên quan; yêu cầu findings dạng
+  `F<n> [BLOCK|SHOULD|NIT] — file:dòng — câu sửa đề xuất`; kết thúc `C<N>-CRITIC-DONE <số>`.
+- Brief reviewer: spec + 2 file bằng chứng TỰ TẠO trước khi gọi
+  (`git diff <base> > /tmp/c<N>.diff`; log `node --test` > `/tmp/c<N>-tests.log`);
+  yêu cầu đối chiếu R/T, tìm test không chứng minh điều nó tuyên bố; kết thúc `C<N>-REVIEW-DONE <số>`.
+
+**Luật subagent:** tối đa 1 chạy tại một lúc; ≤2 subagent/cycle; not our pane —
+không đụng pane khác. BLOCK không giải được → cycle thành `blocked`: ghi findings
+vào dòng backlog của vòng đó, KHÔNG hạ chuẩn để qua cổng.
+
+**Bằng chứng mỗi cổng nằm trong spec/docs khi đóng:** findings critic + cách xử,
+log test, log try-run (LỚN), findings reviewer + cách xử.
 
 ## Giới hạn tuyệt đối (vi phạm = hỏng niềm tin)
 
