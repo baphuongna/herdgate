@@ -1244,3 +1244,167 @@ process.stdin.on("data", (d) => {
     if (dirB) rmSync(dirB, { recursive: true, force: true });
   }
 });
+
+// ---- C26: workPauseAfter — a cap on consecutive WORK cycles ----------------
+
+const c26State = (over = {}) => ({ ...c17State(), ...over });
+
+test("c26 T1: workPauseAfter validates fail-closed; default 0 and workStreak show in status", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    for (const over of [{ workPauseAfter: -1 }, { workPauseAfter: 1.5 }]) {
+      const r = run(dir, { cmd: ["start"] }, { config: goodConfig(dir, over) });
+      assert.equal(r.code, 2, `expected exit 2 for ${JSON.stringify(over)}: ${r.stderr}`);
+      assert.match(r.stderr, /workPauseAfter/, `the error must name the field: ${JSON.stringify(over)}`);
+    }
+    const s = run(dir, { cmd: ["status"] }, {
+      config: goodConfig(dir),
+      state: { paneId: "wA:p1", status: "running", workStreak: 7 },
+    });
+    assert.equal(s.code, 0, s.stderr);
+    const j = JSON.parse(s.stdout);
+    assert.equal(j.config.ok, true);
+    assert.equal(j.config.workPauseAfter, 0, "the default is OFF — upgrades change no running loop");
+    assert.equal(j.state.workStreak, 7);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c26 T2: two work settles in a row auto-pause the loop (no second nudge)", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    gitSeed(dir);
+    gitCommit(dir, "feat(c26): real work");
+    const cfg = goodConfig(dir, { workPauseAfter: 2 });
+    const a = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, { config: cfg, state: c26State(), event: idleEvent });
+    assert.equal(a.code, 0, a.stderr);
+    assert.equal(a.calls.length, 1, "streak 1 < 2: the first work settle still nudges");
+    const st1 = readState(dir);
+    assert.equal(st1.workStreak, 1, "the work cycle is counted");
+    assert.notEqual(st1.paused, true);
+
+    gitCommit(dir, "feat(c26): more real work");
+    st1.lastNudgeAt = Date.now() - 60_000; // past cooldown, like the c17 test
+    const b = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, { config: cfg, state: st1, event: idleEvent });
+    assert.equal(b.code, 0, b.stderr);
+    assert.deepEqual(b.calls, [], "streak 2 reached the threshold: no second nudge");
+    const st2 = readState(dir);
+    assert.equal(st2.paused, true);
+    assert.equal(st2.pausedBy, "auto");
+    assert.equal(st2.workStreak, 2);
+    assert.equal(st2.status, "running", "auto-pause keeps status running — resume re-arms the same loop");
+    assert.match(readLog(dir), /auto-pause: 2 work cycles in a row — resume with the resume action/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c26 T3: a no-op between works resets the work streak (and work resets noop, both axes)", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    gitSeed(dir);
+    // Commits carry explicit timestamps: the classify window is wall-clock
+    // (lastNudgeAt..now), so a work commit must sit OUTSIDE the no-op window
+    // the same way a real previous cycle does.
+    const gitCommitAt = (subject, msAgo) => {
+      const when = new Date(Date.now() - msAgo).toISOString();
+      const c = spawnSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t.t", "commit", "--allow-empty", "-q", "-m", subject], {
+        encoding: "utf8", env: { ...process.env, GIT_AUTHOR_DATE: when, GIT_COMMITTER_DATE: when },
+      });
+      assert.equal(c.status, 0, c.stderr);
+    };
+    gitCommitAt("feat: work one", 120_000);
+    const cfg = goodConfig(dir, { workPauseAfter: 2, noopPauseAfter: 2 });
+    let st = c26State({ lastNudgeAt: Date.now() - 130_000 });
+    const run1 = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, { config: cfg, state: st, event: idleEvent });
+    assert.equal(run1.code, 0, run1.stderr);
+    st = readState(dir);
+    assert.equal(st.workStreak, 1, "work counted");
+
+    gitCommitAt("no-op — backlog trống", 60_000);
+    st.lastNudgeAt = Date.now() - 65_000;
+    const run2 = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, { config: cfg, state: st, event: idleEvent });
+    assert.equal(run2.code, 0, run2.stderr);
+    st = readState(dir);
+    assert.equal(st.noopStreak, 1, "no-op counted");
+    assert.equal(st.workStreak, 0, "the no-op resets the work streak — the cap sees CONSECUTIVE work only");
+
+    gitCommitAt("feat: work two", 30_000);
+    st.lastNudgeAt = Date.now() - 35_000;
+    const run3 = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, { config: cfg, state: st, event: idleEvent });
+    assert.equal(run3.code, 0, run3.stderr);
+    st = readState(dir);
+    assert.equal(st.workStreak, 1, "counting restarts after the interrupting no-op");
+    assert.equal(st.noopStreak, 0, "work resets the no-op streak (c17 behavior, still true)");
+    assert.notEqual(st.paused, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c26 T4: workPauseAfter 0 (default) — a long work streak never pauses", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    gitSeed(dir);
+    const cfg = goodConfig(dir); // no workPauseAfter: default 0 = off
+    let st = c26State({ workStreak: 99 });
+    for (let i = 0; i < 3; i++) {
+      gitCommit(dir, `feat: work ${i}`);
+      st.lastNudgeAt = Date.now() - 60_000;
+      const r = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, { config: cfg, state: st, event: idleEvent });
+      assert.equal(r.code, 0, r.stderr);
+      st = readState(dir);
+      assert.equal(r.calls.filter((c) => c.startsWith("pane.send_text")).length, 1, `round ${i}: still nudging`);
+      assert.notEqual(st.paused, true, `round ${i}: never paused`);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c26 T5: resume and kick reset the work streak; a fresh run starts clean", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    const replies = {
+      "workspace.list": { result: { workspaces: [] } },
+      "workspace.create": { result: { workspace: { workspace_id: "w8" } } },
+      "pane.list": { result: { panes: [{ pane_id: "wA:p1", agent_status: "idle" }] } },
+      "pane.send_text": { result: { type: "ok" } },
+      "tab.create": { result: { root_pane: { pane_id: "w7:p3" } } },
+    };
+    // resume forgives the streak
+    const r = run(dir, { cmd: ["resume"] }, {
+      config: goodConfig(dir),
+      state: { paneId: "wA:p1", workspaceId: "w7", status: "running", paused: true, pausedBy: "auto", workStreak: 2, noopStreak: 0 },
+    });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(readState(dir).workStreak, 0, "resume forgives the work streak (stale work would re-pause)");
+    // kick resets it too
+    run(dir, { cmd: ["kick"], stubReplies: replies }, {
+      config: goodConfig(dir),
+      state: { paneId: "wA:p1", workspaceId: "w7", status: "running", paused: true, pausedBy: "auto", workStreak: 2, noopStreak: 2 },
+    });
+    assert.equal(readState(dir).workStreak, 0, "kick resets the work streak");
+    assert.equal(readState(dir).noopStreak, 0, "kick still resets the no-op streak");
+    // start begins a clean run
+    const s = run(dir, { cmd: ["start"], stubReplies: replies }, { config: goodConfig(dir) });
+    assert.equal(s.code, 0, s.stderr);
+    assert.equal(readState(dir).workStreak, 0, "a fresh run starts with a clean streak");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("c26 T6: unknown classification touches neither streak", () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, "prompt.md"), "probe");
+    // no gitSeed: cwd is not a repo -> classifyCycle returns "unknown"
+    const r = run(dir, { cmd: ["event"], stubReplies: nudgeReply }, {
+      config: goodConfig(dir, { workPauseAfter: 1, noopPauseAfter: 1 }),
+      state: c26State({ workStreak: 5, noopStreak: 4 }),
+      event: idleEvent,
+    });
+    assert.equal(r.code, 0, r.stderr);
+    const st = readState(dir);
+    assert.equal(st.workStreak, 5, "unknown does not punish by guesswork");
+    assert.equal(st.noopStreak, 4, "unknown does not pardon either");
+    assert.notEqual(st.paused, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
