@@ -16,7 +16,7 @@
  * (`ssh <host> hc connect`), and that channel is relayed byte by byte.
  */
 
-import { createHash, createPublicKey, generateKeyPairSync as nodeKeyPair, verify as cryptoVerify, type KeyObject } from "node:crypto";
+import { createHash, createPublicKey, verify as cryptoVerify, type KeyObject } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer as tcpServer, type Socket } from "node:net";
 import { dirname } from "node:path";
@@ -26,7 +26,12 @@ import { type State } from "./stores.ts";
 import { pruneBudget, randomToken } from "./util.ts";
 
 const { Server } = ssh2Pkg;
-const utils = (ssh2Pkg as unknown as { utils?: { generateKeyPairSync?(type: string): { private: string; public: string } } }).utils;
+const utils = (ssh2Pkg as unknown as {
+  utils?: {
+    generateKeyPairSync?(type: string): { private: string; public: string };
+    parseKey(key: string): unknown;
+  };
+}).utils;
 
 const MAX_CHANNELS_PER_DEVICE = 3;
 const AUTH_STRIKES = 5;
@@ -110,6 +115,8 @@ export interface SshConfig {
   keyPath?: string;
   /** Deadline from transport accept through successful SSH user authentication. */
   authTimeoutMs?: number;
+  /** Test seam: the host key generator. Default: ssh2's ed25519 pair. */
+  mintKey?: () => { private: string; public: string };
 }
 
 export interface SshDeps {
@@ -447,31 +454,62 @@ export async function startSshd(deps: SshDeps): Promise<SshHandle | null> {
 }
 
 /** Mint once, keep at mode 0600; ephemeral (per-boot) when no key path is configured. */
+/** A malformed mint is a ~0.3% event (see hostKeyDefect), so this many tries is exhaustive in practice. */
+const MINT_TRIES = 8;
+
+/**
+ * The one parser that matters: `new Server({ hostKeys })` runs the same code, so a pair that
+ * fails here can never bring the leg up. ssh2 1.17.0's `generateKeyPairSync("ed25519")` returns
+ * a malformed pair about once in 300 mints (keygen.js strips real leading 0x00 key bytes as if
+ * they were BIT STRING padding; measured 2026-11-24). Returns null when the pair is usable.
+ */
+function hostKeyDefect(key: { private: string; public: string }): string | null {
+  if (!utils?.parseKey) return "this ssh2 build has no parseKey";
+  const prv = utils.parseKey(key.private);
+  if (prv instanceof Error) return `private: ${prv.message}`;
+  const pub = utils.parseKey(key.public);
+  if (pub instanceof Error) return `public: ${pub.message}`;
+  return null;
+}
+
 function loadOrMintHostKey(deps: SshDeps): { private: string; public: string; fingerprint: string } {
   const path = deps.config.keyPath;
   if (path) {
     try {
       const f = JSON.parse(readFileSync(path, "utf8")) as { private: string; public: string };
-      if (typeof f.private !== "string" || !f.private || typeof f.public !== "string" || !f.public) throw new Error("invalid key");
+      if (typeof f.private !== "string" || !f.private || typeof f.public !== "string" || !f.public) {
+        throw new Error("private/public missing or not strings");
+      }
+      const defect = hostKeyDefect(f);
+      if (defect) throw new Error(defect);
       return { private: f.private, public: f.public, fingerprint: fingerprintOf(f.public) };
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("cannot load existing SSH host key; restore it from backup");
+      // ENOENT is the one recoverable case: nothing to load, mint below. Anything else is a
+      // broken identity and must stop the leg — with the reason, not a parser stack from ssh2.
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error(`cannot load existing SSH host key (${e instanceof Error ? e.message : String(e)}); restore it from backup`);
+      }
     }
   }
-  // ssh2.utils generates the OpenSSH format directly; the node-crypto path is the fallback.
-  const key =
-    utils?.generateKeyPairSync
-      ? (() => {
-          const k = utils.generateKeyPairSync("ed25519");
-          return { private: k.private, public: k.public };
-        })()
-      : (() => {
-          const { publicKey, privateKey } = nodeKeyPair("ed25519");
-          return {
-            private: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
-            public: publicKey.export({ type: "spki", format: "pem" }).toString(),
-          };
-        })();
+  // ssh2.utils is the generator: it emits the OpenSSH format ssh2 itself parses. (A node-crypto
+  // PEM pair is NOT a fallback — ssh2 1.17 answers "Unsupported key format" to pkcs8 ed25519.)
+  const generate = utils?.generateKeyPairSync?.bind(utils);
+  const mint =
+    deps.config.mintKey ??
+    (() => {
+      if (!generate) throw new Error("this ssh2 build has no generateKeyPairSync — cannot mint a host key");
+      return generate("ed25519");
+    });
+  // Mint until the pair parses. A key that does not parse must never reach `new Server()`
+  // (the leg would be null) nor the disk (every restart would repeat it).
+  let key = mint();
+  let defect = hostKeyDefect(key);
+  for (let attempt = 1; defect; attempt++) {
+    if (attempt >= MINT_TRIES) throw new Error(`cannot mint a valid ed25519 host key after ${MINT_TRIES} tries (last: ${defect})`);
+    deps.log(`ssh: minted host key malformed (${defect}); minting again`);
+    key = mint();
+    defect = hostKeyDefect(key);
+  }
   const fingerprint = fingerprintOf(key.public);
   if (path) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
