@@ -111,6 +111,11 @@ function validateConfig(c) {
     if (typeof c.noopPattern !== "string" || c.noopPattern.length < 1 || c.noopPattern.length > 120) return "loop.json: `noopPattern` must be a string of 1-120 chars";
     try { new RegExp(c.noopPattern); } catch { return "loop.json: `noopPattern` is not a valid JS regex"; }
   }
+  // C26: the other axis of C17's cost ceiling — consecutive WORK cycles.
+  // Default 0 = OFF: an in-place upgrade must not change a running loop
+  // (lesson C10); the cap is the chain owner's choice, like maxCycles.
+  const workPauseAfter = c.workPauseAfter ?? 0;
+  if (!Number.isInteger(workPauseAfter) || workPauseAfter < 0) return "loop.json: `workPauseAfter` must be an integer >= 0 (0 disables the work cap)";
   return null;
 }
 
@@ -206,8 +211,8 @@ async function cmdStatus() {
   const s = loadState();
   const alive = s.paneId ? await paneAlive(s.paneId) : false;
   out({
-    config: cfgErr ? { ok: false, error: cfgErr, path: CONFIG } : { ok: true, label: cfg.label, promptFile: cfg.promptFile, cwd: cfg.cwd, boot: buildBoot(cfg), cooldownMs: cfg.cooldownMs ?? MIN_COOLDOWN_MS, maxCycles: cfg.maxCycles ?? 0, noopPauseAfter: cfg.noopPauseAfter ?? 2, watchFiles: Array.isArray(cfg.watchFiles) ? cfg.watchFiles : [] },
-    state: { paneId: s.paneId ?? null, workspaceId: s.workspaceId ?? null, status: s.status ?? "idle", paused: s.paused === true, pausedBy: s.pausedBy ?? null, pausedAt: s.pausedAt ?? 0, armed: s.armed === undefined ? true : s.armed === true, cycles: s.cycles ?? 0, noopStreak: Number(s.noopStreak) || 0, lastNudgeAt: s.lastNudgeAt ?? 0, lastAuditAt: s.lastAuditAt ?? null, auditHold: s.auditHold ?? null, paneAlive: alive },
+    config: cfgErr ? { ok: false, error: cfgErr, path: CONFIG } : { ok: true, label: cfg.label, promptFile: cfg.promptFile, cwd: cfg.cwd, boot: buildBoot(cfg), cooldownMs: cfg.cooldownMs ?? MIN_COOLDOWN_MS, maxCycles: cfg.maxCycles ?? 0, noopPauseAfter: cfg.noopPauseAfter ?? 2, workPauseAfter: cfg.workPauseAfter ?? 0, watchFiles: Array.isArray(cfg.watchFiles) ? cfg.watchFiles : [] },
+    state: { paneId: s.paneId ?? null, workspaceId: s.workspaceId ?? null, status: s.status ?? "idle", paused: s.paused === true, pausedBy: s.pausedBy ?? null, pausedAt: s.pausedAt ?? 0, armed: s.armed === undefined ? true : s.armed === true, cycles: s.cycles ?? 0, noopStreak: Number(s.noopStreak) || 0, workStreak: Number(s.workStreak) || 0, lastNudgeAt: s.lastNudgeAt ?? 0, lastAuditAt: s.lastAuditAt ?? null, auditHold: s.auditHold ?? null, paneAlive: alive },
     log: LOG,
   });
 }
@@ -253,7 +258,7 @@ async function cmdStart() {
   if (!sent.ok) return die(3, `pane.send_text failed: ${sent.error?.message}`);
 
   // C23: a fresh run object also drops any stale deferred schedule (F8).
-  saveState({ paneId, workspaceId: wsId, status: "running", paused: false, armed: false, cycles: 0, noopStreak: 0, lastNudgeAt: 0, startedAt: Date.now() });
+  saveState({ paneId, workspaceId: wsId, status: "running", paused: false, armed: false, cycles: 0, noopStreak: 0, workStreak: 0, lastNudgeAt: 0, startedAt: Date.now() });
   log(`start: pane ${paneId} in ${label} (workspace ${wsId})`);
   out({ ok: true, paneId, workspaceId: wsId });
 }
@@ -281,7 +286,7 @@ async function cmdKick() {
   const r = await herdr("pane.send_text", { pane_id: s.paneId, text });
   if (!r.ok) return die(3, `pane.send_text failed: ${r.error?.message}`);
   // C23: a real nudge clears any pending deferred nudge in the same write (R5/F14).
-  saveState({ ...s, paused: false, pausedBy: undefined, noopStreak: 0, cycles: (Number(s.cycles) || 0) + 1, lastNudgeAt: Date.now(), deferredUntil: undefined, deferredId: undefined });
+  saveState({ ...s, paused: false, pausedBy: undefined, noopStreak: 0, workStreak: 0, cycles: (Number(s.cycles) || 0) + 1, lastNudgeAt: Date.now(), deferredUntil: undefined, deferredId: undefined });
   log(`kick: nudged pane ${s.paneId}`);
   out({ ok: true, nudged: true, paneId: s.paneId });
 }
@@ -311,6 +316,7 @@ function cmdPause(resume) {
   const next = { ...s, paused: !resume };
   if (resume) {
     next.noopStreak = 0;
+    next.workStreak = 0;
     delete next.pausedBy;
     delete next.pausedAt;
     next.auditHold = undefined;
@@ -376,7 +382,7 @@ function settleBookkeeping({ state: s0, cfg, paneId }) {
       // lifted by the machine — one honest line per settle.
       return { state: s, action: "stop", reason: s.pausedBy === "auto" ? "paused-auto" : "paused-owner" };
     }
-    s = { ...s, paused: false, pausedBy: undefined, pausedAt: undefined, noopStreak: 0 };
+    s = { ...s, paused: false, pausedBy: undefined, pausedAt: undefined, noopStreak: 0, workStreak: 0 };
     saveState(s);
     log(`auto-resume: watched file changed — ${basename(changed)}`);
     // falls through: the resumed loop obeys the normal nudge rules below
@@ -412,6 +418,7 @@ function settleBookkeeping({ state: s0, cfg, paneId }) {
   const verdict = classifyCycle(cfg, Number(s.lastNudgeAt) || Number(s.startedAt) || 0, Date.now());
   if (verdict === "no-op") {
     s.noopStreak = (Number(s.noopStreak) || 0) + 1;
+    s.workStreak = 0; // C26: the two axes reset each other — caps see CONSECUTIVE runs
     const noopPauseAfter = cfg?.noopPauseAfter ?? 2;
     if (noopPauseAfter > 0 && s.noopStreak >= noopPauseAfter) {
       const next = { ...s, paused: true, pausedBy: "auto", pausedAt: Date.now(), status: "running", ...auditMark };
@@ -420,6 +427,16 @@ function settleBookkeeping({ state: s0, cfg, paneId }) {
     }
   } else if (verdict === "work") {
     s.noopStreak = 0;
+    // C26: a self-justifying work streak has a cost ceiling too. Same stop
+    // shape as the no-op cap: pausedBy "auto" (C20 auto-resume applies),
+    // status stays "running" so resume re-arms the same loop.
+    s.workStreak = (Number(s.workStreak) || 0) + 1;
+    const workPauseAfter = cfg?.workPauseAfter ?? 0;
+    if (workPauseAfter > 0 && s.workStreak >= workPauseAfter) {
+      const next = { ...s, paused: true, pausedBy: "auto", pausedAt: Date.now(), status: "running", ...auditMark };
+      saveState(next);
+      return { state: next, action: "stop", reason: "work-auto-pause" };
+    }
   }
   const maxCycles = cfg?.maxCycles ?? 0;
   const cycles = Number(s.cycles) || 0;
@@ -485,6 +502,7 @@ function settleStopLine(reason, s, cfg, paneId) {
     case "paused-auto": return "paused (auto) — no watched file changed since the pause — no nudge";
     case "audit hold": return `audit hold ${s.auditHold?.rules?.join(",")} — no nudge until the owner resumes`;
     case "auto-pause": return `auto-pause: ${s.noopStreak} no-op cycles in a row — resume with the resume action`;
+    case "work-auto-pause": return `auto-pause: ${s.workStreak} work cycles in a row — resume with the resume action`;
     case "max-cycles": return `maxCycles ${cfg?.maxCycles ?? 0} reached — loop done`;
     default: return null; // audit violation (already logged), max-cycles-done (silent)
   }
