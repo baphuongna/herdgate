@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -45,7 +45,7 @@ if (group === 'pane' && sub === 'list') {
   // A settle-signal receipt, exactly where findReceipt reads it (16-hex
   // scope dir + receipts.jsonl, v4 id) — so tests can prove the found path.
   try {
-    const dir = join(process.env.HERDGATE_PI_RECEIPT_DIR, id.slice(0, 16));
+    const dir = join(process.env.HERDGATE_PI_RECEIPT_DIR, id.replace(/-/g, '').slice(0, 16));
     mkdirSync(dir, { recursive: true });
     appendFileSync(join(dir, 'receipts.jsonl'), JSON.stringify({ v: 1, id, sessionId: id, status: 'replied', turns: 1, ts: Date.now(), lastActivityAt: Date.now() }) + '\\n');
   } catch { /* best effort */ }
@@ -126,13 +126,11 @@ const withEnv = (f: Fixture, over: Record<string, string>) => ({ ...f.env, ...ov
 type RunResult = { stdout: string; stderr: string; status: number | null };
 
 function runSdd(args: string[], env: NodeJS.ProcessEnv): RunResult {
-  try {
-    const stdout = execFileSync(process.execPath, [SDD_CLI, ...args], { encoding: 'utf8', env });
-    return { stdout, stderr: '', status: 0 };
-  } catch (error) {
-    const e = error as { stdout?: string; stderr?: string; status?: number };
-    return { stdout: e.stdout ?? '', stderr: e.stderr ?? '', status: e.status ?? 1 };
-  }
+  // spawnSync, never execFileSync: the SUCCESS branch must capture stderr
+  // too — an empty-string assert is a free pass (reviewer2's F2), and the
+  // settle warnings live exactly on that branch.
+  const r = spawnSync(process.execPath, [SDD_CLI, ...args], { encoding: 'utf8', env });
+  return { stdout: r.stdout ?? '', stderr: r.stderr ?? '', status: r.status };
 }
 
 test.after(() => { for (const r of roots) rmSync(r, { recursive: true, force: true }); });
