@@ -22,12 +22,14 @@ WS ping 8s (`gateway.ts`, `heartbeatMs ?? 8_000`) — dưới ngưỡng idle 100
 | Chặng | Đo | Kết luận |
 |---|---|---|
 | HTTP tới gate, local | `curl 127.0.0.1:8833/healthz` ×3 | **1.2 ms** |
-| Cùng request qua `https://gate.phuongnb.io.vn` (edge **SIN**) | ×4 | **0.37 / 1.04 / 1.57 / 2.66 s**; connect 0.05–1.09 s |
+| Cùng request qua `https://gate.phuongnb.io.vn` (qua edge Cloudflare, lần đo đó SIN) | ×4 | **0.37 / 1.04 / 1.57 / 2.66 s**; connect 0.05–1.09 s |
 | Tunnel cloudflared 26h | journal `herdgate-tunnel` | 54 dòng lỗi, **7 lần đăng ký lại + 10 retry**, chủ yếu `QUIC … no recent network activity`, dồn vào 00–04h |
 
 Tức là: gate xử lý trong 1 ms, nhưng mỗi kết nối **mới** phải trả 0.4–2.7 s cho chặng
-điện thoại → Cloudflare SIN → máy nhà (hairpin: cả hai đầu ở Việt Nam, đi vòng Singapore),
-và chặng này biến thiên 7 lần giữa các lần đo (mất gói/tắc trên ISP↔Cloudflare).
+điện thoại → Cloudflare (SIN hoặc HKG) → máy nhà (hairpin: cả hai đầu ở Việt Nam, đi vòng
+qua Hồng Kông/Singapore; 7 ngày log, phía nhà đăng ký 4 lần HKG, 4 lần SIN — edge do lần
+đăng ký quyết định, không do giao thức tunnel), và chặng này biến thiên 7 lần giữa các lần đo
+(mất gói/tắc trên ISP↔Cloudflare).
 
 Số round-trip của một hành động một-shot qua đường hiện tại: WS (TCP + TLS 1.3 + upgrade) ≈ 3,
 KEX ≈ 2, auth publickey với OpenSSH (`none` → hỏi key → ký) ≈ 3, mở channel + exec + trả lời ≈ 2
