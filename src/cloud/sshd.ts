@@ -527,9 +527,16 @@ function loadOrMintHostKey(deps: SshDeps): { private: string; public: string; fi
   return { ...key, fingerprint };
 }
 
-/** SHA256 fingerprint in the same `SHA256:…` shape OpenSSH prints. */
+/**
+ * SHA256 of the public key's SSH blob — the second column of `ssh-keygen -lf`. Taken from
+ * ssh2's parser, so it never depends on how the key happens to be spelled: the first version
+ * stripped "first and last line" as if every key were PEM, and for the authorized_keys line
+ * ssh2 mints that glued the algorithm name onto the base64 before hashing (the production
+ * key reported SHA256:ER5U4j… where ssh-keygen says SHA256:OCMQlB…).
+ */
 function fingerprintOf(publicKeyText: string): string {
-  const base64 = publicKeyText.replace(/^.*?\n/, "").replace(/\n.*$/, "").replace(/\s+/g, "");
-  const digest = createHash("sha256").update(Buffer.from(base64, "base64")).digest("base64").replace(/=+$/, "");
-  return `SHA256:${digest}`;
+  const parsed = utils?.parseKey(publicKeyText);
+  const blob = parsed && !(parsed instanceof Error) ? (parsed as { getPublicSSH(): Buffer }).getPublicSSH() : null;
+  if (!blob) throw new Error("host key public half does not parse — no fingerprint");
+  return `SHA256:${createHash("sha256").update(blob).digest("base64").replace(/=+$/, "")}`;
 }

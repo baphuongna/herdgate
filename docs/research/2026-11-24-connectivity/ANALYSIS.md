@@ -60,6 +60,15 @@ dừng với thông điệp "restore it from backup" kèm lý do. Test: `test/ss
 stress 600 lần sinh thật: 1 key hỏng bị bắt, 0 thất bại. Nhánh fallback PEM cũng lộ ra là code chết
 (ssh2 không đọc pkcs8 ed25519) → bỏ, thay bằng lỗi rõ ràng.
 
+**Đã sửa (nhỏ, cùng họ "in sai giá trị an ninh") — fingerprint của host key.** Khi kiểm key production
+bằng parser mới thì phát hiện `fingerprintOf` hash nhầm: hàm viết cho dạng PEM (bỏ dòng đầu/cuối),
+còn key ssh2 sinh là một dòng `ssh-ed25519 <base64>` nên tên thuật toán bị dính vào chuỗi trước khi
+hash. Gate ghi `SHA256:ER5U4j…`, `ssh-keygen -lf` nói `SHA256:OCMQlB…`. Không ai so sánh hai giá trị
+này (PWA không hiển thị) nên chưa ai bị cắn; giờ lấy blob public từ parser của ssh2 rồi hash
+(`test/ssh-hostkey-fingerprint.test.ts`, đối chiếu chéo `ssh-keygen`). Trường `fingerprint` trong
+file key production vẫn là giá trị cũ — chỉ là thông tin, gate tính lại khi nạp; không sửa tay
+file state.
+
 Chưa sửa, đã hiểu: pha KEX trên raw TCP vẫn còn ~45 ms. ssh2 gửi KEXINIT của server ngay sau khi
 đọc version string của client (`protocol/Protocol.js`, `kexinit(this)`), nên nó không mang ACK cho
 KEXINIT của client; OpenSSH còn giữ Nagle trong lúc KEX (chỉ tắt khi vào phiên) nên `ECDH_INIT`
