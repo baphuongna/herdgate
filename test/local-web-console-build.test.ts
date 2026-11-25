@@ -5,6 +5,8 @@ import { createAssetAllowlist, sandboxArgs, verifyBuildOutput } from "../console
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 
 const root = new URL("../", import.meta.url);
 
@@ -48,9 +50,13 @@ test("build sandbox clears environment and user homes and denies networking", ()
   assert.equal(args[outputBind + 1], "/home/bom/source/worktree/console/dist");
   assert.equal(args[outputBind + 2], "/tmp/herdgate-console-sandbox/repo/console/dist");
   assert.ok(!args.includes("/home/bom/source/worktree"));
+  const viteIndex = args.lastIndexOf("/tmp/herdgate-console-sandbox/tools/node");
+  assert.deepEqual(args.slice(viteIndex + 2), [
+    "build", "--config", "/tmp/herdgate-console-sandbox/repo/console/vite.config.ts", "--configLoader", "runner",
+  ]);
 });
 
-test("build allowlist contains only regular output files with digests and no-store shell policy", async () => {
+test("build emits the runtime-compatible manifest.json schema and serves only runtime-accepted assets", async () => {
   const temp = await mkdtemp(path.join(os.tmpdir(), "herdgate-console-build-test-"));
   try {
     await mkdir(path.join(temp, "assets"));
@@ -59,13 +65,27 @@ test("build allowlist contains only regular output files with digests and no-sto
     await writeFile(path.join(temp, "assets", "app-a1b2c3d4.js"), "console.log('fixture')");
     await writeFile(path.join(temp, "notices", "LICENSE"), "fixture license");
     await writeFile(path.join(temp, "notices", "THIRD_PARTY_NOTICES.md"), "fixture notices");
+    const expected = JSON.parse(await readFile(new URL("./fixtures/local-web-console-runtime-manifest.json", import.meta.url), "utf8"));
+    const runtimeRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../herdgate-console-runtime");
+    const runtimeFixture = path.join(runtimeRoot, "test/fixtures/local-web-console-runtime/console/dist/manifest.json");
+    const runtimeService = path.join(runtimeRoot, "bin/console-service.mjs");
+    if (existsSync(runtimeFixture)) assert.deepEqual(JSON.parse(await readFile(runtimeFixture, "utf8")), expected);
     const manifest = await createAssetAllowlist(temp);
-    assert.equal(manifest.appBase, "/");
-    assert.ok(manifest.files.some((file) => file.path === "index.html" && file.cache === "no-store"));
-    assert.ok(manifest.files.some((file) => file.path === "assets/app-a1b2c3d4.js" && file.cache === "immutable"));
-    assert.ok(manifest.files.every((file) => /^[a-f0-9]{64}$/.test(file.sha256) && file.size > 0));
-    assert.deepEqual(JSON.parse(await readFile(path.join(temp, "asset-manifest.json"), "utf8")), manifest);
-    assert.equal((await verifyBuildOutput(temp)).files.length, manifest.files.length);
+    assert.deepEqual(Object.keys(manifest).sort(), Object.keys(expected).sort());
+    assert.equal(manifest.version, expected.version);
+    assert.equal(manifest.index, expected.index);
+    assert.deepEqual(Object.keys(manifest.files).sort(), ["assets/app-a1b2c3d4.js", "index.html"]);
+    for (const entry of Object.values(manifest.files)) {
+      assert.deepEqual(Object.keys(entry).sort(), ["path", "type"]);
+      assert.ok(["text/html; charset=utf-8", "text/javascript; charset=utf-8", "text/css; charset=utf-8", "font/woff2", "image/svg+xml", "image/png"].includes(entry.type));
+    }
+    assert.deepEqual(Object.keys(manifest.files["index.html"]).sort(), Object.keys(expected.files["index.html"]).sort());
+    assert.deepEqual(JSON.parse(await readFile(path.join(temp, "manifest.json"), "utf8")), manifest);
+    assert.equal(Object.keys((await verifyBuildOutput(temp)).files).length, Object.keys(manifest.files).length);
+    if (existsSync(runtimeService)) {
+      const { validateConsoleAssets } = await import(pathToFileURL(runtimeService).href);
+      assert.doesNotThrow(() => validateConsoleAssets(temp));
+    }
     await writeFile(path.join(temp, "assets", "app-a1b2c3d4.js"), "navigator.serviceWorker.register('/sw.js')");
     await assert.rejects(verifyBuildOutput(temp), /forbidden upstream\/PWA boot reference/);
   } finally { await rm(temp, { recursive: true, force: true }); }

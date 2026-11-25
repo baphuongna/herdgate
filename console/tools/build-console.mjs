@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -9,6 +8,11 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repository = path.resolve(root, "..");
 const output = path.join(root, "dist");
 const requiredAssets = ["index.html", "notices/LICENSE", "notices/THIRD_PARTY_NOTICES.md"];
+const runtimeMimeTypes = new Set([
+  "text/html; charset=utf-8", "text/css; charset=utf-8", "text/javascript; charset=utf-8",
+  "application/javascript; charset=utf-8", "application/json; charset=utf-8", "image/svg+xml",
+  "image/png", "image/jpeg", "image/webp", "image/gif", "font/woff2", "font/woff",
+]);
 const forbiddenBuildPatterns = [
   /navigator\.serviceWorker|serviceWorker\.register\s*\(/i,
   /https?:\\?\/\\?\/(?:app\.)?ovis\.sh/i,
@@ -23,6 +27,7 @@ function contentType(file) {
     ".js": "text/javascript; charset=utf-8",
     ".css": "text/css; charset=utf-8",
     ".woff2": "font/woff2",
+    ".woff": "font/woff",
     ".wasm": "application/wasm",
     ".svg": "image/svg+xml",
     ".png": "image/png",
@@ -46,41 +51,40 @@ async function listFiles(directory, prefix = "") {
 }
 
 export async function createAssetAllowlist(distDirectory) {
-  const files = await listFiles(distDirectory);
-  const listed = [];
-  for (const entry of files.sort((a, b) => a.relative.localeCompare(b.relative, "en"))) {
-    if (entry.relative === "asset-manifest.json") continue;
+  const outputFiles = await listFiles(distDirectory);
+  const files = {};
+  for (const entry of outputFiles.sort((a, b) => a.relative.localeCompare(b.relative, "en"))) {
+    if (entry.relative === "manifest.json") continue;
     const relative = entry.relative.split(path.sep).join("/");
-    const bytes = await readFile(entry.full);
     if (relative.startsWith("assets/") && !/-[A-Za-z0-9_-]{8,}\.[^.]+$/.test(path.basename(relative))) {
       throw new Error(`asset is not content-hashed: ${relative}`);
     }
-    listed.push({
-      path: relative,
-      size: bytes.length,
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-      contentType: contentType(relative),
-      cache: relative.startsWith("assets/") ? "immutable" : "no-store",
-    });
+    const type = contentType(relative);
+    if (!runtimeMimeTypes.has(type)) {
+      if (relative.startsWith("assets/")) throw new Error(`asset MIME type is not supported by Console runtime: ${relative} (${type})`);
+      continue;
+    }
+    files[relative] = { path: relative, type };
   }
   for (const required of requiredAssets) {
-    if (!listed.some((entry) => entry.path === required)) throw new Error(`required Console build file missing: ${required}`);
+    if (!outputFiles.some((entry) => entry.relative === required)) throw new Error(`required Console build file missing: ${required}`);
   }
-  if (!listed.some((entry) => entry.path.startsWith("assets/") && entry.path.endsWith(".js"))) {
+  if (!files["index.html"]) throw new Error("runtime manifest is missing index.html");
+  if (!Object.keys(files).some((asset) => asset.startsWith("assets/") && asset.endsWith(".js"))) {
     throw new Error("Console build is missing its JavaScript bundle");
   }
-  const manifest = { version: 1, appBase: "/", files: listed };
-  await writeFile(path.join(distDirectory, "asset-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 });
+  const manifest = { version: 1, index: "index.html", files };
+  await writeFile(path.join(distDirectory, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 });
   return manifest;
 }
 
 export async function verifyBuildOutput(distDirectory) {
   const manifest = await createAssetAllowlist(distDirectory);
-  for (const item of manifest.files) {
-    if (!/\.(?:html|js|css)$/.test(item.path)) continue;
-    const text = await readFile(path.join(distDirectory, item.path), "utf8");
+  for (const [urlPath, entry] of Object.entries(manifest.files)) {
+    if (!/\.(?:html|js|css)$/.test(urlPath)) continue;
+    const text = await readFile(path.join(distDirectory, entry.path), "utf8");
     for (const pattern of forbiddenBuildPatterns) {
-      if (pattern.test(text)) throw new Error(`forbidden upstream/PWA boot reference in built asset: ${item.path}`);
+      if (pattern.test(text)) throw new Error(`forbidden upstream/PWA boot reference in built asset: ${urlPath}`);
     }
   }
   const html = await readFile(path.join(distDirectory, "index.html"), "utf8");
@@ -127,7 +131,7 @@ export function sandboxArgs({ repositoryPath, consolePath, distPath, nodePath, v
     "--setenv", "NODE_ENV", "production",
     "--setenv", "CI", "1",
     "--setenv", "NPM_CONFIG_USERCONFIG", "/dev/null",
-    "--", sandboxNode, sandboxVite, "build", "--config", `${sandboxConsole}/vite.config.ts`,
+    "--", sandboxNode, sandboxVite, "build", "--config", `${sandboxConsole}/vite.config.ts`, "--configLoader", "runner",
   ];
   return args;
 }
@@ -155,7 +159,7 @@ async function main() {
     if (result.error) throw result.error;
     if (result.status !== 0) throw new Error(`sandboxed Vite build failed (status ${result.status ?? "unknown"})`);
     const manifest = await verifyBuildOutput(output);
-    process.stdout.write(`Built ${manifest.files.length} allowlisted files at console/dist (loopback app base /).\n`);
+    process.stdout.write(`Built ${Object.keys(manifest.files).length} runtime-allowlisted files at console/dist (loopback app base /).\n`);
   } catch (error) {
     await rm(output, { recursive: true, force: true });
     throw error;

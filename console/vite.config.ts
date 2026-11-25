@@ -18,6 +18,11 @@ export default {
   esbuild: { jsx: "automatic", jsxImportSource: "react" },
   resolve: {
     alias: [
+      // Ovis components share preference modules that persist to browser storage. The L1 surface is read-only and tab-local.
+      { find: /(?:^|.*\/)settings\.ts$/, replacement: path.join(root, "src/ovis/settings-shim.tsx") },
+      { find: /(?:^|.*\/)lastViewedPane\.ts$/, replacement: path.join(root, "src/ovis/last-viewed-pane-shim.ts") },
+      { find: /(?:^|.*\/)machineContext\.tsx$/, replacement: path.join(root, "src/ovis/machine-context-shim.tsx") },
+      { find: /(?:^|.*\/)i18n\.ts$/, replacement: path.join(root, "src/ovis/i18n-shim.ts") },
       { find: /^react\/jsx-runtime$/, replacement: path.join(modules, "react/jsx-runtime.js") },
       { find: /^react\/jsx-dev-runtime$/, replacement: path.join(modules, "react/jsx-dev-runtime.js") },
       { find: /^react$/, replacement: path.join(modules, "react/index.js") },

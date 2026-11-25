@@ -7,48 +7,55 @@ This is an isolated **build-only** workspace. The runtime package remains Herdga
 From the repository root, with the pinned runtime first on `PATH`:
 
 ```sh
-LC_ALL=C PATH=/home/bom/.nvm/versions/node/v22.23.5/bin:$PATH \
-  /home/bom/.nvm/versions/node/v22.23.5/bin/node console/tools/preflight.mjs
+export PATH=/home/bom/.cache/herdgate-console-toolchain/bun-bin:/home/bom/.nvm/versions/node/v22.23.5/bin:$PATH
+LC_ALL=C /home/bom/.nvm/versions/node/v22.23.5/bin/node console/tools/preflight.mjs
 
 cd console
-LC_ALL=C PATH=/home/bom/.nvm/versions/node/v22.23.5/bin:$PATH bun run build:console
+LC_ALL=C bun run build:console
 ```
 
-The preflight exits `2` when any required version, direct dependency, lock consistency, entrypoint, or build config is missing. The build command refuses to run unless preflight is green, then runs Vite only inside `bwrap --unshare-net` with a cleared environment, isolated HOME/TMP, read-only source, and only `console/dist` writable. If bubblewrap is unavailable, it refuses to build unsandboxed. The output is `console/dist/index.html`, hashed `/assets/`, bundled notices, and `asset-manifest.json`; the manifest is the static-file allowlist. The app base is `/`, not `/console/`.
+The preflight exits `2` when any required version, direct dependency, lock consistency, entrypoint, or build config is missing. The build command refuses to run unless preflight is green, then runs Vite only inside `bwrap --unshare-net` with a cleared environment, isolated HOME/TMP, read-only source, and only `console/dist` writable. It passes `--configLoader runner` so Vite does not emit temporary config bundles beside the read-only config. Aliases that redirect Ovis state modules consume the full relative import ID and resolve to absolute worktree paths, avoiding duplicate module IDs. If bubblewrap is unavailable, the script refuses to build unsandboxed. The output is `console/dist/index.html`, hashed `/assets/`, bundled notices, and **`manifest.json` in the runtime service's `{ version, index, files: { urlPath: { path, type } } }` schema**; notices remain shipped but are not URL-allowlisted because the runtime MIME allowlist intentionally excludes document types. The app base is `/`, not `/console/`.
 
-## Pinned dependencies and preload (not performed here)
+## Pinned dependencies and offline toolchain
 
-`vendor/ovis/package.json` and `vendor/ovis/bun.lock` are the exact upstream-pinned manifest/lock (`bun@1.4.4`, lockfile v2); the upstream patched-dependency files are retained. The upstream dependency manifest includes build and non-shipped Ovis packages so the frozen upstream lock can be used unchanged. These packages are build inputs only; no Ovis server/runtime is copied into `dist`. `console/package.json` intentionally declares no duplicate dependency graph and does not modify the root package.
+`vendor/ovis/package.json` and `vendor/ovis/bun.lock` are the exact upstream-pinned manifest/lock (`bun@1.4.4`, lockfile v2); patched-dependency files are retained. The root manifest is unchanged. These packages are build inputs only; no Ovis server/runtime is copied into `dist`.
 
-Preload only from an already-approved offline dependency cache and a locally staged Bun 1.4.4 binary. Do **not** fetch, install globally, use a developer's npm credentials, run any Ovis installer, or run package lifecycle scripts. Set the paths to those local staged inputs, create the isolated `node_modules` destination, and run this frozen, networkless install:
+### Recreate the staged toolchain/cache without Internet or secrets
+
+The build in this worktree used Node `v22.23.5` and the separately staged Bun `1.4.4` binary at `/home/bom/.cache/herdgate-console-toolchain/bun-1.4.4/bun-linux-x64/bun` (SHA-256 `10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235`, checked against Bun's official `SHASUMS256.txt`). The staged registry contains only lock-derived package metadata/tarballs; 249 lock package entries were checked against `bun.lock` SHA-512 integrity, and optional platform artifacts are included. The read-only `registry-stub.py` serves that staged tree only on `127.0.0.1:18777`; it has no credentials, write methods, or external-network path. Keep the binary, registry, and Bun cache in an approved local staging directory. Do not fetch/install globally, use a developer's npm credentials, run an Ovis installer, or allow lifecycle scripts.
+
+For a fresh `node_modules` from already-staged artifacts, run the registry stub and Bun in the **same** isolated network namespace. This lets Bun reach loopback while denying all external networking; only the cache and `node_modules` are writable:
 
 ```sh
 WORKTREE=/home/bom/source/herdgate-console-web
-BUN=/opt/herdgate-toolchain/bun-1.4.4
-CACHE=/opt/herdgate-console-cache/bun-1.4.4
-mkdir -p "$WORKTREE/console/vendor/ovis/node_modules" "$CACHE"
+TOOLCHAIN=/home/bom/.cache/herdgate-console-toolchain
+BUN="$TOOLCHAIN/bun-1.4.4/bun-linux-x64/bun"
+mkdir -p "$WORKTREE/console/vendor/ovis/node_modules"
 test "$("$BUN" --version)" = 1.4.4
+printf '%s  %s\n' 10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235 "$BUN" | sha256sum -c -
 bwrap --unshare-net --die-with-parent --ro-bind / / \
   --tmpfs /tmp --dir /tmp/herdgate-preload --dir /tmp/herdgate-preload/worktree \
   --dir /tmp/herdgate-preload/cache --dir /tmp/herdgate-preload/tools \
   --ro-bind "$WORKTREE" /tmp/herdgate-preload/worktree \
   --bind "$WORKTREE/console/vendor/ovis/node_modules" /tmp/herdgate-preload/worktree/console/vendor/ovis/node_modules \
-  --bind "$CACHE" /tmp/herdgate-preload/cache \
+  --bind "$TOOLCHAIN/cache-bun-1.4.4" /tmp/herdgate-preload/cache \
   --ro-bind "$BUN" /tmp/herdgate-preload/tools/bun \
+  --ro-bind "$TOOLCHAIN/registry-stub.py" /tmp/herdgate-preload/registry-stub.py \
+  --ro-bind "$TOOLCHAIN/local-registry" /tmp/herdgate-preload/registry \
   --tmpfs /home --tmpfs /root --tmpfs /run --dir /tmp/herdgate-preload/home \
   --proc /proc --dev /dev \
   --chdir /tmp/herdgate-preload/worktree/console/vendor/ovis --clearenv \
   --setenv PATH /tmp/herdgate-preload/tools:/usr/bin:/bin --setenv HOME /tmp/herdgate-preload/home \
-  --setenv TMPDIR /tmp --setenv LC_ALL C --setenv CI 1 \
-  -- /tmp/herdgate-preload/tools/bun install --frozen-lockfile --ignore-scripts --cache-dir=/tmp/herdgate-preload/cache
+  --setenv TMPDIR /tmp --setenv LC_ALL C --setenv CI 1 --setenv NPM_CONFIG_USERCONFIG /dev/null \
+  -- /bin/sh -ec 'python3 /tmp/herdgate-preload/registry-stub.py /tmp/herdgate-preload/registry 18777 & registry_pid=$!; trap "kill $registry_pid 2>/dev/null || true" EXIT; sleep 1; /tmp/herdgate-preload/tools/bun install --registry=http://127.0.0.1:18777 --frozen-lockfile --ignore-scripts --cache-dir=/tmp/herdgate-preload/cache'
 ```
 
-If anything is absent from the staged cache, the isolated install fails rather than reaching the network. Confirm the Bun lock still matches the package manifest by rerunning preflight. The `--ignore-scripts` flag suppresses root and dependency lifecycle scripts; the private cache and `node_modules` are the only writable install destinations. After preload, run the build command above; it independently denies networking and does not inherit credentials or user configuration.
+Then rerun preflight and the sandboxed build command above. `--ignore-scripts` suppresses root/dependency lifecycle scripts; an unavailable package makes the local registry return 404 instead of falling back to the Internet. No registry token or other secret is required.
 
-## Current preflight snapshot
+### Verified build snapshot
 
-This worktree was inspected with Node `v22.23.5`. Bun on `PATH` is `/home/bom/.local/bin/bun` version `1.3.13`, not required `1.4.4`. `vendor/ovis/bun.lock` is 66,172 bytes, lockfile v2, SHA-256 `d4e40245456c0d874a7f0af1ef45aa47fa2256c465a3995866d260f6f442ad47`, and matches the pinned package manifest. The default Bun cache `/home/bom/.bun/install/cache` has 11 opaque files totaling 2,532,574 bytes; it does not identify installed packages. All 36 pinned direct Ovis dependencies are missing under `vendor/ovis/node_modules`, including React `^19.3.0`, xterm `6.0.0`, addon-fit `0.11.0`, Vite `^8.3.4`, and the remaining app/build dependencies. No install or network fetch has been attempted.
+With `PATH=/home/bom/.cache/herdgate-console-toolchain/bun-bin:/home/bom/.nvm/versions/node/v22.23.5/bin:$PATH`, preflight reported `buildReady: true`, 36/36 direct dependencies present, and zero blockers. `node console/tools/build-console.mjs` completed in the network-isolated bubblewrap sandbox. It wrote the runtime-validated `console/dist/index.html` and `{ version, index, files }` `manifest.json`; the manifest allowlists 97 files totaling 4,111,475 bytes (100 files in `dist`, including the manifest and two notices). The bundled JS is 780,603 bytes and CSS is 185,647 bytes. The build output is ignored by Git (`/dist/`); rerun the command to reproduce it.
 
 ## Integration boundary
 
-`console/src/ui.tsx` provides the local login, workspace/tab/pane selection, refresh gating, explicit offline/ambiguous states, and read-only ANSI mirror. It uses the same pinned Ovis `@xterm/xterm` and fit addon used by Ovis terminal UI; it does **not** mount Ovis `App` or `PaneTerminal`, whose current APIs attach Ovis's WebSocket and expose input/write operations. The typed Herdgate client calls only `capabilities`, `auth/redeem`, `auth/logout`, `session`, and `pane/:id/screen`; unsupported writes are not implemented. This adapter surface is tested against the worktree HTTP fixture. It is not evidence of a production daemon endpoint, a built bundle, or a browser-level zero-egress test.
+`console/src/entry.tsx` mounts the Herdgate shell (`ui.tsx`), which handles local login and runtime polling. Its selected-session view imports the pinned Ovis `TabStrip` and `PaneCanvas` source through `console/src/ovis/ReadOnlySessionView.tsx`; the terminal xterm surface is an attributed read-only port, not Ovis `PaneTerminal`. Workspace choice stays Herdgate-owned rather than importing Ovis `Sidebar` and its stored preferences/worktree features. The exact trace and capability boundary are documented in `console/patches/README.md`. The typed client adapts the a9a260f runtime schema and calls only `capabilities`, `auth/redeem`, `auth/logout`, `session`, and `pane/:id/screen`. The Vite machine-context alias hard-denies all Ovis machine API methods before transport; the entry-installed network guard permits only those typed local fetch routes (plus the two auth POSTs) and disables WebSocket/EventSource constructors. Node tests verify representative machine API rejections and route/socket blocking. Static build scanning is not a measured browser network trace.
