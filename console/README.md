@@ -59,3 +59,19 @@ With `PATH=/home/bom/.cache/herdgate-console-toolchain/bun-bin:/home/bom/.nvm/ve
 ## Integration boundary
 
 `console/src/entry.tsx` mounts the Herdgate shell (`ui.tsx`), which handles local login and runtime polling. Its selected-session view imports the pinned Ovis `TabStrip` and `PaneCanvas` source through `console/src/ovis/ReadOnlySessionView.tsx`; the terminal xterm surface is an attributed read-only port, not Ovis `PaneTerminal`. Workspace choice stays Herdgate-owned rather than importing Ovis `Sidebar` and its stored preferences/worktree features. The exact trace and capability boundary are documented in `console/patches/README.md`. The typed client adapts the a9a260f runtime schema and calls only `capabilities`, `auth/redeem`, `auth/logout`, `session`, and `pane/:id/screen`. The Vite machine-context alias hard-denies all Ovis machine API methods before transport; the entry-installed network guard permits only those typed local fetch routes (plus the two auth POSTs) and disables WebSocket/EventSource constructors. Node tests verify representative machine API rejections and route/socket blocking. Static build scanning is not a measured browser network trace.
+
+## Build and ship
+
+## Ship contract
+
+The npm package ships the built `console/dist/` artifact only: `manifest.json`, its allowlisted static assets, `notices/LICENSE`, and `notices/THIRD_PARTY_NOTICES.md`. It does not ship `console/vendor/`, `console/src/`, or `console/tools/`; the installed service needs only Node.js ≥22, not the Ovis checkout, Bun, or Vite.
+
+Build the pinned frontend in the separately staged Console build environment with:
+
+```sh
+npm run build:console
+```
+
+That command uses the staged Bun 1.4.4 toolchain. `scripts/build-release.sh` deliberately does not invoke it: release packaging first validates `console/dist/`, packs to a temporary directory, and checks the real tar listing against the manifest and notices. A missing or invalid bundle blocks the release and prints the build command; it never fetches assets or silently ships an incomplete Console.
+
+Windows lifecycle remains fail-closed (`console_windows_launcher_blocked`) until verified on the target Herdr App/runtime. Do not interpret the Linux fixture smoke test as Windows support.

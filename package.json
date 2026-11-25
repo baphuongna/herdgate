@@ -13,6 +13,7 @@
     "test": "node --test test/*.test.ts",
     "check": "tsc -p tsconfig.json",
     "build:cloud": "tsc -p tsconfig.cloud.json",
+    "build:console": "node console/tools/build-console.mjs",
     "build:release": "bash scripts/build-release.sh",
     "ssh-bridge": "node src/cloud/ssh-bridge.ts",
     "ssh-tcp-edge": "node src/cloud/ssh-tcp-edge.ts",
@@ -36,6 +37,7 @@
   },
   "files": [
     "bin/*.mjs",
+    "console/dist/**",
     ".agents/skills/herdr*/SKILL.md",
     ".agents/skills/herdr/herdr_pi.py",
     ".agents/skills/herdr/profiles.example.toml",
