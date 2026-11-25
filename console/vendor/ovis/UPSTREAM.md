@@ -7,7 +7,7 @@
 
 ## Import selection
 
-The frontend source closure was traced from `src/main.tsx` through relative TS/TSX/JS/CSS/JSON and static asset imports, including CSS `url()` references. All source files in that closure are copied byte-for-byte. The complete `src/assets/` and `src/fonts/` asset trees are retained. The four public artwork files and upstream HTML/Vite configuration are retained for provenance/audit; `upstream-index.html` and `upstream-vite.config.ts` are not the Herdgate build inputs.
+The frontend source closure was traced from `src/main.tsx` through relative TS/TSX/JS/CSS/JSON and static asset imports, including CSS `url()` and `new URL(..., import.meta.url)` worker/WASM references. All source files in that closure are copied byte-for-byte. The complete `src/assets/` and `src/fonts/` asset trees are retained. The four public artwork files and upstream HTML/Vite configuration are retained for provenance/audit; `upstream-index.html` and `upstream-vite.config.ts` are not the Herdgate build inputs.
 
 Not imported: Ovis `server/`, `relay/`, `push-relay/`, `app/`, CI/release/site workflows, test files, generated PWA service worker/manifest, installers, and unrelated repository content. The browser frontend is broad and imports account, relay, update, and other screens; retaining that source does not enable or claim those capabilities. A Herdgate-owned entrypoint/build must exclude their boot/network paths and show unsupported features honestly.
 
