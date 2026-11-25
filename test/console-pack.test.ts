@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import test, { type TestContext } from "node:test";
 import { assertConsolePackContents } from "../scripts/console-pack.mjs";
+import { reapConsoleServer } from "./fixtures/local-web-console-runtime/console-process.mjs";
 import { startFixtureRuntime } from "./fixtures/local-web-console-runtime/runtime.mjs";
 
 const ROOT = join(import.meta.dirname, "..");
@@ -136,7 +137,7 @@ test("packed npm install boots Console from a clean unpacked tarball with only t
     child.once("exit", (status) => resolve({ status, stdout, stderr }));
   });
   t.after(async () => {
-    if (existsSync(join(state, "instance.json"))) run("stop");
+    await reapConsoleServer(() => run("stop"), state);
     await runtime.close();
   });
   const started = await runAsync("start");
