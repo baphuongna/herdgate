@@ -81,8 +81,8 @@
 5. Implement tối thiểu theo spec.
 6. Targeted green → full suite xanh tuyệt đối.
 7. Verify sống: home (source, restart service đúng vai) và/hoặc laptop
-   (npm, qua drive script — `HG_VERIFY` chỉ cho lệnh ngắn, update dùng
-   `HG_WAIT=75` + pre-clean `.setup`).
+   (npm, qua drive script: `HG_DRY=1` đọc trước, update `HG_WAIT=75`; `.setup` mồ
+   côi >60s tự thu hồi (C1) — không xoá tay).
 8. Commit (docs/impl tách commit), bump version + tag + npm publish nếu vòng
    có release; chờ `dist-tags.latest` flip rồi mới drive update từ xa.
 9. Dọn rác probe (device revoke, temp file), cập nhật Cycle Log (đạt/chưa đạt).
