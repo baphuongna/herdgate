@@ -3,7 +3,7 @@
 - Repository: `https://github.com/devswha/ovis.git`
 - Pinned revision: `b0f20e7bcf87f770638c26b8c74e77ef8fd84131` (verified from `/tmp/ovis-fork-check.OTCATe` HEAD)
 - License: MIT; upstream `LICENSE` and `THIRD_PARTY_NOTICES.md` are retained alongside `package.json`, the complete upstream `bun.lock`, and all upstream `patches/`.
-- `SOURCE-MANIFEST.txt` records SHA-256, upstream-relative path, and byte length for every imported file. Recompute hashes from this checkout with `sha256sum -c` after stripping each row's trailing size field, or use a verifier in Herdgate tooling.
+- `SOURCE-MANIFEST.txt` records SHA-256, upstream-relative path, and byte length for every imported file. Verify each row and byte count with `console/tools/verify-ovis-source.mjs` through `test/local-web-console-frontend.test.ts`.
 
 ## Import selection
 
@@ -13,6 +13,6 @@ Not imported: Ovis `server/`, `relay/`, `push-relay/`, `app/`, CI/release/site w
 
 ## Reproduction and build status
 
-The source archive was populated from the clean pinned checkout with a relative-import closure walk, plus the stated static assets, upstream lock/licensing/patches, and audit inputs. The source file count, aggregate bytes, and every file digest are in `SOURCE-MANIFEST.txt`.
+The source archive was populated from the clean pinned checkout with a relative-import closure walk, plus the stated static assets, upstream lock/licensing/patches, and audit inputs. The source file count, aggregate bytes, and every file digest are in `SOURCE-MANIFEST.txt`. Source integrity validation is now available through the local test.
 
 Upstream declares Bun `1.4.4` and builds with `bun run build`; that upstream command uses Ovis build scripts and is **not** the Herdgate build command and was not run. This environment has Bun `1.3.13`; its local package cache is only 2.5 MB and the Ovis dependency set is not installed. No install, lifecycle script, upstream build, or network fetch was run. Any Herdgate build must use an audited isolated toolchain and run offline after controlled dependency provisioning.
