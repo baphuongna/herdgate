@@ -239,7 +239,7 @@ export function ConsoleApp() {
       <p>Enter the short-lived code printed by <code>herdgate console login</code>. Reloading requires a new login.</p>
       <form onSubmit={(event) => { void redeem(event); }}>
         <label htmlFor="local-code">One-time local code</label>
-        <input id="local-code" ref={codeInput} name="code" type="password" autoComplete="off" autoCapitalize="off" spellCheck={false} inputMode="text" minLength={64} maxLength={64} pattern="[0-9a-f]{64}" required />
+        <input id="local-code" ref={codeInput} name="code" type="text" className="code-input" autoComplete="off" autoCapitalize="off" spellCheck={false} inputMode="text" minLength={64} maxLength={64} pattern="[0-9a-f]{64}" required />
         <button type="submit" disabled={busy}>{busy ? "Checking…" : "Unlock Console"}</button>
       </form>
       {codeError && <p className="notice error" role="alert">{codeError}</p>}

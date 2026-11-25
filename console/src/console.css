@@ -25,6 +25,8 @@ button { color: inherit; }
 .auth-card form { display: grid; gap: .7rem; margin-top: 1.4rem; }
 .auth-card label { font-size: .88rem; font-weight: 600; }
 .auth-card input { min-height: 2.8rem; padding: .6rem .75rem; border: 1px solid #3b4856; border-radius: .55rem; background: #0c1117; color: #edf3f9; }
+/* One-time local code, not a credential: keep password-manager prompts out of the way and mask visually. */
+.auth-card input.code-input { -webkit-text-security: disc; letter-spacing: .06em; }
 button { min-height: 2.45rem; border: 1px solid #46586b; border-radius: .55rem; background: #263746; cursor: pointer; padding: .5rem .85rem; }
 button:hover:not(:disabled) { background: #31485c; }
 button:focus-visible, input:focus-visible { outline: 2px solid #86bdf5; outline-offset: 2px; }

@@ -62,7 +62,7 @@ The Ovis settings shim imports the pinned `DEFAULT_SETTINGS` without a `.ts` suf
 
 The response-header CSP retains the complete runtime policy, including the header-only `frame-ancestors 'none'`. The metadata CSP is exactly that value without the final `; frame-ancestors 'none'`, which browsers ignore in meta and warn about. The build validator checks both constants' relationship and the built metadata value. `'unsafe-inline'` is limited to `style-src` because xterm 6's DOM renderer creates inline style attributes and style elements for ANSI colors, bold, and underline. `script-src` remains `'self'`. External fetches initiated by CSS remain blocked: `img-src` and `font-src` only allow `'self'` (images additionally allow `data:`). A `data:,` favicon link avoids an implicit `/favicon.ico` request.
 
-Chrome's regular (non-headless) password manager may offer “Save password?” for the one-time login code despite `autocomplete="off"`; verify that prompt manually in Chrome before release. Headless browser runs do not establish this behavior.
+The one-time local code field is `type="text"` masked with `-webkit-text-security: disc`: it is a single-use local code (already printed by `herdgate console login`), not a credential, so no password-typed field exists for the browser password manager to claim. Measured in a headed Chrome run against the real Herdr session on 26/11: `type: text`, computed `webkitTextSecurity: disc`, login 233 ms.
 
 ## Integration boundary
 

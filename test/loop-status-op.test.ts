@@ -72,11 +72,13 @@ async function fakeGate(dir: string, extraEnv: Record<string, string | undefined
     },
     stdio: "ignore",
   });
-  const deadline = Date.now() + 8_000;
+  // Under `--test-concurrency=4` a cold plugin spawn can exceed 8 s (measured flakes on
+  // 25–26/11: 'no loop.status reply within 8000ms' with a healthy publisher). 30 s stays a real bound.
+  const deadline = Date.now() + 30_000;
   while (!conn && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
   assert.ok(conn, "publisher never connected to the fake gate");
   /** Send a device op; resolve with the first frame after that whose payload op matches. */
-  const ask = async (op: string, timeoutMs = 8_000): Promise<Record<string, unknown>> => {
+  const ask = async (op: string, timeoutMs = 30_000): Promise<Record<string, unknown>> => {
     const seen = frames.length;
     conn!.send(JSON.stringify({ v: 1, t: "frame", device: device.id, payload: { op } }));
     const end = Date.now() + timeoutMs;

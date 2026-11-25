@@ -226,6 +226,17 @@ test("read-only pane adapter keeps every pane in a split tab selectable", async 
   assert.deepEqual(requested, ["p1", "p2"]);
 });
 
+test("the one-time local code field never triggers the browser password manager", async () => {
+  const ui = await readFile(path.join(consoleRoot, "src/ui.tsx"), "utf8");
+  const input = /<input id="local-code"[^>]*>/.exec(ui)?.[0] ?? "";
+  assert.ok(input, "the local-code input must exist in the shell source");
+  assert.match(input, /type="text"/, "the login code is a one-time local code, not a credential: a password-typed field makes Chrome offer to save it");
+  assert.doesNotMatch(ui, /type="password"/, "no password-typed field exists in the Console shell");
+  assert.match(input, /className="code-input"/, "the code field carries the masking class");
+  const css = await readFile(path.join(consoleRoot, "src/console.css"), "utf8");
+  assert.match(css, /\.auth-card input\.code-input\s*\{[^}]*-webkit-text-security:\s*disc/, "the code field is visually masked without password semantics");
+});
+
 test("read-only mirror keeps xterm's helper textarea out of Tab traversal", () => {
   const textarea = { tabIndex: 0 };
   let keyHandler: ((event: { key: string; shiftKey?: boolean }) => boolean) | undefined;
