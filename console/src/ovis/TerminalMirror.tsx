@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import type { ConsolePaneScreen } from "../../../src/console/web/view-model.ts";
 import { stripUnsafeOsc } from "../../../src/console/web/mirror-gate.ts";
+import { configureReadOnlyMirrorKeyboard } from "./mirror-keyboard.ts";
 
 /**
  * Herdgate's read-only port of the terminal surface in Ovis PaneTerminal.tsx
@@ -30,6 +31,7 @@ export function OvisTerminalMirror({ screen, stale }: { screen: ConsolePaneScree
     const fitAddon = new FitAddon();
     instance.loadAddon(fitAddon);
     instance.open(host.current);
+    configureReadOnlyMirrorKeyboard(instance);
     terminal.current = instance;
     fit.current = fitAddon;
     const resize = (): void => {

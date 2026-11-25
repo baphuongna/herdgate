@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
 import { CONSOLE_CSP_HEADER, CONSOLE_CSP_META } from "../console/tools/build-console.mjs";
 import { installConsoleStorageGuard, type ConsoleStorage, type ConsoleStorageHost } from "../console/src/ovis/storage-guard.ts";
 import { activateReadPane } from "../console/src/ovis/pane-select-key.ts";
+import { configureReadOnlyMirrorKeyboard } from "../console/src/ovis/mirror-keyboard.ts";
 
 const repo = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const consoleRoot = path.join(repo, "console");
@@ -223,4 +224,28 @@ test("read-only pane adapter keeps every pane in a split tab selectable", async 
   assert.match(css, /\.ovis-pane-not-selected:focus-visible\s*\{/);
   for (const paneId of cells) onSelectPane(paneId);
   assert.deepEqual(requested, ["p1", "p2"]);
+});
+
+test("read-only mirror keeps xterm's helper textarea out of Tab traversal", () => {
+  const textarea = { tabIndex: 0 };
+  let keyHandler: ((event: { key: string; shiftKey?: boolean }) => boolean) | undefined;
+  configureReadOnlyMirrorKeyboard({
+    textarea,
+    attachCustomKeyEventHandler: (handler) => { keyHandler = handler; },
+  });
+  assert.equal(textarea.tabIndex, -1, "xterm's otherwise tabbable helper input is removed from sequential focus order");
+  assert.ok(keyHandler);
+  assert.equal(keyHandler({ key: "Tab" }), false, "xterm must not cancel or refocus on forward Tab");
+  assert.equal(keyHandler({ key: "Tab", shiftKey: true }), false, "xterm must not cancel or refocus on reverse Tab");
+  assert.equal(keyHandler({ key: "Enter" }), true, "other key handling remains unchanged");
+});
+
+test("hidden Ovis panes are inert and focusable panes become active only when shown", async () => {
+  const paneCanvas = await readFile(path.join(vendorRoot, "src/components/PaneCanvas.tsx"), "utf8");
+  const css = await readFile(path.join(vendorRoot, "src/components/PaneCanvas.css"), "utf8");
+  assert.match(paneCanvas, /const hidden = offTab \|\| \(alone !== null && alone !== item\.pane_id\)/);
+  assert.match(paneCanvas, /aria-hidden=\{hidden \|\| undefined\} inert=\{hidden \|\| undefined\}/,
+    "off-tab and non-visible split panes must be removed from sequential focus and the accessibility tree");
+  assert.match(paneCanvas, /role="button" tabIndex=\{0\}/, "a visible pane placeholder remains keyboard focusable");
+  assert.match(css, /\.pane-frame\.is-hidden \{ visibility: hidden; pointer-events: none; \}/);
 });
