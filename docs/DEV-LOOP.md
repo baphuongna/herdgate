@@ -70,6 +70,9 @@
    ghi vào log thay vì bị bỏ qua.
 7. Test đầy đủ: `TEST_PI_BIN=$(which pi) TEST_HERDR_BIN=$(which herdr) npm test`
    (baseline tại lúc viết: **299 pass / 0 fail**).
+8. **Đĩa**: timer dev-loop có `ExecCondition` `scripts/disk-guard.sh /home 90`
+   — `/home` ≥ 90% (số của `df`) thì chu kỳ bị **bỏ qua**, không tính lỗi
+   (journal: `disk-guard … skipping`). Thấy dòng đó thì dọn trước, không chạy tay.
 
 ## Protocol một vòng (10 bước)
 
@@ -84,7 +87,8 @@
    (npm, qua drive script: `HG_DRY=1` đọc trước, update `HG_WAIT=75`; `.setup` mồ
    côi >60s tự thu hồi (C1) — không xoá tay).
 8. Commit (docs/impl tách commit), bump version + tag + npm publish nếu vòng
-   có release; chờ `dist-tags.latest` flip rồi mới drive update từ xa.
+   có release; chờ `dist-tags.latest` flip (tarball còn 404 thêm vài phút)
+   rồi mới drive update từ xa; E404 thì chạy lại.
 9. Dọn rác probe (device revoke, temp file), cập nhật Cycle Log (đạt/chưa đạt).
 10. Nếu còn giờ trong lượt: mở vòng sau từ bước 1. Dừng chỉ khi user báo dừng.
 
