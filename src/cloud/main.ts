@@ -22,7 +22,7 @@
  *   HERDGATE_SSH_TUNNELS_PER_IP  per-client SSH-over-WSS cap (default 6)
  *   HERDGATE_SSH_TUNNELS_TOTAL   global SSH-over-WSS cap (default 64)
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startCloud } from "./gateway.ts";
@@ -53,9 +53,12 @@ function accountToken(): string {
   return value;
 }
 
-/** Default web root: the `src/web` directory beside this file, so `npm start` serves the PWA. */
+/** Default web root, wherever this file runs from. The first that exists wins:
+ *    src/cloud/            → ../web            a checkout (`npm start`)
+ *    runtime/cloud/        → ../web            the Cloud archive (web copied beside it)
+ *    dist/cloud-runtime/cloud/ → ../../../src/web   the npm package (web stays in src/web) */
 const here = dirname(fileURLToPath(import.meta.url));
-const defaultWebRoot = join(here, "..", "web");
+const defaultWebRoot = [join(here, "..", "web"), join(here, "..", "..", "..", "src", "web")].find((p) => existsSync(p));
 const webRoot = env.HERDGATE_NO_WEB === "1" ? undefined : (env.HERDGATE_WEB_ROOT ?? defaultWebRoot);
 
 const sshPort = Number(env.HERDGATE_SSH_PORT ?? 2222);

@@ -207,3 +207,21 @@ test("client: handles the refusal paths honestly", () => {
   assert.match(src, /pair\.denied/, "a denied pair is shown, not swallowed");
   assert.match(src, /host offline|host is not connected/, "an offline host is stated plainly");
 });
+
+test("uplift: notifications are asked for on a tap, and used only once granted", () => {
+  // 2026-11-25: a week in production, 0 of 13 devices subscribed — the app subscribed without
+  // ever asking, the browser refused, and the catch swallowed it.
+  const html = readFileSync(join(WEB, "index.html"), "utf8");
+  const src = codeOnly(readFileSync(join(WEB, "app.js"), "utf8"));
+  assert.match(html, /<p[^>]*id="push-status"[^>]*role="status"/, "Settings states where notifications stand");
+  assert.match(html, /<button[^>]*id="push-enable"[^>]*hidden/, "and offers the one tap, hidden until it can work");
+  assert.match(src, /\$\("push-enable"\)\.addEventListener\("click", \(\) => \{ void enablePush\(\); \}\);/, "the tap is wired");
+  const enable = src.slice(src.indexOf("async function enablePush()"), src.indexOf("async function enablePush()") + 420);
+  assert.match(enable, /await Notification\.requestPermission\(\)/, "the tap asks the browser");
+  assert.match(enable, /if \(answer === "granted"\) await subscribePush\(\);/, "and subscribes only on a yes");
+  const subscribe = src.slice(src.indexOf("async function subscribePush()"), src.indexOf("function renderPushStatus()"));
+  const guard = subscribe.indexOf('if (pushSupport() !== "granted") return;');
+  assert.ok(guard > 0, "the automatic calls (after pairing, on open) no longer subscribe against a refusal");
+  assert.ok(guard < subscribe.indexOf("pushManager.subscribe"), "the guard stands before the subscribe");
+  assert.ok(!src.includes("innerHTML"), "still text only");
+});

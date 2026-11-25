@@ -1,6 +1,6 @@
 {
   "name": "@bom0792/herdgate",
-  "version": "0.14.1",
+  "version": "0.15.0",
   "description": "Cloud relay hub for herdr-core: every machine dials out, phones and browsers follow (PWA + SSH leg, E2E payloads).",
   "type": "module",
   "engines": {
@@ -17,7 +17,8 @@
     "ssh-bridge": "node src/cloud/ssh-bridge.ts",
     "ssh-tcp-edge": "node src/cloud/ssh-tcp-edge.ts",
     "mobile-tui": "node src/host/mobile-tui.ts",
-    "postinstall": "node scripts/patch-ssh2.mjs && node scripts/install-pi-skills.mjs"
+    "postinstall": "node scripts/patch-ssh2.mjs && node scripts/install-pi-skills.mjs",
+    "prepack": "npm run build:cloud"
   },
   "dependencies": {
     "qrcode-terminal": "^0.12.0",
@@ -47,6 +48,7 @@
     "src/web/icons/icon.svg",
     "src/web/icons/icon-192.png",
     "src/web/icons/icon-512.png",
+    "dist/cloud-runtime/**/*.js",
     "app-mod/herdgate/main.js",
     "app-mod/herdgate/mod.json",
     "app-mod/herdgate/herdgate.svg",

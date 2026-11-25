@@ -16,7 +16,10 @@ The default `dist/<version>/` contains `herdgate-cloud-<version>.tar.gz`,
 with `sha256sum -c SHA256SUMS`. The Cloud archive contains compiled JS, the PWA
 with the matching host ZIP, a dependency lockfile, and Compose/systemd examples.
 The standalone npm command `herdgate cloud serve` is also available from a full
-npm installation on Node with TypeScript stripping, like `npm start`.
+npm installation. From 0.15.0 the package carries the compiled cloud
+(`dist/cloud-runtime/`), which is what the command runs: Node refuses to strip
+TypeScript for files under `node_modules`. In a checkout (no `dist/`) the command
+runs `src/cloud/main.ts` instead, like `npm start`.
 
 Extract the Cloud archive and follow its [README](templates/cloud/README.md)
 to deploy via Docker Compose or systemd. Create credentials on the destination:
@@ -28,6 +31,11 @@ owner token, state, SSH key and any VAPID keys. A clean Gate starts with no room
 From v0.9.33, Push wake is off by default. If you need it, set `HERDGATE_ENABLE_PUSH=1`
 (and optionally `HERDGATE_PUSH_SUB` to a VAPID contact URI); `HERDGATE_NO_PUSH=1`
 takes precedence. Existing VAPID keys are untouched while wake is off.
+
+On the phone, notifications are opt-in by a tap: PWA → **⋯ → Enable notifications** (iOS: add the
+app to the Home Screen first). Until 0.15.0 the app subscribed without ever asking, every browser
+refused, and no device had a subscription. To prove the path end to end, sign in to `/admin` →
+Devices → *Gửi thử* on that device; a notification appears with the PWA closed.
 
 A PWA room with a Noise host pin no longer accepts plaintext pane data or a different
 host key.
@@ -165,12 +173,20 @@ running `cloudflared access`, which the phone does not. Reachability options, in
 of setup cost:
 
 1. **LAN / same network** — `HERDGATE_SSH_BIND=0.0.0.0`, phones dial the machine.
-2. **IPv6 AAAA** (this machine's setup) — a DNS-only `AAAA` record to the gate
-   machine's global IPv6; `~/.local/bin/herdgate-ssh-ddns` + the `herdgate-ddns`
-   timer keep it current (needs a Cloudflare API token + `ufw allow`).
+2. **IPv6 AAAA** — a DNS-only `AAAA` record to the gate machine's global IPv6;
+   `~/.local/bin/herdgate-ssh-ddns` + the `herdgate-ddns` timer keep it current (needs a
+   Cloudflare API token + `ufw allow`). This only works where the router passes inbound
+   IPv6: the home gate's does not (checked from the phone's cellular network many times,
+   last on 2026-11-25), so it is not an option there.
+
 3. **Tokenless TCP edge (recommended for a VPS)** — one TCP connection from Herdr
    Mobile maps to one WSS connection to the public gate. The edge never terminates
    SSH. Use the existing Herdgate SSH host key on the phone, not the VPS admin key.
+
+**None of the three available? Keep the default `HERDGATE_SSH_BIND=127.0.0.1`.** Every phone
+reaches the sshd through the Cloudflare Tunnel anyway (`/v1/ssh/ws`, the `ssh-ws` leg, piped into
+the sshd in-process), so a public listener buys nothing and exposes the SSH port to the Internet.
+That is the home gate's configuration since 0.15.0.
 
 ### Deploy the tokenless TCP edge on a VPS
 

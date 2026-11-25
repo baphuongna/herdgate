@@ -240,7 +240,7 @@ function renderDevices() {
           button("Đổi tên", "device-rename", d.id),
           d.scope === "act" ? [" ", button("Thu quyền", "device-withdraw", d.id, { class: "warn", title: "act → read" })] : [],
           " ", button(d.keys ? `Key (${d.keys})` : "Key", "keys-toggle", d.id, { class: "link" }),
-          d.push ? [" ", button("Tắt push", "push-off", d.id, { class: "link" })] : [],
+          d.push ? [" ", button("Gửi thử", "push-test", d.id, { class: "link", title: "Gửi một thông báo thử tới thiết bị này" }), " ", button("Tắt push", "push-off", d.id, { class: "link" })] : [],
           " ", button("Thu hồi", "device-revoke", d.id, { class: "link danger" }),
         ),
       ),
@@ -326,6 +326,9 @@ async function onAction(ev) {
       return act("Thu hồi thiết bị", () => api("/v1/device/revoke", { method: "POST", body: { device: id } }));
     case "push-off":
       return act("Tắt push", () => api("/v1/device/push", { method: "DELETE", body: { device: id } }));
+    case "push-test":
+      // The gate answers once the push service has: 200 is a delivered request, 502 names the failure.
+      return act(`Gửi thông báo thử tới «${device?.name ?? id}»`, () => api("/v1/admin/push-test", { method: "POST", body: { device: id } }));
     case "keys-toggle":
       if (state.keysOpen.has(id)) state.keysOpen.delete(id);
       else {

@@ -39,6 +39,9 @@ HOST="herdgate-host-$VERSION.zip"
 bash scripts/build-host-bundle.sh "$OUT/$HOST"
 cp "$OUT/$HOST" "$CLOUD/runtime/web/herdgate-host.zip"
 tar -czf "$OUT/$NAME.tar.gz" -C "$STAGE" "$NAME"
+# The npm tarball is packed with --ignore-scripts (no prepack), so build the compiled cloud it
+# ships — the one `herdgate cloud serve` runs from an install — right here, explicitly.
+npm run -s build:cloud
 npm pack --ignore-scripts --pack-destination "$OUT"
 ( cd "$OUT" && sha256sum -- *.tar.gz *.tgz *.zip > SHA256SUMS )
 # Move the complete set into place; don't nest or replace an existing release.

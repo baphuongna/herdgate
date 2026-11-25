@@ -147,7 +147,18 @@ export function gateFacts(g) {
     ["SSH-leg", ssh],
     ["Push", g?.push ? "bật" : "tắt"],
     ["Web (PWA)", g?.web ? "bật" : "tắt"],
+    ["Từ chối từ lúc khởi động", refusalText(g?.health)],
+    ["Đang chặn", `${g?.health?.blockedNow ?? 0} địa chỉ`],
+    ["Node", g?.health?.node ?? "?"],
   ];
+}
+
+/** The gate's own count of what it refused since it started — by reason, so the owner can tell
+ *  a wrong token (theirs to fix) from a flood (the gate's to weather). "—" before 0.15.0. */
+export function refusalText(h) {
+  const r = h?.refused;
+  if (!r) return "—";
+  return `${r.total ?? 0} (${r.blocked ?? 0} bị chặn, ${r.hello ?? 0} sai token, ${r.timeout ?? 0} quá hạn, ${r.rate ?? 0} quá nhanh)`;
 }
 
 /** One line under a room's name: the publisher first (the axis an operator misreads), then the build. */

@@ -70,6 +70,9 @@ npm test                       # e2e: one cloud, one host, three devices
 HERDGATE_ACCOUNT_TOKEN=$(openssl rand -base64 32) \
 HERDGATE_STATE=./herdgate-state.json \
 npm start
+
+# or from the npm package (0.15.0+ ships the compiled cloud; `cloud serve` runs it)
+npx @bom0792/herdgate cloud serve        # same HERDGATE_* environment
 ```
 
 Pair a host (on the host machine, or from a test script):
@@ -490,18 +493,29 @@ Going public: [DEPLOY.md](DEPLOY.md) (cloudflared, on this machine).
 `/admin` is a second page served by the same cloud (`src/web/admin.*`). The owner signs in with the
 account token — the same one the PWA keeps — and manages the gate itself rather than a machine:
 
-- **Overview** — gate version, uptime, SSH leg, push; counts; pairing codes waiting for approval;
+- **Overview** — gate version, uptime, SSH leg, push, how much the gate has refused since it started
+  (blocked / wrong token / hello timeout / rate) and how many addresses are blocked right now; counts;
+  pairing codes waiting for approval;
 - **Machines** — rename; remove (cascades to its devices; the agent is told it is unpaired and stops redialing);
 - **Devices** — across every machine: scope, live legs, last seen; rename, withdraw `act` (the gate only
-  ever *lowers* a scope — `act` is the host's grant at pairing), revoke, SSH keys (fingerprints), push off;
+  ever *lowers* a scope — `act` is the host's grant at pairing), revoke, SSH keys (fingerprints), push off,
+  push test (*Gửi thử*: one notification through the real push service — the gate answers only once the
+  service has; open the PWA's Settings → *Enable notifications* on the phone first — notifications are
+  opt-in by a tap, never assumed);
 - **Pairing** — pending codes with approve/refuse, or approve a pasted code;
 - **Events** — the last 300 of the gate's own log lines (in memory; the journal stays the record of truth).
 
-The API behind it is the owner's alone: `/v1/admin/overview`, `/v1/admin/events`, `/v1/room/rename`,
-`/v1/room/remove`, `/v1/device/rename`, `/v1/device/scope`, `/v1/agent/deny`. The rules are pinned by
+The API behind it is the owner's alone: `/v1/admin/overview`, `/v1/admin/events`, `/v1/admin/push-test`,
+`/v1/room/rename`, `/v1/room/remove`, `/v1/device/rename`, `/v1/device/scope`, `/v1/agent/deny`. The rules are pinned by
 `test/admin-api.test.ts` and `test/web-admin.test.ts`: the token rides in the `Authorization` header only,
 wire strings are rendered as text, there is exactly one `fetch` site, and the service worker never
 touches `/admin`. Spec: [docs/specs/2026-11-25-web-admin.md](docs/specs/2026-11-25-web-admin.md).
+
+Since 0.15.0 the gate says why it refuses: one `refused <leg> <address> <reason>` line per refusal
+(never the token that was refused), folded under a flood; a block is announced; an agent's
+`disconnected` line ends with `code=… reason="…" after=…s`; and `lastSeen` is written to the state file
+(at most once a minute per device), so a restart no longer turns "seen this morning" into "never seen".
+Spec: [docs/specs/2026-11-25-uplift.md](docs/specs/2026-11-25-uplift.md).
 
 
 The npm package bundles six skills: `herdr`, `herdr-advisor`, `herdr-committee`,

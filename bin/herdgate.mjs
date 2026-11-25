@@ -9,7 +9,7 @@ import { cpSync, mkdirSync, writeFileSync, existsSync, readFileSync, realpathSyn
 import readline from "node:readline";
 import { join, dirname, basename } from "node:path";
 import { homedir, hostname } from "node:os";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { listClouds, manageCloud, resolveCloud } from "./cloud-config.mjs";
 import { trySyncPiSkills } from "./pi-skills.mjs";
@@ -274,6 +274,24 @@ function runNode(file, args, env = process.env) {
   const child = spawnSync(process.execPath, [file, ...args], { env, stdio: "inherit", shell: false, windowsHide: true });
   if (child.error) throw child.error;
   process.exitCode = child.status ?? 1;
+}
+
+/** A long-running node child that must die with this process. `runNode` blocks in spawnSync,
+ *  which cannot forward a signal: a SIGTERM to `cloud serve` killed only this wrapper and left
+ *  the gate running with no parent (found by test/npm-pack-boot.test.ts, 2026-11-25). */
+async function runNodeAttached(file, args, env = process.env) {
+  const child = spawn(process.execPath, [file, ...args], { env, stdio: "inherit", shell: false, windowsHide: true });
+  const forward = (signal) => () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+  };
+  process.once("SIGINT", forward("SIGINT"));
+  process.once("SIGTERM", forward("SIGTERM"));
+  process.once("SIGHUP", forward("SIGHUP"));
+  await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", () => resolve());
+  });
+  process.exitCode = child.exitCode ?? 1;
 }
 
 function runInstalledTui(args, useSavedProfile = false) {
@@ -561,9 +579,14 @@ try {
     trySyncPiSkills();
   } else if (cmd === "pi-skills" && !args.length) trySyncPiSkills();
   else if (cmd === "cloud" && args.length === 1 && args[0] === "serve") {
-    const entry = join(ROOT, "src", "cloud", "main.ts");
-    if (!existsSync(entry)) throw new Error("cloud serve requires the full npm package; use the Cloud archive for Docker or systemd");
-    runNode(entry, []);
+    // The compiled cloud first: an npm install lives under node_modules, where Node refuses to
+    // strip TypeScript (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING). The .ts entry still serves
+    // a checkout (`dist/` is not built there).
+    const compiled = join(ROOT, "dist", "cloud-runtime", "cloud", "main.js");
+    const source = join(ROOT, "src", "cloud", "main.ts");
+    if (existsSync(compiled)) await runNodeAttached(compiled, []);
+    else if (existsSync(source)) await runNodeAttached(source, []);
+    else throw new Error("cloud serve requires the full npm package; use the Cloud archive for Docker or systemd");
   } else if (cmd === "cloud") manageCloud(args);
   else if (cmd === "connect") await connectController();
   else if (cmd === "pair") pairHost(args);

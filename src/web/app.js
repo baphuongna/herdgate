@@ -3027,7 +3027,7 @@ async function subscribePush() {
   const { deviceId, deviceSecret } = state;
   const base = cloudBase();
   if (!(deviceSecret && deviceId)) return; // paired devices only
-  if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
+  if (pushSupport() !== "granted") return; // subscribe() needs a permission a tap has just granted
   try {
     const reg = await navigator.serviceWorker.ready;
     const keyRes = await fetch(`${base}/v1/push/key`);
@@ -3053,6 +3053,45 @@ async function subscribePush() {
   } catch {
     /* permission denied or push unavailable: the gate still works without it */
   }
+}
+
+/** What this browser allows: "granted", "denied", "default" (not asked yet), or "unsupported".
+ *  iOS has web push only for an app added to the Home Screen; there `Notification` is undefined
+ *  inside Safari. */
+function pushSupport() {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window) || typeof Notification === "undefined") return "unsupported";
+  return Notification.permission;
+}
+
+/** The Settings line and its one button: the truth about notifications, and the tap that asks. */
+function renderPushStatus() {
+  const status = $("push-status");
+  const button = $("push-enable");
+  if (!status || !button) return;
+  const paired = !!(state.deviceId && state.deviceSecret);
+  const support = pushSupport();
+  if (support === "unsupported") {
+    status.textContent = "Notifications: not supported in this browser. On an iPhone, add the app to the Home Screen first.";
+    button.hidden = true;
+  } else if (support === "granted") {
+    status.textContent = paired ? "Notifications: enabled." : "Notifications: enabled — pair this device to receive them.";
+    button.hidden = true;
+  } else if (support === "denied") {
+    status.textContent = "Notifications: blocked in this browser's settings.";
+    button.hidden = true;
+  } else {
+    status.textContent = paired ? "Notifications: off." : "Notifications: off — pair this device first.";
+    button.hidden = !paired;
+  }
+}
+
+/** A tap is the only thing a browser accepts as the moment to ask (2026-11-25: a week of silent
+ *  subscriptions that never were — the app asked without one and swallowed the refusal). */
+async function enablePush() {
+  if (pushSupport() !== "default") return renderPushStatus();
+  const answer = await Notification.requestPermission();
+  if (answer === "granted") await subscribePush();
+  renderPushStatus();
 }
 
 /** A push subscription is permanently bound to the VAPID key it was created with.
@@ -3351,6 +3390,7 @@ $("pair-form").addEventListener("submit", (event) => {
       closePair();
       selectRoom(roomId, pairing, true);
       void subscribePush();
+      renderPushStatus();
     }
   });
 });
@@ -3400,6 +3440,7 @@ $("menu").addEventListener("click", () => {
   $("settings").showModal();
 });
 
+$("push-enable").addEventListener("click", () => { void enablePush(); });
 $("settings-form").addEventListener("submit", () => {
   const value = $("cloud").value.trim().replace(/\/$/, "");
   if (value !== state.cloud) {
@@ -3592,6 +3633,7 @@ if (state.token) {
   connect();
   void subscribePush(); // upgrade an existing subscription (keys, VAPID rotation check)
 }
+renderPushStatus();
 
 // A phone that wakes up should not show a dead screen.
 document.addEventListener("visibilitychange", () => {

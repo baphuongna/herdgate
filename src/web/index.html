@@ -86,6 +86,10 @@
         <input id="cloud" name="cloud" placeholder="https://herd.example.com" />
         <p class="muted small">Leave empty to use this page's own origin.</p>
         <p class="muted small"><a href="/admin">Trang quản trị gate</a> — máy, thiết bị, ghép nối, sự kiện.</p>
+        <p class="muted small" id="push-status" role="status">Notifications: —</p>
+        <div class="row">
+          <button id="push-enable" type="button" hidden>Enable notifications</button>
+        </div>
         <div class="row">
           <button id="signout" type="button" class="danger">Forget token</button>
           <button type="submit">Close</button>

@@ -309,3 +309,19 @@ test("model: the gate's answers are told apart for the owner, and polling only r
   assert.match(M.withdrawText({ name: "tablet", roomName: "laptop" }), /«tablet» \(máy laptop\)/);
   assert.match(M.revokeText({ name: "tablet", roomName: "laptop" }), /vĩnh viễn/);
 });
+
+test("uplift: the gate's health reads in the owner's words, and the test ring is a guarded owner write", () => {
+  assert.equal(M.refusalText(undefined), "—", "a gate older than 0.15.0 said nothing; that is shown, not invented");
+  assert.equal(M.refusalText({ refused: { total: 12, blocked: 1, hello: 10, timeout: 0, rate: 1 } }), "12 (1 bị chặn, 10 sai token, 0 quá hạn, 1 quá nhanh)");
+  const facts = M.gateFacts({ health: { refused: { total: 12, blocked: 1, hello: 10, timeout: 0, rate: 1 }, blockedNow: 1, node: "v22.23.5" } });
+  assert.deepEqual(facts.slice(0, 4), M.gateFacts({ ssh: { enabled: false } }).slice(0, 3).concat([["SSH-leg", "tắt"]]).slice(0, 3).concat([facts[3]]).slice(0, 4), "the facts that were there keep their places");
+  assert.deepEqual(facts.slice(6), [
+    ["Từ chối từ lúc khởi động", "12 (1 bị chặn, 10 sai token, 0 quá hạn, 1 quá nhanh)"],
+    ["Đang chặn", "1 địa chỉ"],
+    ["Node", "v22.23.5"],
+  ]);
+  assert.deepEqual(M.gateFacts({}).slice(6), [["Từ chối từ lúc khởi động", "—"], ["Đang chặn", "0 địa chỉ"], ["Node", "?"]]);
+  const src = codeOnly(read("admin.js"));
+  assert.match(src, /button\("Gửi thử", "push-test", d\.id/, "the ring sits on the rows that hold a subscription");
+  assert.match(src, /api\("\/v1\/admin\/push-test", \{ method: "POST", body: \{ device: id \} \}\)/, "and is a POST owner write through the one fetch site");
+});

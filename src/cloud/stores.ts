@@ -12,6 +12,9 @@ import { basename, dirname, join } from "node:path";
 import type { Scope } from "../protocol/envelope.ts";
 import { randomId, randomToken, sameSecret, sha256Hex, cleanName } from "./util.ts";
 
+/** How stale a device's stored sighting must be before the next one is written to disk. */
+export const SEEN_WRITE_MS = 60_000;
+
 export interface Account {
   id: string;
   name: string;
@@ -46,6 +49,10 @@ export interface DeviceRecord {
   push?: { endpoint: string; at: string; p256dh?: string; auth?: string };
   /** SSH public keys this device may log in with (authorized_keys lines, parsed). */
   sshKeys?: { algo: string; b64: string; comment?: string; at: string }[];
+  /** When the gate last saw it, and on which leg. RAM keeps the exact second; this is the
+   *  copy that outlives a restart, refreshed at most once a minute per device (the mobile
+   *  native app says hello every ~17 s). Absent until the first sighting. */
+  seen?: { at: string; leg: "web" | "ssh" };
 }
 
 interface StateFile {
@@ -173,6 +180,19 @@ export class State {
     if (!d) return false;
     d.push = endpoint ? { endpoint, at: new Date().toISOString(), ...keys } : undefined;
     if (!endpoint) delete d.push;
+    this.#save();
+    return true;
+  }
+
+  /** Remember a sighting. Writes only when the leg changed or the stored time is a minute
+   *  old, so a chatty device costs the disk one small write a minute at most. Returns whether
+   *  anything was written. */
+  touchDeviceSeen(id: string, leg: "web" | "ssh"): boolean {
+    const d = this.deviceById(id);
+    if (!d) return false;
+    const now = Date.now();
+    if (d.seen && d.seen.leg === leg && now - Date.parse(d.seen.at) < SEEN_WRITE_MS) return false;
+    d.seen = { at: new Date(now).toISOString(), leg };
     this.#save();
     return true;
   }
