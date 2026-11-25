@@ -50,6 +50,14 @@ async function health(state) {
     return body;
   } catch { return null; }
 }
+async function probeRuntime(state) {
+  const result = await control(state, "probe-runtime", 9_000);
+  if (!["online", "unavailable"].includes(result.runtime)) throw new Error("console_runtime_probe_invalid");
+  return result.runtime;
+}
+function statusValue(state, runtime, transport) {
+  return { status: runtime === "online" ? "ready" : "runtime-unavailable", address: state.origin, transport };
+}
 async function statusInfo(directory = stateDirectory()) {
   let state;
   try { state = readInstance(directory); } catch { return { status: "error" }; }
@@ -63,7 +71,8 @@ async function statusInfo(directory = stateDirectory()) {
   }
   const body = await health(state);
   if (!body) return { status: "error" };
-  return { status: body.runtime === "online" ? "ready" : "runtime-unavailable", address: state.origin, transport: body.transport };
+  try { return statusValue(state, await probeRuntime(state), body.transport); }
+  catch { return { status: "error" }; }
 }
 function outputStatus(value, json) {
   if (json) process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -71,7 +80,7 @@ function outputStatus(value, json) {
   else if (value.status === "error") process.stdout.write("Console: error (instance is not responding)\n");
   else process.stdout.write(`Console: ${value.status} at ${value.address} (${value.transport})\n`);
 }
-async function control(state, command) {
+async function control(state, command, timeoutMs = 1_000) {
   try {
     const socketStat = lstatSync(state.controlPath);
     if (!socketStat.isSocket() || (process.platform !== "win32" && (socketStat.uid !== process.getuid?.() || (socketStat.mode & 0o077) !== 0))) throw new Error("console_control_unverified");
@@ -80,7 +89,7 @@ async function control(state, command) {
     const socket = net.createConnection(state.controlPath);
     let data = Buffer.alloc(0);
     let settled = false;
-    const timer = setTimeout(() => finish(new Error("console_control_timeout")), 1_000);
+    const timer = setTimeout(() => finish(new Error("console_control_timeout")), timeoutMs);
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
@@ -113,7 +122,7 @@ async function start() {
   if (existing) {
     const current = await health(existing);
     if (current) {
-      outputStatus({ status: current.runtime === "online" ? "ready" : "runtime-unavailable", address: existing.origin, transport: current.transport }, false);
+      outputStatus(statusValue(existing, await probeRuntime(existing), current.transport), false);
       return;
     }
     throw new Error("console_instance_unverified; refusing to kill or adopt stale state");
@@ -132,7 +141,7 @@ async function start() {
       if (concurrent) {
         const current = await health(concurrent);
         if (current) {
-          outputStatus({ status: current.runtime === "online" ? "ready" : "runtime-unavailable", address: concurrent.origin, transport: current.transport }, false);
+          outputStatus(statusValue(concurrent, await probeRuntime(concurrent), current.transport), false);
           return;
         }
         throw new Error("console_instance_unverified; refusing to kill or adopt stale state");
@@ -148,7 +157,7 @@ async function start() {
     if (running) {
       const current = await health(running);
       if (current) {
-        outputStatus({ status: current.runtime === "online" ? "ready" : "runtime-unavailable", address: running.origin, transport: current.transport }, false);
+        outputStatus(statusValue(running, await probeRuntime(running), current.transport), false);
         return;
       }
       throw new Error("console_instance_unverified; refusing to kill or adopt stale state");
@@ -165,14 +174,14 @@ async function start() {
     let spawnError;
     child.once("error", (error) => { spawnError = error; });
     child.unref();
-    const end = Date.now() + 5_000;
+    const end = Date.now() + 12_000;
     while (Date.now() < end) {
       if (spawnError || child.exitCode !== null || child.signalCode !== null) throw new Error("console_start_failed; check local service state");
       const state = readInstance(directory);
       if (state?.instanceId === instanceId) {
         const current = await health(state);
         if (current) {
-          outputStatus({ status: current.runtime === "online" ? "ready" : "runtime-unavailable", address: state.origin, transport: current.transport }, false);
+          outputStatus(statusValue(state, await probeRuntime(state), current.transport), false);
           return;
         }
       }

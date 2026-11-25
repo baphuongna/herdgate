@@ -53,10 +53,10 @@ test("console CLI start/status/login/open/stop drives an isolated HTTP + RPC fix
   const [start, startAgain] = await Promise.all([runAsync("start"), runAsync("start")]);
   assert.equal(start.status, 0, start.stderr);
   assert.equal(startAgain.status, 0, startAgain.stderr);
-  const status = run("status", "--json");
+  const status = await runAsync("status", "--json");
   assert.equal(status.status, 0);
   const statusObject = JSON.parse(status.stdout);
-  assert.equal(statusObject.status, "runtime-unavailable", "Console can start when runtime has not yet been read");
+  assert.equal(statusObject.status, "ready", "start probes the configured runtime before reporting status");
   assert.equal(statusObject.transport, "rpc");
   assert.match(statusObject.address, /^http:\/\/127\.0\.0\.1:\d+$/);
   assert.doesNotMatch(status.stdout, new RegExp(runtimeSocket.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -83,8 +83,9 @@ test("console CLI start/status/login/open/stop drives an isolated HTTP + RPC fix
   const sessionResponse = await fetch(`${origin}/api/console/v1/session`, { headers: auth });
   assert.equal(sessionResponse.status, 200);
   const session = await sessionResponse.json() as { runtimeGeneration: string };
-  assert.equal(run("status", "--json").status, 0);
-  assert.equal(JSON.parse(run("status", "--json").stdout).status, "ready");
+  const onlineStatus = await runAsync("status", "--json");
+  assert.equal(onlineStatus.status, 0);
+  assert.equal(JSON.parse(onlineStatus.stdout).status, "ready");
   const screen = await fetch(`${origin}/api/console/v1/pane/w1%3Ap1/screen`, { headers: { ...auth, "x-herdgate-runtime-generation": session.runtimeGeneration } });
   assert.equal(screen.status, 200);
   assert.match((await screen.json()).ansi, /fixture screen/);
@@ -102,6 +103,48 @@ test("console CLI start/status/login/open/stop drives an isolated HTTP + RPC fix
   assert.equal(run("stop").status, 0, "stop is idempotent");
   assert.deepEqual(JSON.parse(run("status", "--json").stdout), { status: "stopped" });
   assert.equal(existsSync(join(state, "instance.json")), false);
+});
+
+test("start and status probe the configured RPC fixture as it goes up and down", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows Console lifecycle remains intentionally blocked pending live verification");
+    return;
+  }
+  const root = mkdtempSync(join(tmpdir(), "hg-console-runtime-status-"));
+  const state = join(root, "state");
+  const runtimeSocket = join(root, "runtime.sock");
+  const env = { ...process.env, HERDGATE_CONSOLE_STATE_DIR: state, HERDGATE_CONSOLE_ASSET_DIR: assets, HERDGATE_CONSOLE_RPC_SOCKET: runtimeSocket };
+  const run = (...args: string[]) => spawnSync(process.execPath, [join(repo, "bin/herdgate.mjs"), "console", ...args], { env, encoding: "utf8", timeout: 10_000 });
+  const runAsync = (...args: string[]) => new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(process.execPath, [join(repo, "bin/herdgate.mjs"), "console", ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("exit", (status) => resolve({ status, stdout, stderr }));
+  });
+  let runtime: Awaited<ReturnType<typeof startFixtureRuntime>> | undefined;
+  t.after(async () => {
+    if (existsSync(join(state, "instance.json"))) run("stop");
+    await runtime?.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const started = run("start");
+  assert.equal(started.status, 0, started.stderr);
+  assert.match(started.stdout, /runtime-unavailable/);
+  assert.equal(JSON.parse(run("status", "--json").stdout).status, "runtime-unavailable");
+
+  runtime = await startFixtureRuntime(runtimeSocket, { snapshot: fixtureSnapshot });
+  const up = await runAsync("status", "--json");
+  assert.equal(up.status, 0, up.stderr);
+  assert.equal(JSON.parse(up.stdout).status, "ready");
+  await runtime.close();
+  runtime = undefined;
+  const down = await runAsync("status", "--json");
+  assert.equal(down.status, 0, down.stderr);
+  assert.equal(JSON.parse(down.stdout).status, "runtime-unavailable");
+  assert.equal(run("stop").status, 0);
 });
 
 test("default assets come from app-root console/dist; explicit asset override remains supported", (t) => {

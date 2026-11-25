@@ -8,6 +8,30 @@ const PANE_TIMEOUT_MS = 2_500;
 const MAX_PANE_LINES = 120;
 let nextId = 0;
 
+function positiveDimension(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+/** Derive terminal cell geometry only from runtime readings or the matching layout. */
+export function derivePaneDimensions(snapshot, paneId, read = {}) {
+  const pane = snapshot?.panes?.find((item) => item?.pane_id === paneId);
+  const layout = snapshot?.layouts?.find((item) => item?.tab_id === pane?.tab_id);
+  const layoutPane = layout?.panes?.find((item) => item?.pane_id === paneId);
+  const isZoomedPane = layout?.zoomed === true && (layout.focused_pane_id === paneId || layoutPane?.focused === true);
+  const rect = isZoomedPane ? layout.area : layoutPane?.rect;
+  const viewportRows = positiveDimension(pane?.scroll?.viewport_rows);
+  const layoutRows = positiveDimension(rect?.height);
+  const verticalInsets = viewportRows !== null && layoutRows !== null ? layoutRows - viewportRows : null;
+  // Live 0.9.5 geometry: zero/two vertical border cells and one stable scrollbar gutter; unknown deltas stay null.
+  const fallbackCols = positiveDimension(rect?.width) !== null && rect.width > 4 && (verticalInsets === 0 || verticalInsets === 2)
+    ? rect.width - (verticalInsets === 2 ? 3 : 1)
+    : null;
+  return {
+    cols: positiveDimension(read?.cols) ?? positiveDimension(fallbackCols),
+    rows: positiveDimension(read?.rows) ?? viewportRows,
+  };
+}
+
 export class ConsoleRpcError extends Error {
   constructor(code, message) {
     super(message);

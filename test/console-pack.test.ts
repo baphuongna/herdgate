@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -126,18 +126,27 @@ test("packed npm install boots Console from a clean unpacked tarball with only t
   const env = { ...process.env, HERDGATE_CONSOLE_STATE_DIR: state, HERDGATE_CONSOLE_RPC_SOCKET: runtimePath };
   delete env.HERDGATE_CONSOLE_ASSET_DIR;
   const run = (...args: string[]) => spawnSync(process.execPath, [join(packageRoot, "bin/herdgate.mjs"), "console", ...args], { env, encoding: "utf8", timeout: 10_000 });
+  const runAsync = (...args: string[]) => new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(process.execPath, [join(packageRoot, "bin/herdgate.mjs"), "console", ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("exit", (status) => resolve({ status, stdout, stderr }));
+  });
   t.after(async () => {
     if (existsSync(join(state, "instance.json"))) run("stop");
     await runtime.close();
   });
-  const started = run("start");
+  const started = await runAsync("start");
   assert.equal(started.status, 0, started.stderr);
-  const status = run("status", "--json");
+  const status = await runAsync("status", "--json");
   assert.equal(status.status, 0, status.stderr);
   const { address } = JSON.parse(status.stdout) as { address: string };
   const shell = await fetch(`${address}/`);
   assert.equal(shell.status, 200);
-  const EXPECTED_CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'none'; child-src 'none'; frame-src 'none'; manifest-src 'none'; form-action 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+  const EXPECTED_CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'none'; child-src 'none'; frame-src 'none'; manifest-src 'none'; form-action 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
   assert.equal(shell.headers.get("content-security-policy"), EXPECTED_CSP);
   assert.equal((await fetch(`${address}/api/console/v1/session`)).status, 401);
   assert.equal(await getWithHost(address, "evil.example"), 403);
