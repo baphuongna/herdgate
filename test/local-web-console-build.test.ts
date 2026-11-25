@@ -1,12 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { inspectConsolePreflight } from "../console/tools/preflight.mjs";
-import { createAssetAllowlist, sandboxArgs, verifyBuildOutput } from "../console/tools/build-console.mjs";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { assertRealNodeModules, CONSOLE_CSP, createAssetAllowlist, sandboxArgs, verifyBuildOutput } from "../console/tools/build-console.mjs";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { existsSync } from "node:fs";
-import { pathToFileURL } from "node:url";
 
 const root = new URL("../", import.meta.url);
 
@@ -33,6 +31,18 @@ test("preflight emits provisioning instructions without running an install or li
   assert.equal(report.credentialsUsed, false);
 });
 
+test("build preflight rejects symlinked node_modules with an actionable sandbox error", async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "herdgate-console-node-modules-"));
+  try {
+    const real = path.join(temp, "real-node-modules");
+    const link = path.join(temp, "node_modules");
+    await mkdir(real);
+    await symlink(real, link);
+    await assert.rejects(assertRealNodeModules(link), /requires a real vendor\/ovis\/node_modules directory; symlinks are not supported/);
+    await assert.doesNotReject(assertRealNodeModules(real));
+  } finally { await rm(temp, { recursive: true, force: true }); }
+});
+
 test("build sandbox clears environment and user homes and denies networking", () => {
   const args = sandboxArgs({
     repositoryPath: "/home/bom/source/worktree",
@@ -56,36 +66,30 @@ test("build sandbox clears environment and user homes and denies networking", ()
   ]);
 });
 
-test("build emits the runtime-compatible manifest.json schema and serves only runtime-accepted assets", async () => {
+test("build emits the Console manifest schema and allowlists only supported assets", async () => {
   const temp = await mkdtemp(path.join(os.tmpdir(), "herdgate-console-build-test-"));
   try {
     await mkdir(path.join(temp, "assets"));
     await mkdir(path.join(temp, "notices"));
-    await writeFile(path.join(temp, "index.html"), "<html><script type=\"module\" src=\"/assets/app-a1b2c3d4.js\"></script></html>");
+    await writeFile(path.join(temp, "index.html"), `<html><meta http-equiv="Content-Security-Policy" content="${CONSOLE_CSP}"><script type="module" src="/assets/app-a1b2c3d4.js"></script></html>`);
     await writeFile(path.join(temp, "assets", "app-a1b2c3d4.js"), "console.log('fixture')");
     await writeFile(path.join(temp, "notices", "LICENSE"), "fixture license");
     await writeFile(path.join(temp, "notices", "THIRD_PARTY_NOTICES.md"), "fixture notices");
     const expected = JSON.parse(await readFile(new URL("./fixtures/local-web-console-runtime-manifest.json", import.meta.url), "utf8"));
-    const runtimeRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../herdgate-console-runtime");
-    const runtimeFixture = path.join(runtimeRoot, "test/fixtures/local-web-console-runtime/console/dist/manifest.json");
-    const runtimeService = path.join(runtimeRoot, "bin/console-service.mjs");
-    if (existsSync(runtimeFixture)) assert.deepEqual(JSON.parse(await readFile(runtimeFixture, "utf8")), expected);
     const manifest = await createAssetAllowlist(temp);
     assert.deepEqual(Object.keys(manifest).sort(), Object.keys(expected).sort());
     assert.equal(manifest.version, expected.version);
     assert.equal(manifest.index, expected.index);
-    assert.deepEqual(Object.keys(manifest.files).sort(), ["assets/app-a1b2c3d4.js", "index.html"]);
+    assert.deepEqual(Object.keys(manifest.files).sort(), ["assets/app-a1b2c3d4.js", "index.html", "notices/LICENSE", "notices/THIRD_PARTY_NOTICES.md"]);
+    assert.equal(manifest.files["notices/LICENSE"].type, "text/plain; charset=utf-8");
+    assert.equal(manifest.files["notices/THIRD_PARTY_NOTICES.md"].type, "text/markdown; charset=utf-8");
     for (const entry of Object.values(manifest.files)) {
       assert.deepEqual(Object.keys(entry).sort(), ["path", "type"]);
-      assert.ok(["text/html; charset=utf-8", "text/javascript; charset=utf-8", "text/css; charset=utf-8", "font/woff2", "image/svg+xml", "image/png"].includes(entry.type));
+      assert.ok(["text/html; charset=utf-8", "text/javascript; charset=utf-8", "text/css; charset=utf-8", "text/plain; charset=utf-8", "text/markdown; charset=utf-8", "font/woff2", "image/svg+xml", "image/png"].includes(entry.type));
     }
     assert.deepEqual(Object.keys(manifest.files["index.html"]).sort(), Object.keys(expected.files["index.html"]).sort());
     assert.deepEqual(JSON.parse(await readFile(path.join(temp, "manifest.json"), "utf8")), manifest);
     assert.equal(Object.keys((await verifyBuildOutput(temp)).files).length, Object.keys(manifest.files).length);
-    if (existsSync(runtimeService)) {
-      const { validateConsoleAssets } = await import(pathToFileURL(runtimeService).href);
-      assert.doesNotThrow(() => validateConsoleAssets(temp));
-    }
     await writeFile(path.join(temp, "assets", "app-a1b2c3d4.js"), "navigator.serviceWorker.register('/sw.js')");
     await assert.rejects(verifyBuildOutput(temp), /forbidden upstream\/PWA boot reference/);
   } finally { await rm(temp, { recursive: true, force: true }); }

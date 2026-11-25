@@ -37,9 +37,13 @@ test("local React shell uses the Herdgate client and does not boot Ovis App/PWA"
   const entry = await readFile(new URL("../console/src/entry.tsx", import.meta.url), "utf8");
   const ui = await readFile(new URL("../console/src/ui.tsx", import.meta.url), "utf8");
   const terminal = await readFile(new URL("../console/src/ovis/TerminalMirror.tsx", import.meta.url), "utf8");
+  const storageGuard = await readFile(new URL("../console/src/ovis/storage-guard.ts", import.meta.url), "utf8");
   const html = await readFile(new URL("../console/index.html", import.meta.url), "utf8");
   assert.match(entry, /createRoot/);
   assert.match(entry, /installConsoleNetworkGuard\(\)/);
+  assert.match(entry, /installConsoleStorageGuard\(\)/);
+  assert.ok(entry.indexOf("installConsoleStorageGuard()") < entry.indexOf("createRoot(element).render"), "storage guard is active before React mounts");
+  assert.match(storageGuard, /memoryStorage\(\)/);
   assert.match(entry, /@xterm\/xterm\/css\/xterm\.css/);
   assert.match(ui, /OvisReadOnlySessionView/);
   assert.match(ui, /fetchScreen\(/);
@@ -56,6 +60,8 @@ test("local React shell uses the Herdgate client and does not boot Ovis App/PWA"
   assert.doesNotMatch(terminal, /from ["'][^"']*HerdrSocket|new WebSocket|\.attach\(/);
   assert.match(html, /connect-src 'self'/);
   assert.doesNotMatch(html, /ovis\.sh|pwa\.ts|sw\.js/);
+  assert.match(ui, /href="\/notices\/THIRD_PARTY_NOTICES\.md"[^>]*>Third-party notices<\/a>/);
+  assert.equal((ui.match(/href="\/notices\/THIRD_PARTY_NOTICES\.md"/g) ?? []).length, 2, "login and main view both link the third-party notices");
 });
 
 test("L1 import trace mounts pinned Ovis tab and pane source with memory-only preference shims", async () => {

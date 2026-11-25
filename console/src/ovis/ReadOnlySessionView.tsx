@@ -59,7 +59,6 @@ export function OvisReadOnlySessionView({ snapshot, selectedPaneId, screen, stal
             onSelect={(paneId) => onSelectPane(paneId)}
             onChanged={() => {}}
             watching
-            solo
             renderPane={(pane) => pane && pane.pane_id === selectedPaneId
               ? <OvisTerminalMirror screen={screen?.paneId === pane.pane_id ? screen : null} stale={stale} />
               : <div className="ovis-pane-not-selected" aria-hidden="true">Select this pane to read its mirror.</div>}
