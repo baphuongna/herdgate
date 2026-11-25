@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { join, dirname, resolve } from "node:path";
+import { join, dirname, relative, resolve } from "node:path";
 import test from "node:test";
 
-const PLUGIN = join(import.meta.dirname, "..", "plugin", "server");
+const ROOT = join(import.meta.dirname, "..");
+const PLUGIN = join(ROOT, "plugin", "server");
+const WEB = join(ROOT, "src", "web");
+const ASSET = /\.(html|js|css|webmanifest|svg|png)$/;
 
 // Shipped code must be self-contained: nothing under plugin/server may import
 // from outside the shipped tree (experiments/, docs/, test/). The npm "files"
@@ -23,6 +27,33 @@ test("plugin/server modules never import from outside the shipped tree", () => {
     }
   }
   assert.deepEqual(offenders, [], "imports escaping plugin/ break the npm install");
+});
+
+// The gate serves the PWA and /admin from src/web beside its entry point, on every
+// install from npm. `files` is a whitelist, so a page listed nowhere is a 404
+// on npm installs while the repo tests stay green (caught before the 0.14.0
+// publish: admin.js/.css shipped through the *.js/*.css globs, admin.html did
+// not). The tarball listing is the source of truth, not a regex over `files`.
+// Versioned install bundles (herdgate-win-*.zip, *.tgz) sit beside the sources
+// and are dropped on purpose via src/web/.npmignore — they are not assets.
+test("npm tarball ships every asset under src/web, the admin page included", { timeout: 60_000 }, () => {
+  const out = execFileSync("npm", ["pack", "--dry-run", "--json"], {
+    cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+  });
+  const packed = new Set((JSON.parse(out)[0].files as { path: string }[]).map((f) => f.path));
+  const walk = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    if (e.name.startsWith(".")) return [];
+    const abs = join(dir, e.name);
+    return e.isDirectory() ? walk(abs) : e.isFile() ? [abs] : [];
+  });
+  const missing = walk(WEB)
+    .filter((p) => ASSET.test(p))
+    .map((p) => `src/web/${relative(WEB, p)}`)
+    .filter((p) => !packed.has(p));
+  assert.deepEqual(missing, [], "assets under src/web that the npm tarball would drop");
+  for (const p of ["src/web/index.html", "src/web/admin.html", "src/web/admin.js", "src/web/sw.js", "src/web/icons/icon-192.png"]) {
+    assert.ok(packed.has(p), `${p} must be in the npm tarball`);
+  }
 });
 
 // And the npm file list must cover everything plugin/server needs transitively.
