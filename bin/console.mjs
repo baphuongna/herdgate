@@ -190,6 +190,17 @@ async function start() {
     throw new Error("console_start_timeout; no verified loopback health response");
   } finally { rmSync(lock, { recursive: true, force: true }); }
 }
+/** kill(pid, 0) plus a Linux zombie check: an unreaped child still answers signal 0. */
+function pidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try { process.kill(pid, 0); } catch { return false; }
+  if (process.platform !== "linux") return true;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] !== "Z";
+  } catch { return false; }
+}
+
 async function stop() {
   const directory = stateDirectory();
   const state = readInstance(directory);
@@ -198,9 +209,15 @@ async function stop() {
     process.stdout.write("Console: stopped\n");
     return;
   }
+  const pid = state.pid;
   await control(state, "stop");
-  const end = Date.now() + 10_000;
-  while (Date.now() < end && existsSync(join(directory, "instance.json"))) await delay(25);
+  const end = Date.now() + 5_000;
+  while (Date.now() < end && pidAlive(pid)) await delay(25);
+  if (pidAlive(pid)) {
+    process.stdout.write(`Console: still running (pid ${pid}); stop did not take effect\n`);
+    process.exitCode = 1;
+    return;
+  }
   if (existsSync(join(directory, "instance.json"))) throw new Error("console_stop_unverified; instance state remains");
   process.stdout.write("Console: stopped\n");
 }

@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import net from "node:net";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
+import { pidAlive, reapConsoleServer } from "./fixtures/local-web-console-runtime/console-process.mjs";
 import { startFixtureRuntime } from "./fixtures/local-web-console-runtime/runtime.mjs";
 
 const repo = join(import.meta.dirname, "..");
@@ -15,6 +18,8 @@ const fixtureSnapshot = {
   panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", focused: true }],
   layouts: [], agents: [],
 };
+
+const delay = (ms: number) => new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 
 test("console CLI start/status/login/open/stop drives an isolated HTTP + RPC fixture", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "hg-console-cli-"));
@@ -42,7 +47,7 @@ test("console CLI start/status/login/open/stop drives an isolated HTTP + RPC fix
     child.once("exit", (status) => resolve({ status, stdout, stderr }));
   });
   t.after(async () => {
-    if (existsSync(join(state, "instance.json"))) run("stop");
+    await reapConsoleServer(() => run("stop"), state);
     await runtime.close();
     rmSync(root, { recursive: true, force: true });
   });
@@ -101,6 +106,7 @@ test("console CLI start/status/login/open/stop drives an isolated HTTP + RPC fix
 
   const stop = run("stop");
   assert.equal(stop.status, 0, stop.stderr);
+  assert.match(stop.stdout, /Console: stopped/, "stop reports the truth: the pid has exited");
   assert.equal(run("stop").status, 0, "stop is idempotent");
   assert.deepEqual(JSON.parse(run("status", "--json").stdout), { status: "stopped" });
   assert.equal(existsSync(join(state, "instance.json")), false);
@@ -127,7 +133,7 @@ test("start and status probe the configured RPC fixture as it goes up and down",
   });
   let runtime: Awaited<ReturnType<typeof startFixtureRuntime>> | undefined;
   t.after(async () => {
-    if (existsSync(join(state, "instance.json"))) run("stop");
+    await reapConsoleServer(() => run("stop"), state);
     await runtime?.close();
     rmSync(root, { recursive: true, force: true });
   });
@@ -164,7 +170,10 @@ test("default assets come from app-root console/dist; explicit asset override re
   delete env.HERDGATE_CONSOLE_ASSET_DIR;
   delete env.HERDGATE_CONSOLE_RPC_SOCKET;
   const run = (...args: string[]) => spawnSync(process.execPath, [join(bin, "console.mjs"), ...args], { env, encoding: "utf8", timeout: 10_000 });
-  t.after(() => { if (existsSync(join(state, "instance.json"))) run("stop"); rmSync(root, { recursive: true, force: true }); });
+  t.after(async () => {
+    await reapConsoleServer(() => run("stop"), state);
+    rmSync(root, { recursive: true, force: true });
+  });
   const started = run("start");
   assert.equal(started.status, 0, started.stderr);
   assert.match(started.stdout, /runtime-unavailable/);
@@ -185,4 +194,93 @@ test("open never starts a stopped Console and start fails clearly without an ass
   const start = run("start");
   assert.notEqual(start.status, 0);
   assert.match(start.stderr, /console_assets_missing/);
+});
+
+test("console server self-terminates when its control state disappears", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows Console lifecycle remains intentionally blocked pending live verification");
+    return;
+  }
+  const root = mkdtempSync(join(tmpdir(), "hg-console-watchdog-"));
+  const state = join(root, "state");
+  const child = spawn(process.execPath, [join(repo, "bin/console-server.mjs"), "--state-dir", state, "--assets-dir", assets, "--instance-id", randomUUID()], { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+  child.stdout.resume();
+  t.after(async () => {
+    if (child.pid !== undefined && pidAlive(child.pid)) child.kill("SIGKILL");
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const statePath = join(state, "instance.json");
+  const startDeadline = Date.now() + 10_000;
+  while (Date.now() < startDeadline && !existsSync(statePath)) await delay(25);
+  assert.ok(existsSync(statePath), `console-server did not publish state: ${stderr.trim()}`);
+
+  // Control intact: the service stays alive across several watchdog ticks.
+  await delay(5_000);
+  assert.equal(child.exitCode, null, "an intact control socket keeps the service alive");
+  assert.equal(pidAlive(child.pid), true);
+
+  // Control lost (state dir wiped, as when a test runner dies before stopping): self-terminate.
+  rmSync(join(state, "control.sock"), { force: true });
+  rmSync(statePath, { force: true });
+  const removedAt = Date.now();
+  const exit = await Promise.race([
+    once(child, "exit").then(([code]) => ({ code })),
+    delay(8_000).then(() => ({ code: "timeout" as const })),
+  ]);
+  assert.notEqual(exit.code, "timeout", `service must end itself once its control state is gone (waited ${Date.now() - removedAt}ms)`);
+  assert.equal(existsSync(join(state, "control.sock")), false, "shutdown leaves no stale control socket");
+});
+
+test("console stop waits for the pid and reports a server that survives the stop command", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows Console lifecycle remains intentionally blocked pending live verification");
+    return;
+  }
+  const root = mkdtempSync(join(tmpdir(), "hg-console-stop-truth-"));
+  const state = join(root, "state");
+  mkdirSync(state, { recursive: true, mode: 0o700 });
+  const instanceId = randomUUID();
+  const controlPath = join(state, "control.sock");
+  // A control endpoint that acknowledges the stop command while its recorded "server"
+  // (this test process, guaranteed alive) deliberately keeps running.
+  const fakeControl = net.createServer((socket) => {
+    socket.on("error", () => socket.destroy());
+    socket.on("data", (chunk) => {
+      let ok = false;
+      try {
+        const message = JSON.parse(chunk.toString("utf8"));
+        ok = message?.command === "stop" && message.instanceId === instanceId;
+      } catch { ok = false; }
+      socket.end(JSON.stringify({ ok }) + "\n");
+    });
+  });
+  fakeControl.listen(controlPath);
+  await once(fakeControl, "listening");
+  chmodSync(controlPath, 0o600); // the CLI's control() requires owner-only socket permissions
+  const port = 49_152 + (process.pid % 16_384); // recorded for state validation only; never contacted
+  writeFileSync(join(state, "instance.json"), JSON.stringify({ version: 1, instanceId, pid: process.pid, host: "127.0.0.1", port, controlPath, origin: `http://127.0.0.1:${port}`, startedAt: Date.now() }), { mode: 0o600 });
+  t.after(() => {
+    fakeControl.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const env = { ...process.env, HERDGATE_CONSOLE_STATE_DIR: state, HERDGATE_CONSOLE_ASSET_DIR: assets };
+  // Async spawn: the fake control endpoint answers from this test process, which must keep
+  // its event loop free while the CLI runs (spawnSync here would deadlock the reply).
+  const stopped = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(process.execPath, [join(repo, "bin/herdgate.mjs"), "console", "stop"], { env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    const guard = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("console stop did not finish within 20s")); }, 20_000);
+    child.once("error", reject);
+    child.once("exit", (status) => { clearTimeout(guard); resolve({ status, stdout, stderr }); });
+  });
+  assert.match(stopped.stdout, new RegExp(`still running \\(pid ${process.pid}\\)`), `stop must not claim success while the pid lives; stderr: ${stopped.stderr}`);
+  assert.notEqual(stopped.status, 0);
+  assert.equal(existsSync(join(state, "instance.json")), true, "a surviving server keeps its state");
 });

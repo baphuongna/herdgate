@@ -22,6 +22,8 @@ let service;
 let control;
 let ownsControl = false;
 let stopping = false;
+const WATCHDOG_INTERVAL_MS = 2_000;
+let watchdog;
 
 function privateDir(path) {
   mkdirSync(path, { recursive: true, mode: 0o700 });
@@ -37,6 +39,7 @@ function writeInstance(state) {
 async function shutdown() {
   if (stopping) return;
   stopping = true;
+  if (watchdog) { clearInterval(watchdog); watchdog = undefined; }
   try { await service?.stop(); } catch { /* shutdown must continue to state cleanup */ }
   if (control?.listening) await new Promise((resolveClose) => control.close(resolveClose));
   try {
@@ -47,6 +50,20 @@ async function shutdown() {
     rmSync(controlPath, { force: true });
     ownsControl = false;
   }
+}
+
+// Orphan guard: once the private control state disappears (state dir wiped, control socket
+// deleted) no client can ever stop this service again, so it must end itself. Starts only
+// after instance state and the control socket exist, so any later absence means lost control.
+function startWatchdog() {
+  watchdog = setInterval(() => {
+    if (stopping) return;
+    let owned = false;
+    try { owned = JSON.parse(readFileSync(statePath, "utf8"))?.instanceId === instanceId; }
+    catch { owned = false; }
+    if (!owned || !existsSync(controlPath)) void shutdown().finally(() => process.exit(0));
+  }, WATCHDOG_INTERVAL_MS);
+  watchdog.unref();
 }
 
 async function main() {
@@ -95,6 +112,7 @@ async function main() {
   ownsControl = true;
   chmodSync(controlPath, 0o600);
   writeInstance({ version: 1, instanceId, pid: process.pid, host: "127.0.0.1", port: Number(new URL(service.origin).port), origin: service.origin, controlPath, startedAt: Date.now() });
+  startWatchdog();
   process.stdout.write("ready\n");
 }
 

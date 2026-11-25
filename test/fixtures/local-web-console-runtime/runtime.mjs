@@ -5,6 +5,8 @@ import { once } from "node:events";
 export async function startFixtureRuntime(socketPath, { snapshot, readText = "fixture screen\n", cols = null, rows = null } = {}) {
   const calls = [];
   const server = net.createServer((socket) => {
+    // The service may close mid-response (EPIPE/ECONNRESET): swallow and close, never crash the test runner.
+    socket.on("error", () => socket.destroy());
     let buffer = "";
     socket.on("data", async (chunk) => {
       buffer += chunk.toString("utf8");
