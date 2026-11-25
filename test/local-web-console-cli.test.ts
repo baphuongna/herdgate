@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -102,6 +102,31 @@ test("console CLI start/status/login/open/stop drives an isolated HTTP + RPC fix
   assert.equal(run("stop").status, 0, "stop is idempotent");
   assert.deepEqual(JSON.parse(run("status", "--json").stdout), { status: "stopped" });
   assert.equal(existsSync(join(state, "instance.json")), false);
+});
+
+test("default assets come from app-root console/dist; explicit asset override remains supported", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "hg-console-default-assets-"));
+  const bin = join(root, "bin");
+  const dist = join(root, "console", "dist");
+  const state = join(root, "state");
+  mkdirSync(bin, { recursive: true });
+  mkdirSync(dist, { recursive: true });
+  for (const file of ["console.mjs", "console-server.mjs", "console-service.mjs", "console-rpc.mjs"]) {
+    copyFileSync(join(repo, "bin", file), join(bin, file));
+  }
+  writeFileSync(join(dist, "manifest.json"), JSON.stringify({ version: 1, index: "index.html", files: { "index.html": { path: "index.html", type: "text/html; charset=utf-8" } } }));
+  writeFileSync(join(dist, "index.html"), "<!doctype html><title>default asset fixture</title>");
+  const env = { ...process.env, HERDGATE_CONSOLE_STATE_DIR: state };
+  delete env.HERDGATE_CONSOLE_ASSET_DIR;
+  delete env.HERDGATE_CONSOLE_RPC_SOCKET;
+  const run = (...args: string[]) => spawnSync(process.execPath, [join(bin, "console.mjs"), ...args], { env, encoding: "utf8", timeout: 10_000 });
+  t.after(() => { if (existsSync(join(state, "instance.json"))) run("stop"); rmSync(root, { recursive: true, force: true }); });
+  const started = run("start");
+  assert.equal(started.status, 0, started.stderr);
+  assert.match(started.stdout, /runtime-unavailable/);
+  const status = run("status", "--json");
+  assert.equal(JSON.parse(status.stdout).status, "runtime-unavailable");
+  assert.equal(run("stop").status, 0);
 });
 
 test("open never starts a stopped Console and start fails clearly without an asset manifest", (t) => {

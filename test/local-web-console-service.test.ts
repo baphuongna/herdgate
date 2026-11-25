@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
-import { createConsoleRpc } from "../plugin/server/console/rpc.mjs";
+import { createConsoleRpc } from "../bin/console-rpc.mjs";
 import { createConsoleService } from "../bin/console-service.mjs";
 import { startFixtureRuntime } from "./fixtures/local-web-console-runtime/runtime.mjs";
 
@@ -97,10 +97,14 @@ test("HTTP service serves manifest allowlist and authenticated read-only API on 
     headers: { ...auth, "x-herdgate-runtime-generation": session.runtimeGeneration },
   });
   assert.equal(screenResponse.status, 200);
-  const screen = await screenResponse.json() as { ansi: string; sequence: number; truncated: boolean };
+  const screen = await screenResponse.json() as { ansi: string; sequence: number; truncated: boolean; capturedAt: string; cols: number | null; rows: number | null; readAt?: string };
   assert.match(screen.ansi, /fixture screen/);
   assert.equal(screen.sequence, 1);
   assert.equal(screen.truncated, false);
+  assert.equal(screen.capturedAt, new Date(1_000_000).toISOString());
+  assert.equal(screen.cols, null);
+  assert.equal(screen.rows, null);
+  assert.equal("readAt" in screen, false);
   assert.equal((await fetch(`${h.origin}/api/console/v1/pane/w1%3Ap1/send`, { method: "POST", headers: { ...auth, origin: h.origin } })).status, 404);
 
   const missingOrigin = await fetch(`${h.origin}/api/console/v1/auth/logout`, { method: "POST", headers: auth });
@@ -203,6 +207,43 @@ test("runtime permission and pane-gone errors map to 403/404 without fallback", 
   assert.equal(vanished.runtimeAvailable, true, "one pane disappearance does not imply runtime loss");
   const refreshed = await fetch(`${vanished.origin}/api/console/v1/session`, { headers: auth });
   assert.equal((await refreshed.json()).runtimeGeneration, runtimeGeneration);
+});
+
+test("same-generation refresh removing a pane rejects its pending screen without leaking ANSI", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "hg-console-pane-race-"));
+  const runtimePath = join(dir, "runtime.sock");
+  let snapshots = 0;
+  let completeRead!: (text: string) => void;
+  let readStarted!: () => void;
+  const started = new Promise<void>((resolve) => { readStarted = resolve; });
+  const runtime = await startFixtureRuntime(runtimePath, {
+    snapshot: () => ++snapshots === 1 ? fixtureSnapshot : { ...fixtureSnapshot, panes: [] },
+    readText: () => { readStarted(); return new Promise<string>((resolve) => { completeRead = resolve; }); },
+  });
+  const rpc = createConsoleRpc({ connect: () => net.createConnection(runtimePath), timeoutMs: 300, paneTimeoutMs: 300 });
+  const service = createConsoleService({ rpc, assetsDir: assets });
+  await service.start();
+  t.after(async () => { await service.stop(); await runtime.close(); rmSync(dir, { recursive: true, force: true }); });
+  const { response: redeemed } = await login(service.origin, service);
+  const { token } = await redeemed.json() as { token: string };
+  const auth = { authorization: `Bearer ${token}` };
+  const first = await fetch(`${service.origin}/api/console/v1/session`, { headers: auth });
+  const { runtimeGeneration } = await first.json() as { runtimeGeneration: string };
+  const pendingScreen = fetch(`${service.origin}/api/console/v1/pane/w1%3Ap1/screen`, {
+    headers: { ...auth, "x-herdgate-runtime-generation": runtimeGeneration },
+  });
+  await started;
+  const refreshed = await fetch(`${service.origin}/api/console/v1/session`, { headers: auth });
+  assert.equal(refreshed.status, 200);
+  assert.deepEqual((await refreshed.json()).snapshot.panes, []);
+  assert.equal(service.runtimeGeneration, runtimeGeneration, "pane removal does not change runtime identity");
+  completeRead("PRIVATE ANSI MUST NOT LEAK\\n");
+  const response = await pendingScreen;
+  assert.equal(response.status, 404);
+  const body = await response.json();
+  assert.equal(body.error.code, "pane_gone");
+  assert.equal("ansi" in body, false);
+  assert.doesNotMatch(JSON.stringify(body), /PRIVATE ANSI/);
 });
 
 test("generation invalidation during pane RPC drops the in-flight screen", async (t) => {

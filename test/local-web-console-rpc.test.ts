@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import net from "node:net";
 import { once } from "node:events";
 import { test } from "node:test";
-import { createConsoleRpc } from "../plugin/server/console/rpc.mjs";
+import { createConsoleRpc } from "../bin/console-rpc.mjs";
 
 const snapshot = { version: "0.9.5", protocol: 22, workspaces: [], tabs: [], panes: [{ pane_id: "w1:p1" }], layouts: [], agents: [] };
 

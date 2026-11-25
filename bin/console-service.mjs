@@ -294,13 +294,22 @@ export function createConsoleService({ rpc = null, assetsDir, now = Date.now, lo
           throw new HttpFault(503, "runtime_unavailable", "Herdr pane read failed");
         }
         if (!runtimeAvailable || runtimeGeneration !== generation || expectedGeneration !== runtimeGeneration) throw new HttpFault(409, "generation_mismatch", "Runtime generation changed during pane read");
+        const currentPane = currentSnapshot?.panes.find((pane) => pane?.pane_id === paneId);
+        if (!currentPane) {
+          sequences.delete(paneId);
+          throw new HttpFault(404, "pane_gone", "Pane is no longer in the current snapshot");
+        }
         if (!read || read.pane_id !== paneId || typeof read.text !== "string" || typeof read.truncated !== "boolean") throw new HttpFault(502, "invalid_pane_read", "Herdr returned an invalid pane frame");
+        const dimensionOrNull = (value) => Number.isSafeInteger(value) && value > 0 ? value : null;
+        const cols = dimensionOrNull(read.cols ?? currentPane.cols);
+        const rowsCount = dimensionOrNull(read.rows ?? currentPane.rows);
+        const capturedAt = new Date(now()).toISOString();
         let ansi = read.text;
         let truncated = read.truncated;
         const endsWithNewline = ansi.endsWith("\n");
         let rows = ansi.split("\n");
         if (endsWithNewline) rows.pop();
-        const responseFor = (text, wasTruncated) => ({ runtimeGeneration: generation, sequence: (sequences.get(paneId) ?? 0) + 1, paneId, ansi: text, truncated: wasTruncated, readAt: new Date(now()).toISOString() });
+        const responseFor = (text, wasTruncated) => ({ runtimeGeneration: generation, sequence: (sequences.get(paneId) ?? 0) + 1, paneId, cols, rows: rowsCount, ansi: text, capturedAt, truncated: wasTruncated });
         let payload = responseFor(ansi, truncated);
         while (Buffer.byteLength(JSON.stringify(payload), "utf8") > MAX_API_BYTES && rows.length > 1) {
           rows.shift();

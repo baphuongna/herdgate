@@ -21,7 +21,7 @@ function stateDirectory(env = process.env) {
   return resolve(join(env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "herdgate", "console"));
 }
 function assetsDirectory(env = process.env) {
-  return resolve(env.HERDGATE_CONSOLE_ASSET_DIR || join(ROOT, "plugin", "server", "console", "dist"));
+  return resolve(env.HERDGATE_CONSOLE_ASSET_DIR || join(ROOT, "console", "dist"));
 }
 function ensurePrivateDir(path) {
   mkdirSync(path, { recursive: true, mode: 0o700 });
