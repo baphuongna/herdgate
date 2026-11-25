@@ -128,10 +128,10 @@ chỉ thị, nhưng ghi nhớ bền ở đây (sống sót qua context compactio
 **Reply PHẢI mở đầu bằng banner 1 dòng**: `🔔 WAKE — agent <tên> <status>: <kết quả trong 1 câu>`
 (id receipt nằm ở dòng sau). Turn wake nhanh và dễ bị người dùng bỏ qua — mở đầu bằng id
 hoặc văn thường là như không báo (đã xảy ra: user nhìn thẳng pane vẫn nghĩ chưa có gì đến):
-1. Chạy test mục tiêu của phần việc con vừa làm (`node --test test/<file>.test.ts`).
-2. Review diff (`git diff` + `git status`) — đúng whitelist file đã giao.
-3. Commit nếu đạt (thông điệp ghi rõ agent nào, spawn id).
-4. Báo user ngắn gọn ngay trong reply (agent nào xong, commit gì, test bao nhiêu pass).
+1. Chạy lại test mục tiêu trong worktree của agent (`node --test test/<file>.test.ts`).
+2. Review diff và `git status`, kể cả file mới chưa track; đối chiếu spec và whitelist đã giao. Test xanh không thay cho review; receipt settle không chứng minh việc đã đạt.
+3. **Nếu test hoặc review chưa đạt và lỗi nằm trong phạm vi đã giao:** không commit, không merge, không tự viết bản vá thay agent và **không hỏi lại user chỉ để xin phép sửa**. Ngay trong turn wake, ghi finding (file/dòng, kết quả quan sát, hành vi mong đợi và test cần có) rồi gửi một lần cho **chính agent đó** bằng `node experiments/pi-spawn/task.mjs continue <tên> <taskfile>`. Giữ nguyên worktree và model; không đóng pane, không tự polling hay gửi lặp. Báo user lỗi và việc đã giao lại. Wake sau chạy lại từ bước 1. Chỉ dừng và hỏi khi bị chặn (vd. agent không nhận được việc, cần thêm quyền/đổi scope, hoặc các vòng sửa không tiến triển).
+4. **Nếu cả test và review đạt:** mới commit trong phạm vi đã giao (thông điệp ghi agent và spawn id); báo ngắn kết quả, commit và số test pass. Không tự merge/publish nếu chưa được giao.
 5. Cần report đầy đủ: `node experiments/pi-receipt/query.mjs --gate <gate> --device <d> --secret <s> --id <uuid> --body`.
 
  KHÔNG chỉ ack rồi kết thúc turn — mỗi lần ack suông là một phần việc chết chờ user nhắc
@@ -150,8 +150,8 @@ marker sai định dạng từng làm cả đợt agent mù observation.
 
 ## Vòng đời con — dọn ngay, không tích tụ
 
-Parent là chủ vòng đời con mình. Sau khi wake đã xử lý (test/commit xong), nếu KHÔNG còn
-việc kế tiếp đã lên kế hoạch cho con đó → **đóng ngay trong cùng turn**:
+Parent là chủ vòng đời con mình. Sau khi review đạt và xử lý xong commit, nếu KHÔNG còn
+việc kế tiếp → **đóng ngay trong cùng turn**. Không đóng khi đã giao sửa và còn chờ wake:
 
 ```bash
 node experiments/pi-spawn/spawn.mjs close <tên>   # đóng tab/pane con; từ chối nếu đang working
