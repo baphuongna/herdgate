@@ -1,6 +1,6 @@
-/** Typed boundary for a future Herdgate read-only Console frontend adapter. */
+/** Typed boundary for the Herdgate read-only Console frontend adapter. */
 export interface ConsoleSessionSnapshot {
-  runtime: 'available' | 'unavailable';
+  runtime: 'available' | 'unavailable' | 'ambiguous';
   runtimeGeneration: string | null;
   workspaces: readonly { id: string; label: string }[];
   tabs: readonly { id: string; workspaceId: string; label: string }[];

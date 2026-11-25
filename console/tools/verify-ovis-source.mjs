@@ -43,7 +43,10 @@ export async function verifyOvisSource(rootUrl) {
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
-  const buildReady = localEntrypoint !== null && await stat(path.join(root, "console/vite.config.ts")).then(() => true, () => false);
+  const hasBuildConfig = await stat(path.join(root, "console/vite.config.ts")).then(() => true, () => false);
+  const buildReady = localEntrypoint !== null && hasBuildConfig
+    && await stat(path.join(root, "console/dist/index.html")).then(() => true, () => false)
+    && await stat(path.join(root, "console/dist/asset-manifest.json")).then(() => true, () => false);
   return {
     revision: PIN,
     fileCount: files.length,
