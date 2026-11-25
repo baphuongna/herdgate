@@ -29,7 +29,7 @@ export async function verifyOvisSource(rootUrl) {
 
   const provenance = await readFile(path.join(vendor, "UPSTREAM.md"), "utf8");
   if (!provenance.includes(`Pinned revision: \`${PIN}\``)) throw new Error("Ovis source pin mismatch");
-  for (const required of ["LICENSE", "THIRD_PARTY_NOTICES.md", "bun.lock", "patches/@xterm%2Fxterm@6.0.0.patch", "src/App.tsx", "src/components/PaneTerminal.tsx", "shared/herdr-api.generated.ts"]) {
+  for (const required of ["LICENSE", "THIRD_PARTY_NOTICES.md", "bun.lock", "patches/@xterm%2Fxterm@6.0.0.patch", "src/App.tsx", "src/components/PaneTerminal.tsx", "src/lib/markdownPreview.worker.ts", "src/lib/highlight.worker.ts", "shared/ghostty/ghostty-vt.wasm", "shared/herdr-api.generated.ts"]) {
     if (!files.includes(required)) throw new Error(`required Ovis frontend source missing: ${required}`);
   }
   if (files.some((file) => /^(server|relay|push-relay|app)\//.test(file))) throw new Error("Ovis backend files must not be vendored");

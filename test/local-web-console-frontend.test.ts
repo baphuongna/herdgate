@@ -12,6 +12,9 @@ test("pinned Ovis frontend source is complete, hash-verified, and excludes serve
   assert.ok(result.files.includes("src/App.tsx"));
   assert.ok(result.files.includes("src/components/PaneTerminal.tsx"));
   assert.ok(result.files.includes("shared/herdr-api.generated.ts"));
+  assert.ok(result.files.includes("src/lib/markdownPreview.worker.ts"));
+  assert.ok(result.files.includes("src/lib/highlight.worker.ts"));
+  assert.ok(result.files.includes("shared/ghostty/ghostty-vt.wasm"));
   assert.ok(!result.files.some((file) => /^(server|relay|push-relay|app)\//.test(file)));
   assert.ok(!result.files.some((file) => /(^|\/)(sw\.js|pwa\.ts|manifest\.webmanifest)$/.test(file)));
 });
