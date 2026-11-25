@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "index": "index.html",
+  "files": {
+    "index.html": { "path": "index.html", "type": "text/html; charset=utf-8" },
+    "assets/app.123abc.js": { "path": "assets/app.123abc.js", "type": "text/javascript; charset=utf-8" },
+    "assets/index-D0ahG_z6.js": { "path": "assets/index-D0ahG_z6.js", "type": "text/javascript; charset=utf-8" },
+    "assets/JetBrainsMono-Bold-D4WEaHbo.woff2": { "path": "assets/JetBrainsMono-Bold-D4WEaHbo.woff2", "type": "font/woff2" },
+    "notices/LICENSE": { "path": "notices/LICENSE", "type": "text/plain; charset=utf-8" },
+    "notices/THIRD_PARTY_NOTICES.md": { "path": "notices/THIRD_PARTY_NOTICES.md", "type": "text/markdown; charset=utf-8" }
+  }
+}
