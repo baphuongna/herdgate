@@ -116,14 +116,15 @@ test("reply ID mismatch fails closed", async (t) => {
 
 test("JSONL split over chunks is reassembled including split UTF-8", async (t) => {
   const server = await harness((request, socket) => {
-    const data = Buffer.from(JSON.stringify({ id: request.id, result: { snapshot: { ...snapshot, note: "một" } } }) + "\n");
+    const payload = { ...snapshot, workspaces: [{ workspace_id: "w1", label: "một" }] };
+    const data = Buffer.from(JSON.stringify({ id: request.id, result: { snapshot: payload } }) + "\n");
     const at = data.indexOf(Buffer.from("ộ")) + 1;
     socket.write(data.subarray(0, at));
     setTimeout(() => socket.end(data.subarray(at)), 5);
   });
   t.after(server.close);
   const result = await createConsoleRpc({ connect: server.connect }).snapshot();
-  assert.equal(result.note, "một");
+  assert.equal(result.workspaces[0].label, "một");
 });
 
 test("malformed, unterminated and oversized replies fail closed", async (t) => {
@@ -163,26 +164,29 @@ test("permission and connector failures reject without retry", async (t) => {
 
 test("pane geometry derives cell dimensions from layout, zoom, and read values", () => {
   const snapshot = {
+    workspaces: [],
+    tabs: [],
+    agents: [],
     panes: [
-      { pane_id: "w1:p1", tab_id: "w1:t1", scroll: { viewport_rows: 38 } },
-      { pane_id: "w1:p2", tab_id: "w1:t1", scroll: { viewport_rows: 38 } },
-      { pane_id: "w1:p3", tab_id: "w1:t2", scroll: { viewport_rows: 38 } },
-      { pane_id: "w1:p4", tab_id: "w1:t3", scroll: { viewport_rows: 40 } },
+      { pane_id: "w1:p1", tab_id: "w1:t1", scroll: { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 38 } },
+      { pane_id: "w1:p2", tab_id: "w1:t1", scroll: { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 38 } },
+      { pane_id: "w1:p3", tab_id: "w1:t2", scroll: { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 38 } },
+      { pane_id: "w1:p4", tab_id: "w1:t3", scroll: { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 40 } },
       { pane_id: "w1:p5", tab_id: "w1:t4" },
-      { pane_id: "w1:p6", tab_id: "w1:t5", scroll: { viewport_rows: 37 } },
+      { pane_id: "w1:p6", tab_id: "w1:t5", scroll: { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 37 } },
     ],
     layouts: [
-      { tab_id: "w1:t1", zoomed: false, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p1", panes: [
+      { workspace_id: "w1", tab_id: "w1:t1", zoomed: false, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p1", splits: [], panes: [
         { pane_id: "w1:p1", focused: true, rect: { x: 0, y: 0, width: 60, height: 40 } },
         { pane_id: "w1:p2", focused: false, rect: { x: 60, y: 0, width: 60, height: 40 } },
       ] },
-      { tab_id: "w1:t2", zoomed: true, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p3", panes: [
+      { workspace_id: "w1", tab_id: "w1:t2", zoomed: true, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p3", splits: [], panes: [
         { pane_id: "w1:p3", focused: true, rect: { x: 0, y: 0, width: 60, height: 40 } },
       ] },
-      { tab_id: "w1:t3", zoomed: false, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p4", panes: [
+      { workspace_id: "w1", tab_id: "w1:t3", zoomed: false, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p4", splits: [], panes: [
         { pane_id: "w1:p4", focused: true, rect: { x: 0, y: 0, width: 120, height: 40 } },
       ] },
-      { tab_id: "w1:t5", zoomed: false, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p6", panes: [
+      { workspace_id: "w1", tab_id: "w1:t5", zoomed: false, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p6", splits: [], panes: [
         { pane_id: "w1:p6", focused: true, rect: { x: 0, y: 0, width: 60, height: 40 } },
       ] },
     ],

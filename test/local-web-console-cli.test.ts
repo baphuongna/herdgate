@@ -88,7 +88,8 @@ test("console CLI start/status/login/open/stop drives an isolated HTTP + RPC fix
   assert.equal(JSON.parse(onlineStatus.stdout).status, "ready");
   const screen = await fetch(`${origin}/api/console/v1/pane/w1%3Ap1/screen`, { headers: { ...auth, "x-herdgate-runtime-generation": session.runtimeGeneration } });
   assert.equal(screen.status, 200);
-  assert.match((await screen.json()).ansi, /fixture screen/);
+  const screenBody = await screen.json() as { ansi: string };
+  assert.match(screenBody.ansi, /fixture screen/);
 
   mkdirSync(openBin, { recursive: true });
   writeFileSync(join(openBin, "xdg-open"), "#!/bin/sh\nprintf '%s' \"$1\" > \"$HG_OPEN_LOG\"\n", { mode: 0o700 });
@@ -159,7 +160,7 @@ test("default assets come from app-root console/dist; explicit asset override re
   }
   writeFileSync(join(dist, "manifest.json"), JSON.stringify({ version: 1, index: "index.html", files: { "index.html": { path: "index.html", type: "text/html; charset=utf-8" } } }));
   writeFileSync(join(dist, "index.html"), "<!doctype html><title>default asset fixture</title>");
-  const env = { ...process.env, HERDGATE_CONSOLE_STATE_DIR: state };
+  const env: NodeJS.ProcessEnv = { ...process.env, HERDGATE_CONSOLE_STATE_DIR: state };
   delete env.HERDGATE_CONSOLE_ASSET_DIR;
   delete env.HERDGATE_CONSOLE_RPC_SOCKET;
   const run = (...args: string[]) => spawnSync(process.execPath, [join(bin, "console.mjs"), ...args], { env, encoding: "utf8", timeout: 10_000 });
