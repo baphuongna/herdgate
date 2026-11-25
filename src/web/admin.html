@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <meta name="referrer" content="no-referrer" />
+    <title>herdgate · quản trị</title>
+    <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/admin.css" />
+  </head>
+  <body>
+    <!-- The owner's console for the gate itself (machines, devices, pairing, events).
+         Everything below is filled by admin.js with textContent; nothing from the wire is HTML. -->
+    <section id="signin" hidden>
+      <h1>herdgate <span class="muted">quản trị</span></h1>
+      <p class="muted">Dán token chủ sở hữu của gate. Nó chỉ nằm trong trình duyệt này và chỉ được gửi tới gate này.</p>
+      <form id="signin-form" autocomplete="off">
+        <label for="token">Token chủ sở hữu</label>
+        <input id="token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" required />
+        <button type="submit">Đăng nhập</button>
+      </form>
+      <p id="signin-error" class="error" role="alert" hidden></p>
+    </section>
+
+    <div id="app" hidden>
+      <header id="top">
+        <strong>herdgate</strong><span class="muted">quản trị</span>
+        <span id="status" class="pill" role="status" aria-live="polite">—</span>
+        <span id="version" class="muted small"></span>
+        <span class="spacer"></span>
+        <button id="refresh" type="button">Làm mới</button>
+        <button id="signout" type="button" class="danger">Đăng xuất</button>
+      </header>
+
+      <nav id="nav" aria-label="Mục">
+        <button type="button" data-view="overview" class="on">Tổng quan</button>
+        <button type="button" data-view="rooms">Máy</button>
+        <button type="button" data-view="devices">Thiết bị</button>
+        <button type="button" data-view="pairing">Ghép nối</button>
+        <button type="button" data-view="events">Sự kiện</button>
+      </nav>
+
+      <main id="main">
+        <section id="view-overview" class="view">
+          <div id="cards" class="cards"></div>
+          <div class="cols">
+            <div class="card">
+              <h2>Gate</h2>
+              <dl id="gate-facts" class="facts"></dl>
+            </div>
+            <div class="card">
+              <h2>Mã ghép đang chờ</h2>
+              <div id="pending"></div>
+            </div>
+          </div>
+          <div class="card">
+            <h2>Máy</h2>
+            <div id="overview-rooms"></div>
+          </div>
+        </section>
+
+        <section id="view-rooms" class="view" hidden>
+          <div class="toolbar">
+            <input id="room-query" type="search" placeholder="Lọc: tên máy, host, phiên bản…" aria-label="Lọc máy" />
+          </div>
+          <div id="rooms"></div>
+        </section>
+
+        <section id="view-devices" class="view" hidden>
+          <div class="toolbar">
+            <input id="device-query" type="search" placeholder="Lọc: tên, máy, scope, id…" aria-label="Lọc thiết bị" />
+          </div>
+          <div id="devices"></div>
+        </section>
+
+        <section id="view-pairing" class="view" hidden>
+          <div class="card">
+            <h2>Đang chờ duyệt</h2>
+            <div id="pairing-pending"></div>
+          </div>
+          <div class="card">
+            <h2>Duyệt bằng mã</h2>
+            <p class="muted">Máy in mã trên panel Herdgate của nó (lệnh <code>herdgate pair</code>). Dán mã vào đây để duyệt.</p>
+            <form id="approve-form" autocomplete="off">
+              <input id="approve-code" required placeholder="mã ghép" autocapitalize="characters" spellcheck="false" />
+              <button type="submit" data-act="approve">Duyệt</button>
+            </form>
+            <p id="approve-note" class="muted" role="status" hidden></p>
+          </div>
+        </section>
+
+        <section id="view-events" class="view" hidden>
+          <div class="toolbar">
+            <button id="events-pause" type="button">Tạm dừng</button>
+            <button id="events-clear" type="button">Xoá màn hình</button>
+            <label class="check"><input type="checkbox" id="events-only-owner" /> chỉ thao tác của tôi</label>
+            <span class="muted small">300 dòng gần nhất trong RAM của gate; nhật ký đầy đủ ở journal máy chủ.</span>
+          </div>
+          <ol id="events" class="events"></ol>
+        </section>
+      </main>
+
+      <p id="toast" class="toast" role="status" aria-live="polite" hidden></p>
+    </div>
+
+    <script src="/admin-model.js" type="module"></script>
+    <script src="/admin.js" type="module"></script>
+  </body>
+</html>

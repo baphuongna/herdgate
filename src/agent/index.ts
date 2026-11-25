@@ -45,9 +45,16 @@ export class HerdGateAgent {
     });
   }
   #stopPromiseCatch: (e: Error) => void = () => {};
+  #unpaired = false;
+
+  /** True once the gate said the room token no longer exists; no more dials after that. */
+  get unpaired(): boolean {
+    return this.#unpaired;
+  }
 
   start(): void {
     this.#stop = false;
+    this.#unpaired = false;
     this.#connect();
   }
 
@@ -135,8 +142,15 @@ export class HerdGateAgent {
       }
     });
     ws.on("error", (e) => this.#log(`ws error: ${e.message}`));
-    ws.on("close", () => {
+    ws.on("close", (code: number, reason: Buffer) => {
       if (this.#stop) return;
+      // The gate removed this room: the token is gone for good. Redialing it would only
+      // pile failed hellos onto this network's address (five of them block it for a minute).
+      if (code === 4001 && reason.toString() === "unknown room token") {
+        this.#unpaired = true;
+        this.#log("cloud refused the room token: this host is no longer paired — run `herdgate pair` again");
+        return;
+      }
       const min = this.#o.backoff?.minMs ?? 1_000;
       const max = this.#o.backoff?.maxMs ?? 30_000;
       const wait = Math.min(max, min * 2 ** this.#attempt) + Math.random() * 500;

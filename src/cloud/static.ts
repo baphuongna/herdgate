@@ -50,6 +50,9 @@ export interface StaticOptions {
   root: string;
   /** Served for `/` and for a directory-looking path. Default `index.html`. */
   index?: string;
+  /** Pretty URLs → real files, e.g. `{ "/admin": "/admin.html" }`. The target goes through
+   *  the same checks as any request; an alias never widens what the root may serve. */
+  aliases?: Record<string, string>;
 }
 
 /**
@@ -66,6 +69,10 @@ export function resolveStatic(root: string, urlPath: string, o: StaticOptions = 
     return null; // malformed escape
   }
   if (decoded.includes("\0")) return null;
+  // An alias is a plain file name under the root (the admin page's pretty URL); it is
+  // looked up by the exact, already-decoded path and then checked like any other request.
+  const alias = o.aliases?.[decoded];
+  if (alias) decoded = alias.startsWith("/") ? alias : `/${alias}`;
 
   const index = o.index ?? "index.html";
   const wanted = decoded === "/" || decoded === "" ? `/${index}` : decoded;
@@ -126,9 +133,9 @@ export function sendStatic(res: ServerResponse, hit: StaticResult): void {
 }
 
 /** Convenience wrapper: serve `urlPath` or answer 404. Returns whether it answered. */
-export function serveStatic(res: ServerResponse, root: string | undefined, urlPath: string): boolean {
+export function serveStatic(res: ServerResponse, root: string | undefined, urlPath: string, o: Pick<StaticOptions, "aliases"> = {}): boolean {
   if (!root) return false;
-  const hit = resolveStatic(root, urlPath, { root });
+  const hit = resolveStatic(root, urlPath, { root, aliases: o.aliases });
   if (!hit) {
     res.writeHead(404, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
     res.end("not found");

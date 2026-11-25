@@ -72,6 +72,24 @@ export class AgentCodes {
     return out;
   }
 
+  /** What the owner's admin page lists: codes still waiting for a decision. */
+  pending(): { code: string; hostName: string; ageSec: number; expiresIn: number }[] {
+    this.#prune();
+    const now = this.#now();
+    return this.#entries
+      .filter((e) => !e.approved)
+      .map((e) => ({ code: e.code, hostName: e.hostName, ageSec: Math.max(0, Math.round((AGENT_CODE_TTL_MS - (e.expires - now)) / 1000)), expiresIn: Math.max(0, Math.round((e.expires - now) / 1000)) }));
+  }
+
+  /** The owner refuses a pending code; an approved one is already a room (404 there). */
+  deny(code: string): boolean {
+    this.#prune();
+    const e = this.#find(code);
+    if (!e || e.approved) return false;
+    this.#entries.splice(this.#entries.indexOf(e), 1);
+    return true;
+  }
+
   #find(code: string): Entry | undefined {
     const up = code.trim().toUpperCase();
     return this.#entries.find((e) => e.code === up);

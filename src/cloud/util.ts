@@ -29,6 +29,15 @@ export function randomId(prefix: string): string {
   return `${prefix}_${randomBytes(4).toString("hex")}`;
 }
 
+/** A display name an owner types (room or device): trimmed, 1–64 chars, and no
+ *  control/format characters — a zero-width mark must not let "phone" pass for "phone". */
+export function cleanName(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const name = v.trim();
+  if (!name || name.length > 64 || /[\p{C}]/u.test(name)) return null;
+  return name;
+}
+
 /** Reads a JSON object body with a size cap; `null` when not a small object. */
 export async function readJsonBody(req: import("node:http").IncomingMessage, maxBytes = 4096): Promise<Record<string, unknown> | null> {
   const chunks: Buffer[] = [];

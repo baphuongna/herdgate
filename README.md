@@ -26,6 +26,7 @@ Both remote connections are outbound; the cloud gateway binds loopback.
 | Herdr TUI | An existing Herdr TUI session over SSH/WSS | Connect and control it with an approved `act` device and its own SSH key |
 | Herdr Mobile (Core) | A real `herdr-core` runtime over SSH | Core terminals and the Core API, subject to the device scope |
 | Herdr Mobile (TUI adapter) | Existing Herdr TUI panes over SSH | Read-only snapshots, or opt-in Send, keys, Interrupt and native attach/resize for one approved `act` device; not the full Core API |
+| Admin page (`/admin`) | The gate's own HTTP API over HTTPS, owner token | Manage machines, devices, pairing codes and read the gate's event tail |
 
 The Gateway also supports bounded room-stream resume and opt-in VAPID push wake (off by default). Pairing, publisher updates and
 Mobile authorization are separate: changing the publisher release does not move a room or grant a new scope.
@@ -484,7 +485,24 @@ Verified live: real Herdr → publisher → cloud → **headless Chrome** signed
 
 Going public: [DEPLOY.md](DEPLOY.md) (cloudflared, on this machine).
 
-## Herdr skills for Pi
+## The admin page (the owner's console)
+
+`/admin` is a second page served by the same cloud (`src/web/admin.*`). The owner signs in with the
+account token — the same one the PWA keeps — and manages the gate itself rather than a machine:
+
+- **Overview** — gate version, uptime, SSH leg, push; counts; pairing codes waiting for approval;
+- **Machines** — rename; remove (cascades to its devices; the agent is told it is unpaired and stops redialing);
+- **Devices** — across every machine: scope, live legs, last seen; rename, withdraw `act` (the gate only
+  ever *lowers* a scope — `act` is the host's grant at pairing), revoke, SSH keys (fingerprints), push off;
+- **Pairing** — pending codes with approve/refuse, or approve a pasted code;
+- **Events** — the last 300 of the gate's own log lines (in memory; the journal stays the record of truth).
+
+The API behind it is the owner's alone: `/v1/admin/overview`, `/v1/admin/events`, `/v1/room/rename`,
+`/v1/room/remove`, `/v1/device/rename`, `/v1/device/scope`, `/v1/agent/deny`. The rules are pinned by
+`test/admin-api.test.ts` and `test/web-admin.test.ts`: the token rides in the `Authorization` header only,
+wire strings are rendered as text, there is exactly one `fetch` site, and the service worker never
+touches `/admin`. Spec: [docs/specs/2026-11-25-web-admin.md](docs/specs/2026-11-25-web-admin.md).
+
 
 The npm package bundles six skills: `herdr`, `herdr-advisor`, `herdr-committee`,
 `herdr-handoff`, `herdr-help` and `herdr-plugin` (sources: [`.agents/skills/`](.agents/skills)).

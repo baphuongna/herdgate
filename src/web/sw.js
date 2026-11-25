@@ -1,6 +1,11 @@
 // Service worker: cache the shell so the app opens without a network, and never cache
 // anything from `/v1/` (the API must always hit the cloud).
 //
+// Its business is the shell ONLY: the `/` navigation and the files in SHELL. Everything else on
+// this origin — the API, /healthz, the admin page (/admin, /admin.*) — is left to the browser, so
+// a deploy of the admin page is never held stale by this cache and an offline "/" never shows
+// some other page that happened to be navigated to.
+//
 // Bump VERSION when a shell file changes; old caches are dropped on activate.
 
 const VERSION = "herdgate-v18";
@@ -101,10 +106,12 @@ self.addEventListener("fetch", (event) => {
 
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return; // never touch another origin
-  if (url.pathname.startsWith("/v1/") || url.pathname === "/healthz") return; // API: always live
 
-  // Navigations: network first (a new deploy should win), cache as the fallback.
-  if (request.mode === "navigate") {
+  const isShellNavigation = request.mode === "navigate" && (url.pathname === "/" || url.pathname === "");
+  if (!isShellNavigation && !SHELL.includes(url.pathname)) return; // not the shell: straight to the network
+
+  // The shell navigation: network first (a new deploy should win), cache as the fallback.
+  if (isShellNavigation) {
     event.respondWith(
       fetch(request)
         .then((response) => {

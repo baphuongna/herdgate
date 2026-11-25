@@ -45,9 +45,12 @@ test("host key: a malformed mint is retried; only a key that parses reaches the 
     let calls = 0;
     const lines: string[] = [];
     const h = await startSshd(deps({ port: 0, keyPath, mintKey: () => (++calls === 1 ? BAD : realMint()) }, (l) => lines.push(l)));
-    assert.ok(h, "the sshd came up on the second mint");
+    assert.ok(h, "the sshd came up after retrying the malformed mint");
     try {
-      assert.equal(calls, 2, "the malformed mint was thrown away and a second one taken");
+      // The stand-in behind the mock is ssh2's real keygen, which carries the ~0.3% defect itself
+      // (seen live once in a full suite): a second or third malformed mint is legitimate, the loop's
+      // job is to keep going until a key parses — and never write one that does not.
+      assert.ok(calls >= 2 && calls <= 8, `the malformed mint was thrown away and another taken (${calls} mints)`);
       assert.ok(lines.some((l) => /malformed/.test(l)), `the retry is on the record: ${JSON.stringify(lines)}`);
       const saved = JSON.parse(readFileSync(keyPath, "utf8")) as Pair;
       assert.ok(parses(saved.private), "the persisted private key parses with ssh2's own parser");

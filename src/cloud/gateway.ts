@@ -37,6 +37,7 @@ import { parseAuthorizedKey, sshKeyFingerprint } from "./sshd.ts";
 import { type Account, type DeviceRecord, type RoomRecord, State } from "./stores.ts";
 import { pruneBudget, readJsonBody, randomId, sameSecret, sha256Hex } from "./util.ts";
 import { serveStatic } from "./static.ts";
+import { EventRing } from "./events.ts";
 import { startSshd, type SshHandle, type SshConfig } from "./sshd.ts";
 import { pushEndpoint, sendPush, encryptPayload, canPayload, type PushKeys } from "./push.ts";
 import { type VapidKeys } from "./vapid.ts";
@@ -117,8 +118,19 @@ export interface Cloud {
   close(): Promise<void>;
 }
 
+/** The admin page's pretty URL → its file (static.ts refuses to guess; it only serves real files). */
+const ADMIN_ALIASES = { "/admin": "/admin.html" };
+/** Log lines kept for the owner's event tail. Bounded; the journal stays the record of truth. */
+const EVENT_RING = 300;
+
 export function startCloud(cfg: CloudConfig): Promise<Cloud> {
-  const log = cfg.log ?? (() => {});
+  const events = new EventRing(EVENT_RING);
+  const startedAt = Date.now();
+  const log = (line: string): void => {
+    cfg.log?.(line);
+    events.push(line);
+  };
+  log(`gate started (v${BUILD_ID || "?"})`);
   const state = new State(cfg.accounts, cfg.statePath);
   const codes = new AgentCodes(Date.now, cfg.publicUrl ?? null, cfg.maxPendingCodes ?? 256);
   let sshd: SshHandle | null = null;
@@ -345,6 +357,74 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
   const pushRoomUpdate = (roomId: string): void => {
     const a = agentByRoom.get(roomId);
     if (a) send(a.ws, { t: "room.update", devices: deviceViews(roomId) });
+  };
+
+  /** Drop a device's live legs: its websocket(s) with `code`/`reason`, and every ssh
+   *  connection it holds. Keys and the record stay — only the sessions end. */
+  const kickDevice = (id: string, code: number, reason: string): void => {
+    for (const c of deviceConns) {
+      if (c.device?.id === id) {
+        deviceConns.delete(c);
+        try { c.ws.close(code, reason); } catch { /* already gone */ }
+      }
+    }
+    sshd?.revoke(id);
+  };
+
+  /** Everything the admin page shows, in one answer instead of a request per room. */
+  const overview = (account: Account): Record<string, unknown> => {
+    const web = new Set<string>();
+    for (const c of deviceConns) if (c.device) web.add(c.device.id);
+    const rooms = state.roomsOfAccount(account.id).map((r) => {
+      const devices = state.devicesOfRoom(r.id);
+      return {
+        id: r.id,
+        name: r.name,
+        created: r.created,
+        host: r.hostInfo ? { name: r.hostInfo.name, version: r.hostInfo.version } : null,
+        connected: agentByRoom.has(r.id),
+        devices: { total: devices.length, live: devices.filter((d) => web.has(d.id) || sshLive.has(d.id)).length },
+      };
+    });
+    const roomName = new Map(rooms.map((r) => [r.id, r.name] as const));
+    const devices = state.devices.filter((d) => d.accountId === account.id).map((d) => {
+      const legs = [...(web.has(d.id) ? ["web"] : []), ...(sshLive.has(d.id) ? ["ssh"] : [])];
+      return {
+        id: d.id,
+        name: d.name,
+        roomId: d.roomId,
+        roomName: roomName.get(d.roomId) ?? "",
+        scope: d.scope,
+        connected: legs.length > 0,
+        legs,
+        lastSeen: deviceSeen.get(d.id) ?? null,
+        keys: (d.sshKeys ?? []).length,
+        created: d.created,
+        push: !!d.push,
+        payload: canPayload(d.push),
+      };
+    });
+    const pending = codes.pending();
+    return {
+      gate: {
+        version: BUILD_ID,
+        startedAt: new Date(startedAt).toISOString(),
+        uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+        ssh: { enabled: !!sshd, publicPort: cfg.sshPublicPort ?? sshd?.port ?? cfg.ssh?.port ?? null },
+        push: !!cfg.push,
+        web: !!cfg.webRoot,
+      },
+      counts: {
+        rooms: rooms.length,
+        devices: devices.length,
+        agentsOnline: rooms.filter((r) => r.connected).length,
+        devicesLive: devices.filter((d) => d.connected).length,
+        pendingCodes: pending.length,
+      },
+      rooms,
+      devices,
+      pairing: { pending },
+    };
   };
 
   const pushPresence = (roomId: string, online: boolean): void => {
@@ -1036,13 +1116,7 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
         const gone = state.removeDevice(device.id);
         if (!gone) return json(res, 404, { error: "no such device" });
         deviceSeen.delete(device.id);
-        for (const c of deviceConns) {
-          if (c.device?.id === device.id) {
-            deviceConns.delete(c);
-            try { c.ws.close(4001, "revoked"); } catch { /* already gone */ }
-          }
-        }
-        sshd?.revoke(device.id);
+        kickDevice(device.id, 4001, "revoked");
         pushRoomUpdate(device.roomId);
         log(`device ${device.id} (${device.name}) revoked by ${account.name}`);
         return json(res, 200, { ok: true });
@@ -1091,10 +1165,130 @@ export function startCloud(cfg: CloudConfig): Promise<Cloud> {
       });
     }
 
+    // ---- The owner's admin page (src/web/admin.*): one aggregate, the event tail, and the
+    // lifecycle actions nothing else had — rename, remove a room, withdraw an act grant. ----
+    if (path === "/v1/admin/overview") {
+      if (blocked(clientKeyOf(req))) return json(res, 429, { error: "rate limited" });
+      if (req.method !== "GET") return json(res, 405, { error: "method not allowed" });
+      const account = accountByAuth(req);
+      if (!account) return json(res, 401, { error: "account token required" });
+      return json(res, 200, overview(account));
+    }
+    if (path === "/v1/admin/events") {
+      if (blocked(clientKeyOf(req))) return json(res, 429, { error: "rate limited" });
+      if (req.method !== "GET") return json(res, 405, { error: "method not allowed" });
+      if (!accountByAuth(req)) return json(res, 401, { error: "account token required" });
+      const after = new URL(req.url ?? "/", "http://x").searchParams.get("after");
+      const items = events.since(after === null ? undefined : Number(after));
+      return json(res, 200, { items, latest: items.length ? items[items.length - 1].seq : Number(after) || 0, capped: events.cap });
+    }
+
+    /** The four checks every owner write starts with; `null` once the answer is sent. */
+    const ownerWrite = (): Account | null => {
+      if (blocked(clientKeyOf(req))) {
+        json(res, 429, { error: "rate limited" });
+        return null;
+      }
+      if (req.method !== "POST") {
+        json(res, 405, { error: "method not allowed" });
+        return null;
+      }
+      const account = accountByAuth(req);
+      if (!account) {
+        json(res, 401, { error: "account token required" });
+        return null;
+      }
+      return account;
+    };
+    const roomOf = (body: Record<string, unknown> | null, account: Account): RoomRecord | null => {
+      const id = typeof body?.room === "string" ? body.room : "";
+      const room = id ? state.rooms.find((r) => r.id === id) : null;
+      return room && room.accountId === account.id ? room : null;
+    };
+    const deviceOf = (body: Record<string, unknown> | null, account: Account): DeviceRecord | null => {
+      const id = typeof body?.device === "string" ? body.device : "";
+      const device = id ? state.deviceById(id) : null;
+      return device && device.accountId === account.id ? device : null;
+    };
+
+    if (path === "/v1/agent/deny") {
+      const account = ownerWrite();
+      if (!account) return;
+      return void readJsonBody(req).then((body) => {
+        const code = typeof body?.code === "string" ? body.code.trim().toUpperCase() : "";
+        if (!code || !codes.deny(code)) return json(res, 404, { error: "no such pending code" });
+        log(`pairing code ${code} denied by ${account.name}`);
+        return json(res, 200, { ok: true });
+      });
+    }
+    if (path === "/v1/room/rename") {
+      const account = ownerWrite();
+      if (!account) return;
+      return void readJsonBody(req).then((body) => {
+        const room = roomOf(body, account);
+        if (!room) return json(res, 404, { error: "no such room" });
+        if (!state.setRoomName(room.id, body?.name)) return json(res, 400, { error: "name must be 1-64 characters without control characters" });
+        log(`room ${room.id} renamed to "${room.name}" by ${account.name}`);
+        return json(res, 200, { ok: true, name: room.name });
+      });
+    }
+    if (path === "/v1/room/remove") {
+      const account = ownerWrite();
+      if (!account) return;
+      return void readJsonBody(req).then((body) => {
+        const room = roomOf(body, account);
+        if (!room) return json(res, 404, { error: "no such room" });
+        const gone = state.removeRoom(room.id)!;
+        for (const d of gone.devices) {
+          deviceSeen.delete(d.id);
+          kickDevice(d.id, 4001, "revoked");
+        }
+        const agent = agentByRoom.get(room.id);
+        if (agent) {
+          agentByRoom.delete(room.id);
+          cancelPairs(agent.ws, "host", "room removed");
+          // The exact pair the agent treats as "unpaired": it stops redialing (F3b).
+          try { agent.ws.close(4001, "unknown room token"); } catch { /* already gone */ }
+        }
+        streams.delete(room.id);
+        log(`room ${room.id} (${gone.room.name}) removed by ${account.name} with ${gone.devices.length} device(s)`);
+        return json(res, 200, { ok: true, devicesRemoved: gone.devices.length });
+      });
+    }
+    if (path === "/v1/device/rename") {
+      const account = ownerWrite();
+      if (!account) return;
+      return void readJsonBody(req).then((body) => {
+        const device = deviceOf(body, account);
+        if (!device) return json(res, 404, { error: "no such device" });
+        if (!state.setDeviceName(device.id, body?.name)) return json(res, 400, { error: "name must be 1-64 characters without control characters" });
+        log(`device ${device.id} renamed to "${device.name}" by ${account.name}`);
+        return json(res, 200, { ok: true, name: device.name });
+      });
+    }
+    if (path === "/v1/device/scope") {
+      const account = ownerWrite();
+      if (!account) return;
+      return void readJsonBody(req).then((body) => {
+        const device = deviceOf(body, account);
+        if (!device) return json(res, 404, { error: "no such device" });
+        if (body?.scope === "act") return json(res, 422, { error: "act is granted by the host at pairing; the gate only withdraws it" });
+        if (body?.scope !== "read") return json(res, 400, { error: "scope must be read" });
+        if (device.scope !== "read") {
+          state.setDeviceScope(device.id, "read");
+          // Live legs authenticated as act must not carry on: they re-attach with the new scope.
+          kickDevice(device.id, 4003, "scope changed");
+          pushRoomUpdate(device.roomId);
+          log(`device ${device.id} (${device.name}) withdrawn to read by ${account.name}`);
+        }
+        return json(res, 200, { ok: true, scope: device.scope });
+      });
+    }
+
     // The PWA, same-origin with the WS legs. Only GET/HEAD, and only after the API
     // routes above, so `/v1/*` can never be shadowed by a file.
     if ((req.method === "GET" || req.method === "HEAD") && cfg.webRoot) {
-      return void serveStatic(res, cfg.webRoot, path);
+      return void serveStatic(res, cfg.webRoot, path, { aliases: ADMIN_ALIASES });
     }
 
     res.writeHead(404);

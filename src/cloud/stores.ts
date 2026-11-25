@@ -10,7 +10,7 @@
 import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { Scope } from "../protocol/envelope.ts";
-import { randomId, randomToken, sameSecret, sha256Hex } from "./util.ts";
+import { randomId, randomToken, sameSecret, sha256Hex, cleanName } from "./util.ts";
 
 export interface Account {
   id: string;
@@ -219,6 +219,55 @@ export class State {
 
   accountById(id: string): Account | null {
     return this.accounts.find((a) => a.id === id) ?? null;
+  }
+
+  /** The owner renames a room (the pairing name is usually a hostname). */
+  setRoomName(id: string, name: unknown): boolean {
+    const r = this.rooms.find((x) => x.id === id);
+    const clean = cleanName(name);
+    if (!r || !clean) return false;
+    if (r.name === clean) return true;
+    r.name = clean;
+    this.#save();
+    return true;
+  }
+
+  setDeviceName(id: string, name: unknown): boolean {
+    const d = this.deviceById(id);
+    const clean = cleanName(name);
+    if (!d || !clean) return false;
+    if (d.name === clean) return true;
+    d.name = clean;
+    this.#save();
+    return true;
+  }
+
+  /** Scope only ever goes DOWN here: `act` is the host's grant at pairing, and the
+   *  owner withdrawing it is the one change the gate may make on its own. */
+  setDeviceScope(id: string, scope: Scope): "ok" | "missing" | "upgrade" {
+    const d = this.deviceById(id);
+    if (!d) return "missing";
+    if (scope === "act" && d.scope !== "act") return "upgrade";
+    if (d.scope !== scope) {
+      d.scope = scope;
+      this.#save();
+    }
+    return "ok";
+  }
+
+  /** Remove a room together with every device on it; the caller kicks their live
+   *  sockets. The room's token hash goes with it, so its agent can never re-hello. */
+  removeRoom(id: string): { room: RoomRecord; devices: DeviceRecord[] } | null {
+    const i = this.rooms.findIndex((r) => r.id === id);
+    if (i < 0) return null;
+    const [room] = this.rooms.splice(i, 1);
+    const devices = this.devices.filter((d) => d.roomId === id);
+    for (const d of devices) {
+      const j = this.devices.indexOf(d);
+      if (j >= 0) this.devices.splice(j, 1);
+    }
+    this.#save();
+    return { room, devices };
   }
 
   /** Mints the device and its one-time secret (returned plaintext, stored hashed). */

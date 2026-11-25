@@ -114,6 +114,15 @@ test('release set contains a clean compiled Cloud that serves the PWA and preser
     assert.equal((await request(base, '/healthz', { headers: { Host: 'other.fixture.invalid' } })).status, 421);
     assert.equal(await (await request(base, '/healthz')).text(), 'ok');
     assert.match(await (await request(base, '/')).text(), /id="signin"/);
+    // The owner's console ships with the release set and answers under its pretty URL.
+    for (const file of ['admin.html', 'admin.js', 'admin.css', 'admin-model.js']) {
+      assert.ok(cloudFiles.includes(`${cloudName}/runtime/web/${file}`), `the release set carries ${file}`);
+    }
+    const admin = await request(base, '/admin');
+    assert.equal(admin.status, 200, '/admin is the console');
+    assert.match(await admin.text(), /id="signin"/);
+    for (const file of ['/admin.js', '/admin-model.js', '/admin.css']) assert.equal((await request(base, file)).status, 200, `${file} is served`);
+    assert.equal((await request(base, '/v1/admin/overview')).status, 401, 'the admin API is the owner\'s alone');
     assert.ok(Buffer.from(await (await request(base, '/herdgate-host.zip')).arrayBuffer()).equals(readFileSync(join(out, hostZip))));
     assert.equal((await request(base, '/owner-token')).status, 404);
     assert.deepEqual((await hello(base)).agents, []);

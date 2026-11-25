@@ -1,0 +1,516 @@
+/* herdgate admin (/admin) — the owner's console. Self-contained on purpose: the PWA's app.css
+   is the phone app's layout, this is a desktop console that also has to work on a phone.
+   Same palette as app.css; no inline style anywhere (CSP: style-src 'self'). */
+
+:root {
+  --bg: #11131a;
+  --surface: #181b24;
+  --raised: #1f2330;
+  --line: #262a36;
+  --fg: #e7e9ee;
+  --muted: #9aa1b1;
+  --dim: #6b7285;
+  --accent: #7aa2f7;
+  --good: #6fcf97;
+  --warn: #e0af68;
+  --bad: #f7768e;
+  --radius: 10px;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --raised: #f0f2f6;
+    --line: #e2e5ea;
+    --fg: #16181d;
+    --muted: #5b6472;
+    --dim: #858d9b;
+    --accent: #2f6fdd;
+    --good: #12805c;
+    --warn: #9a6700;
+    --bad: #c0304a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+}
+
+h1,
+h2 {
+  margin: 0 0 8px;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+h2 {
+  font-size: 14px;
+  color: var(--muted);
+  text-transform: none;
+  letter-spacing: 0.01em;
+}
+
+p {
+  margin: 8px 0;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.small {
+  font-size: 12px;
+}
+
+.dim {
+  color: var(--dim);
+}
+
+.error {
+  color: var(--bad);
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.spacer {
+  flex: 1;
+}
+
+/* ---- sign in ---- */
+#signin {
+  max-width: 420px;
+  margin: 12vh auto 0;
+  padding: 24px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+/* ---- frame ---- */
+#app {
+  display: grid;
+  grid-template-columns: 170px 1fr;
+  grid-template-rows: auto 1fr;
+  grid-template-areas:
+    "top top"
+    "nav main";
+  min-height: 100vh;
+}
+
+#top {
+  grid-area: top;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+#top strong {
+  font-size: 15px;
+}
+
+#nav {
+  grid-area: nav;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 8px;
+  border-right: 1px solid var(--line);
+  background: var(--surface);
+  position: sticky;
+  top: 45px;
+  align-self: start;
+}
+
+#nav button {
+  text-align: left;
+  background: none;
+  border: 0;
+  color: var(--muted);
+  font: inherit;
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+#nav button:hover {
+  color: var(--fg);
+  background: var(--raised);
+}
+
+#nav button.on {
+  color: var(--fg);
+  background: var(--raised);
+  font-weight: 600;
+}
+
+#main {
+  grid-area: main;
+  padding: 16px;
+  max-width: 1280px;
+  min-width: 0;
+}
+
+/* ---- cards, tables ---- */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 12px;
+  min-width: 0;
+}
+
+.cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.cols .card {
+  margin-bottom: 12px;
+}
+
+.stat .value {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.stat .label {
+  color: var(--muted);
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  margin: 0;
+}
+
+.facts dt {
+  color: var(--muted);
+}
+
+.facts dd {
+  margin: 0;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+input[type="search"],
+input[type="password"],
+input[type="text"] {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font: inherit;
+  min-width: 240px;
+}
+
+input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+button {
+  background: var(--raised);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+button:hover {
+  border-color: var(--accent);
+}
+
+button.danger {
+  color: var(--bad);
+}
+
+button.warn {
+  color: var(--warn);
+}
+
+button.link {
+  background: none;
+  border: 0;
+  color: var(--accent);
+  padding: 4px 6px;
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+
+form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+form label {
+  width: 100%;
+  color: var(--muted);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+th {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+tr:last-child td {
+  border-bottom: 0;
+}
+
+td.actions {
+  white-space: nowrap;
+  text-align: right;
+}
+
+td.actions button {
+  padding: 3px 8px;
+  font-size: 12.5px;
+}
+
+.sub {
+  display: block;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.pill {
+  font-size: 11.5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.pill.good {
+  color: var(--good);
+}
+
+.pill.warn {
+  color: var(--warn);
+}
+
+.pill.bad {
+  color: var(--bad);
+}
+
+.pill.act {
+  color: var(--warn);
+  border: 1px solid var(--warn);
+}
+
+.pill.read {
+  color: var(--muted);
+  border: 1px solid var(--line);
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.row .name {
+  font-weight: 600;
+}
+
+.row .grow {
+  flex: 1;
+  min-width: 160px;
+}
+
+.keys {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.keys li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 4px 0;
+}
+
+/* ---- events ---- */
+.events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  max-height: calc(100vh - 170px);
+  overflow: auto;
+}
+
+.events li {
+  display: grid;
+  grid-template-columns: 70px 84px 1fr;
+  gap: 10px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--line);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.events li:last-child {
+  border-bottom: 0;
+}
+
+.events .t {
+  color: var(--dim);
+}
+
+.events .k {
+  color: var(--muted);
+}
+
+.events li.mine .k {
+  color: var(--accent);
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  max-width: min(92vw, 640px);
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--raised);
+  border: 1px solid var(--line);
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.35);
+  overflow-wrap: anywhere;
+}
+
+/* ---- narrow: the nav becomes a strip ---- */
+@media (max-width: 760px) {
+  #app {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "top"
+      "nav"
+      "main";
+  }
+
+  #top {
+    flex-wrap: wrap;
+  }
+
+  #nav {
+    flex-direction: row;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    position: sticky;
+    top: 0;
+  }
+
+  #nav button {
+    white-space: nowrap;
+  }
+
+  #main {
+    padding: 12px;
+  }
+
+  input[type="search"],
+  form input {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .events li {
+    grid-template-columns: 62px 1fr;
+  }
+
+  .events .k {
+    display: none;
+  }
+}
