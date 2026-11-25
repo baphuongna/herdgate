@@ -22,6 +22,7 @@ const session = {
 };
 const screen = { paneId: "p/1", runtimeGeneration: "gen-1", sequence: 4, cols: 80, rows: 24, ansi: "hello", capturedAt: "2026-01-01T00:00:00.000Z", truncated: false };
 const capabilities = { mode: "mirror", scope: "read", transport: "rpc", features: { session: true, paneScreen: true, act: false, attach: false, chat: false, inbox: false, fileViewer: false } };
+type RecordedRequestInit = RequestInit & { cache?: "default" | "force-cache" | "no-cache" | "no-store" | "only-if-cached" | "reload" };
 
 function withoutOvisSnapshot(snapshot: ConsoleSessionSnapshot) {
   const { ovisSnapshot: _ovisSnapshot, ...projected } = snapshot;
@@ -29,7 +30,7 @@ function withoutOvisSnapshot(snapshot: ConsoleSessionSnapshot) {
 }
 
 test("redeems a code in the body and keeps the returned bearer only in this API client", async () => {
-  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const calls: Array<{ url: string; init: RecordedRequestInit }> = [];
   const client = new ConsoleApiClient(async (input, init = {}) => {
     calls.push({ url: String(input), init });
     if (String(input).endsWith("/auth/redeem")) return Response.json({ token, expiresInMs: 1_800_000, maxAgeMs: 28_800_000 });
@@ -59,7 +60,7 @@ test("matches runtime API contract from a9a260f for redeem, capabilities, sessio
     focused_pane_id: "p/runtime", focused_tab_id: "t-runtime", focused_workspace_id: "w-runtime", layouts: [], agents: [],
   };
   const rawScreen = { runtimeGeneration: "runtime-gen", sequence: 1, paneId: "p/runtime", cols: null, rows: null, ansi: "runtime ANSI", capturedAt: "2026-11-25T00:00:00.000Z", truncated: false };
-  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const calls: Array<{ url: string; init: RecordedRequestInit }> = [];
   const client = new ConsoleApiClient(async (input, init = {}) => {
     const url = String(input);
     calls.push({ url, init });
@@ -82,7 +83,11 @@ test("matches runtime API contract from a9a260f for redeem, capabilities, sessio
     panes: [{ id: "p/runtime", tabId: "t-runtime", workspaceId: "w-runtime", title: "Runtime shell" }],
     focused: { workspaceId: "w-runtime", tabId: "t-runtime", paneId: "p/runtime" },
   });
-  assert.equal(adapted.ovisSnapshot?.panes[0]?.pane_id, "p/runtime");
+  const ovisPanes = adapted.ovisSnapshot?.panes;
+  assert.ok(Array.isArray(ovisPanes));
+  const firstOvisPane = ovisPanes[0];
+  assert.ok(typeof firstOvisPane === "object" && firstOvisPane !== null && "pane_id" in firstOvisPane);
+  assert.equal(firstOvisPane.pane_id, "p/runtime");
   assert.deepEqual(await client.fetchScreen("p/runtime", "runtime-gen"), rawScreen);
   assert.equal(calls.find((call) => call.url.endsWith("/pane/p%2Fruntime/screen"))?.url, "/api/console/v1/pane/p%2Fruntime/screen");
   assert.equal(new Headers(calls.find((call) => call.url.endsWith("/screen"))?.init.headers).get("x-herdgate-runtime-generation"), "runtime-gen");
@@ -92,7 +97,7 @@ test("matches runtime API contract from a9a260f for redeem, capabilities, sessio
 });
 
 test("maps only the typed read routes and sends expected generation for an encoded pane ID", async () => {
-  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const calls: Array<{ url: string; init: RecordedRequestInit }> = [];
   const client = new ConsoleApiClient(async (input, init = {}) => {
     calls.push({ url: String(input), init });
     if (String(input).includes("/capabilities")) return Response.json(capabilities);

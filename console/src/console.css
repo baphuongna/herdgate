@@ -70,7 +70,8 @@ footer a { color: #9ecbff; }
 .ovis-l1-session .terminal-surface { flex: 1; min-height: 0; max-height: none; border: 0; border-radius: 0; }
 .ovis-l1-session .tab-strip-menu, .ovis-l1-session .pane-frame-menu { display: none !important; }
 .ovis-l1-readonly-note { flex: none; margin: 0; padding: .4rem .7rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: .72rem; }
-.ovis-pane-not-selected { display: grid; height: 100%; place-items: center; color: var(--text-dim); font-size: .85rem; }
+.ovis-pane-not-selected { display: grid; height: 100%; place-items: center; color: var(--text-dim); font-size: .85rem; cursor: pointer; }
+.ovis-pane-not-selected:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; color: var(--text); }
 
 @media (max-width: 760px) {
   .layout { grid-template-columns: 1fr; }

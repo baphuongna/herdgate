@@ -1,4 +1,13 @@
-type Fetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+type FetchInput = Parameters<typeof fetch>[0];
+type FetchInit = NonNullable<Parameters<typeof fetch>[1]> & {
+  cache?: "default" | "force-cache" | "no-cache" | "no-store" | "only-if-cached" | "reload";
+};
+type Fetcher = (input: FetchInput, init?: FetchInit) => Promise<Response>;
+type NetworkGlobals = typeof globalThis & {
+  location: { origin: string };
+  WebSocket: typeof WebSocket;
+  EventSource: typeof EventSource;
+};
 
 const consoleRoutes = new Map<string, ReadonlySet<string>>([
   ["/api/console/v1/auth/redeem", new Set(["POST"])],
@@ -36,17 +45,18 @@ export function denyNetworkConstructor<T extends Function>(constructor: T, name:
 
 /** Install before mounting vendor components; restore is useful for controlled tests/teardown. */
 export function installConsoleNetworkGuard(): () => void {
-  const originalFetch = globalThis.fetch;
-  const originalWebSocket = globalThis.WebSocket;
-  const originalEventSource = globalThis.EventSource;
-  globalThis.fetch = createConsoleFetchGuard(originalFetch, globalThis.location.origin);
-  globalThis.WebSocket = denyNetworkConstructor(originalWebSocket, "WebSocket");
+  const globals = globalThis as NetworkGlobals;
+  const originalFetch = globals.fetch;
+  const originalWebSocket = globals.WebSocket;
+  const originalEventSource = globals.EventSource;
+  globals.fetch = createConsoleFetchGuard(originalFetch, globals.location.origin);
+  globals.WebSocket = denyNetworkConstructor(originalWebSocket, "WebSocket");
   if (typeof originalEventSource === "function") {
-    globalThis.EventSource = denyNetworkConstructor(originalEventSource, "EventSource");
+    globals.EventSource = denyNetworkConstructor(originalEventSource, "EventSource");
   }
   return () => {
-    globalThis.fetch = originalFetch;
-    globalThis.WebSocket = originalWebSocket;
-    if (typeof originalEventSource === "function") globalThis.EventSource = originalEventSource;
+    globals.fetch = originalFetch;
+    globals.WebSocket = originalWebSocket;
+    if (typeof originalEventSource === "function") globals.EventSource = originalEventSource;
   };
 }

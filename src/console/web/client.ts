@@ -19,7 +19,11 @@ export class ConsoleApiError extends Error {
 }
 
 const API = "/api/console/v1";
-type Fetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+type FetchInput = Parameters<typeof fetch>[0];
+type ConsoleRequestInit = NonNullable<Parameters<typeof fetch>[1]> & {
+  cache?: "default" | "force-cache" | "no-cache" | "no-store" | "only-if-cached" | "reload";
+};
+type Fetcher = (input: FetchInput, init?: ConsoleRequestInit) => Promise<Response>;
 
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -27,6 +31,17 @@ function object(value: unknown): value is Record<string, unknown> {
 
 function hasStrings(value: unknown, keys: readonly string[]): boolean {
   return object(value) && keys.every((key) => typeof value[key] === "string");
+}
+
+function arrayField(value: Record<string, unknown>, key: string): readonly unknown[] | null {
+  const field = value[key];
+  return Array.isArray(field) ? field as readonly unknown[] : null;
+}
+
+function integerField(value: unknown, key: string): number | null {
+  if (!object(value)) return null;
+  const field = value[key];
+  return Number.isSafeInteger(field) ? Number(field) : null;
 }
 
 function stringField(value: unknown, key: string): string | null {
@@ -37,22 +52,25 @@ function stringField(value: unknown, key: string): string | null {
 function adaptRuntimeSession(payload: unknown): ConsoleSessionSnapshot | null {
   if (!object(payload) || typeof payload.runtimeGeneration !== "string" || !payload.runtimeGeneration || !object(payload.snapshot)) return null;
   const raw = payload.snapshot;
-  if (!Array.isArray(raw.workspaces) || !Array.isArray(raw.tabs) || !Array.isArray(raw.panes)) return null;
+  const rawWorkspaces = arrayField(raw, "workspaces");
+  const rawTabs = arrayField(raw, "tabs");
+  const rawPanes = arrayField(raw, "panes");
+  if (!rawWorkspaces || !rawTabs || !rawPanes) return null;
   const workspaces: ConsoleSessionSnapshot["workspaces"][number][] = [];
-  for (const item of raw.workspaces) {
+  for (const item of rawWorkspaces) {
     const id = stringField(item, "workspace_id");
     if (!id) return null;
     workspaces.push({ id, label: stringField(item, "label") ?? id });
   }
   const tabs: ConsoleSessionSnapshot["tabs"][number][] = [];
-  for (const [index, item] of raw.tabs.entries()) {
+  for (const [index, item] of rawTabs.entries()) {
     const id = stringField(item, "tab_id");
     const workspaceId = stringField(item, "workspace_id");
     if (!id || !workspaceId) return null;
     tabs.push({ id, workspaceId, label: stringField(item, "label") ?? `Tab ${index + 1}` });
   }
   const panes: ConsoleSessionSnapshot["panes"][number][] = [];
-  for (const item of raw.panes) {
+  for (const item of rawPanes) {
     const id = stringField(item, "pane_id");
     const tabId = stringField(item, "tab_id");
     const workspaceId = stringField(item, "workspace_id");
@@ -61,7 +79,7 @@ function adaptRuntimeSession(payload: unknown): ConsoleSessionSnapshot | null {
       ?? stringField(item, "terminal_title") ?? stringField(item, "label") ?? id });
   }
   const focusedPaneId = stringField(raw, "focused_pane_id")
-    ?? (Array.isArray(raw.panes) ? stringField(raw.panes.find((item) => object(item) && item.focused === true), "pane_id") : null);
+    ?? stringField(rawPanes.find((item) => object(item) && item.focused === true), "pane_id");
   const focusedTabId = stringField(raw, "focused_tab_id") ?? (focusedPaneId ? panes.find((pane) => pane.id === focusedPaneId)?.tabId ?? null : null);
   const focusedWorkspaceId = stringField(raw, "focused_workspace_id")
     ?? (focusedPaneId ? panes.find((pane) => pane.id === focusedPaneId)?.workspaceId ?? null : null);
@@ -78,33 +96,33 @@ function adaptRuntimeSession(payload: unknown): ConsoleSessionSnapshot | null {
     version: stringField(raw, "version") ?? "unknown",
     protocol: Number.isSafeInteger(raw.protocol) ? raw.protocol : 0,
     workspaces: workspaces.map((workspace, index) => {
-      const source = raw.workspaces.find((item) => object(item) && item.workspace_id === workspace.id);
+      const source = rawWorkspaces.find((item): item is Record<string, unknown> => object(item) && item.workspace_id === workspace.id);
       const workspaceTabs = tabsByWorkspace.get(workspace.id) ?? [];
       return { ...(object(source) ? source : {}), workspace_id: workspace.id, label: workspace.label,
         active_tab_id: stringField(source, "active_tab_id") ?? (workspace.id === focusedWorkspaceId ? focusedTabId : null) ?? workspaceTabs[0] ?? "",
         agent_status: stringField(source, "agent_status") ?? "unknown", focused: source?.focused === true || workspace.id === focusedWorkspaceId,
-        number: Number.isSafeInteger(source?.number) ? source.number : index + 1,
-        pane_count: Number.isSafeInteger(source?.pane_count) ? source.pane_count : tabCounts.get(workspace.id) ?? 0,
-        tab_count: Number.isSafeInteger(source?.tab_count) ? source.tab_count : workspaceTabs.length };
+        number: integerField(source, "number") ?? index + 1,
+        pane_count: integerField(source, "pane_count") ?? tabCounts.get(workspace.id) ?? 0,
+        tab_count: integerField(source, "tab_count") ?? workspaceTabs.length };
     }),
     tabs: tabs.map((tab, index) => {
-      const source = raw.tabs.find((item) => object(item) && item.tab_id === tab.id);
+      const source = rawTabs.find((item): item is Record<string, unknown> => object(item) && item.tab_id === tab.id);
       return { ...(object(source) ? source : {}), tab_id: tab.id, workspace_id: tab.workspaceId, label: tab.label,
         agent_status: stringField(source, "agent_status") ?? "unknown", focused: source?.focused === true || tab.id === focusedTabId,
-        number: Number.isSafeInteger(source?.number) ? source.number : index + 1,
-        pane_count: Number.isSafeInteger(source?.pane_count) ? source.pane_count : paneCounts.get(tab.id) ?? 0 };
+        number: integerField(source, "number") ?? index + 1,
+        pane_count: integerField(source, "pane_count") ?? paneCounts.get(tab.id) ?? 0 };
     }),
     panes: panes.map((pane) => {
-      const source = raw.panes.find((item) => object(item) && item.pane_id === pane.id);
+      const source = rawPanes.find((item): item is Record<string, unknown> => object(item) && item.pane_id === pane.id);
       return { ...(object(source) ? source : {}), pane_id: pane.id, tab_id: pane.tabId, workspace_id: pane.workspaceId,
         title: stringField(source, "title") ?? pane.title, terminal_id: stringField(source, "terminal_id") ?? pane.id,
         terminal_title: stringField(source, "terminal_title") ?? pane.title, focused: source?.focused === true || pane.id === focusedPaneId,
         agent_status: stringField(source, "agent_status") ?? "unknown",
-        revision: Number.isSafeInteger(source?.revision) ? source.revision : 0 };
+        revision: integerField(source, "revision") ?? 0 };
     }),
-    layouts: Array.isArray(raw.layouts) ? raw.layouts : [],
-    agents: Array.isArray(raw.agents) ? raw.agents : [],
-  } as unknown as NonNullable<ConsoleSessionSnapshot["ovisSnapshot"]>;
+    layouts: arrayField(raw, "layouts") ?? [],
+    agents: arrayField(raw, "agents") ?? [],
+  };
   return { runtime: "available", runtimeGeneration: payload.runtimeGeneration, workspaces, tabs, panes,
     focused: { workspaceId: focusedWorkspaceId, tabId: focusedTabId, paneId: focusedPaneId }, ovisSnapshot };
 }

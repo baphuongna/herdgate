@@ -69,7 +69,11 @@ test("local HTTP fixture exercises auth, typed session and pane mirror routes wi
     assert.deepEqual(received.workspaces, expectedSnapshot.workspaces);
     assert.deepEqual(received.tabs, expectedSnapshot.tabs);
     assert.deepEqual(received.panes, expectedSnapshot.panes);
-    assert.equal(received.ovisSnapshot?.panes[0]?.pane_id, paneId);
+    const ovisPanes = received.ovisSnapshot?.panes;
+    assert.ok(Array.isArray(ovisPanes));
+    const firstOvisPane = ovisPanes[0];
+    assert.ok(typeof firstOvisPane === "object" && firstOvisPane !== null && "pane_id" in firstOvisPane);
+    assert.equal(firstOvisPane.pane_id, paneId);
     assert.deepEqual(await client.fetchScreen(paneId, generation), screen);
     const writeAttempt = await fetch(new URL(`/api/console/v1/pane/${encodeURIComponent(paneId)}/act`, origin), {
       method: "POST", headers: { authorization: "Bearer fixture-tab-token", "content-type": "application/json" }, body: JSON.stringify({ key: "x" }),

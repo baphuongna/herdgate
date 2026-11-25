@@ -7,7 +7,7 @@ import "../vendor/ovis/src/styles.css";
 import "@xterm/xterm/css/xterm.css";
 import "./console.css";
 
-installConsoleStorageGuard();
+installConsoleStorageGuard(window);
 installConsoleNetworkGuard();
 
 const element = document.getElementById("root");
