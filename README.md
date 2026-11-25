@@ -27,6 +27,7 @@ Both remote connections are outbound; the cloud gateway binds loopback.
 | Herdr Mobile (Core) | A real `herdr-core` runtime over SSH | Core terminals and the Core API, subject to the device scope |
 | Herdr Mobile (TUI adapter) | Existing Herdr TUI panes over SSH | Read-only snapshots, or opt-in Send, keys, Interrupt and native attach/resize for one approved `act` device; not the full Core API |
 | Admin page (`/admin`) | The gate's own HTTP API over HTTPS, owner token | Manage machines, devices, pairing codes and read the gate's event tail |
+| Local Web Console | `127.0.0.1` on the machine that runs Herdr (read-only L1) | A second, browser-only way into the same Herdr session: one-time local login code, mirror pane screens with real geometry, no terminal input |
 
 The Gateway also supports bounded room-stream resume and opt-in VAPID push wake (off by default). Pairing, publisher updates and
 Mobile authorization are separate: changing the publisher release does not move a room or grant a new scope.
@@ -122,6 +123,27 @@ HERDGATE_URL=https://herd.example.com HERDGATE_ROOM_TOKEN=… npm run host
 ```
 
 Devices pair into the room and ask for `{op:"view"}`; the host answers with the current Herdr metadata.
+
+## The local Web Console (read-only, loopback)
+
+On any machine that runs Herdr, `herdgate console start` serves a small local web app on `127.0.0.1` only:
+
+```sh
+node bin/herdgate.mjs console start        # bind 127.0.0.1, OS-assigned port
+node bin/herdgate.mjs console login        # one-time code, 120 s TTL
+node bin/herdgate.mjs console open         # open the browser
+node bin/herdgate.mjs console stop
+```
+
+It is a second door into the *same* Herdr session, not a replacement for the Herdr TUI or the mobile app:
+
+- **Read-only (L1):** session snapshot and pane mirrors (ANSI, colors, geometry from the Herdr layouts). No input, no resize, no layout changes, no `act`.
+- **Local auth:** one-time code printed by `console login`; the session token stays in tab memory only (no cookie, no storage, no service worker). Lock the tab and the token is gone.
+- **Fail-closed:** wrong/missing Host or Origin is refused; the static shell serves only the built manifest allowlist; a dead Herdr shows "Runtime unavailable" and hides stale mirrors.
+- **Lifecycle:** the service ends itself if its private state disappears, and `console stop` only claims "stopped" when the process is really gone.
+- Windows lifecycle stays intentionally blocked until it is verified on the target Herdr App.
+
+See `console/README.md` for the vendored-frontend build (offline, sandboxed) and `docs/specs/2026-11-25-local-web-console.md` for the full design. The npm tarball ships the built `console/dist`.
 
 ## The subagent fleet (receipts · wake · observers)
 
