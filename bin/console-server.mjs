@@ -77,6 +77,10 @@ async function main() {
       if (message.command === "issue-login") {
         try { socket.end(JSON.stringify({ ok: true, code: service.issueLoginCode() }) + "\n"); }
         catch (error) { socket.end(JSON.stringify({ ok: false, code: error?.code ?? "login_failed" }) + "\n"); }
+      } else if (message.command === "probe-runtime") {
+        void service.probeRuntime().then((runtime) => {
+          if (!socket.destroyed) socket.end(JSON.stringify({ ok: true, runtime }) + "\n");
+        });
       } else if (message.command === "stop") {
         socket.end('{"ok":true}\n');
         setImmediate(() => void shutdown());

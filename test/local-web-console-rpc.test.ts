@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import net from "node:net";
 import { once } from "node:events";
 import { test } from "node:test";
-import { createConsoleRpc } from "../bin/console-rpc.mjs";
+import { createConsoleRpc, derivePaneDimensions } from "../bin/console-rpc.mjs";
 
 const snapshot = { version: "0.9.5", protocol: 22, workspaces: [], tabs: [], panes: [{ pane_id: "w1:p1" }], layouts: [], agents: [] };
 
@@ -159,6 +159,41 @@ test("permission and connector failures reject without retry", async (t) => {
   await assert.rejects(createConsoleRpc({ connect: denied.connect }).snapshot(), /permission_denied/);
   assert.equal(calls, 1);
   await assert.rejects(createConsoleRpc({ connect: () => { throw new Error("EACCES"); } }).snapshot(), /connect failed/);
+});
+
+test("pane geometry derives cell dimensions from layout, zoom, and read values", () => {
+  const snapshot = {
+    panes: [
+      { pane_id: "w1:p1", tab_id: "w1:t1", scroll: { viewport_rows: 38 } },
+      { pane_id: "w1:p2", tab_id: "w1:t1", scroll: { viewport_rows: 38 } },
+      { pane_id: "w1:p3", tab_id: "w1:t2", scroll: { viewport_rows: 38 } },
+      { pane_id: "w1:p4", tab_id: "w1:t3", scroll: { viewport_rows: 40 } },
+      { pane_id: "w1:p5", tab_id: "w1:t4" },
+      { pane_id: "w1:p6", tab_id: "w1:t5", scroll: { viewport_rows: 37 } },
+    ],
+    layouts: [
+      { tab_id: "w1:t1", zoomed: false, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p1", panes: [
+        { pane_id: "w1:p1", focused: true, rect: { x: 0, y: 0, width: 60, height: 40 } },
+        { pane_id: "w1:p2", focused: false, rect: { x: 60, y: 0, width: 60, height: 40 } },
+      ] },
+      { tab_id: "w1:t2", zoomed: true, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p3", panes: [
+        { pane_id: "w1:p3", focused: true, rect: { x: 0, y: 0, width: 60, height: 40 } },
+      ] },
+      { tab_id: "w1:t3", zoomed: false, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p4", panes: [
+        { pane_id: "w1:p4", focused: true, rect: { x: 0, y: 0, width: 120, height: 40 } },
+      ] },
+      { tab_id: "w1:t5", zoomed: false, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p6", panes: [
+        { pane_id: "w1:p6", focused: true, rect: { x: 0, y: 0, width: 60, height: 40 } },
+      ] },
+    ],
+  };
+  assert.deepEqual(derivePaneDimensions(snapshot, "w1:p1"), { cols: 57, rows: 38 });
+  assert.deepEqual(derivePaneDimensions(snapshot, "w1:p2"), { cols: 57, rows: 38 });
+  assert.deepEqual(derivePaneDimensions(snapshot, "w1:p3"), { cols: 117, rows: 38 });
+  assert.deepEqual(derivePaneDimensions(snapshot, "w1:p4"), { cols: 119, rows: 40 });
+  assert.deepEqual(derivePaneDimensions(snapshot, "w1:p5"), { cols: null, rows: null }, "missing runtime geometry never guesses dimensions");
+  assert.deepEqual(derivePaneDimensions(snapshot, "w1:p6"), { cols: null, rows: 37 }, "unexpected layout/runtime mismatch leaves columns unknown");
+  assert.deepEqual(derivePaneDimensions(snapshot, "w1:p1", { cols: 91, rows: 29 }), { cols: 91, rows: 29 }, "runtime dimensions win over derived layout geometry");
 });
 
 test("unknown operation cannot be requested through the public client", () => {

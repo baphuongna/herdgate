@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { createConsoleRpc } from "../bin/console-rpc.mjs";
-import { createConsoleService } from "../bin/console-service.mjs";
+import { CONSOLE_CSP, createConsoleService } from "../bin/console-service.mjs";
 import { startFixtureRuntime } from "./fixtures/local-web-console-runtime/runtime.mjs";
 
 const assets = new URL("./fixtures/local-web-console-runtime/console/dist/", import.meta.url).pathname;
@@ -57,9 +57,22 @@ test("HTTP service serves manifest allowlist and authenticated read-only API on 
   assert.equal(shell.status, 200);
   assert.match(shell.headers.get("cache-control") ?? "", /no-store/);
   assert.equal(shell.headers.get("access-control-allow-origin"), null);
-  assert.match(shell.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
+  assert.equal(shell.headers.get("content-security-policy"), CONSOLE_CSP);
   assert.match(await shell.text(), /fixture-local-console|Fixture shell/);
   assert.equal((await fetch(`${h.origin}/assets/app.123abc.js`)).status, 200);
+  for (const path of ["/assets/index-D0ahG_z6.js", "/assets/JetBrainsMono-Bold-D4WEaHbo.woff2"]) {
+    const asset = await fetch(`${h.origin}${path}`);
+    assert.equal(asset.status, 200);
+    assert.equal(asset.headers.get("cache-control"), "public, max-age=31536000, immutable");
+  }
+  const unhashed = await fetch(`${h.origin}/assets/app.123abc.js`);
+  assert.equal(unhashed.headers.get("cache-control"), "no-store");
+  const license = await fetch(`${h.origin}/notices/LICENSE`);
+  assert.equal(license.status, 200);
+  assert.equal(license.headers.get("content-type"), "text/plain; charset=utf-8");
+  const thirdParty = await fetch(`${h.origin}/notices/THIRD_PARTY_NOTICES.md`);
+  assert.equal(thirdParty.status, 200);
+  assert.equal(thirdParty.headers.get("content-type"), "text/markdown; charset=utf-8");
   assert.equal((await fetch(`${h.origin}/not-in-manifest`)).status, 404);
   assert.equal((await fetch(`${h.origin}/../package.json`)).status, 404);
 
@@ -114,6 +127,37 @@ test("HTTP service serves manifest allowlist and authenticated read-only API on 
   assert.equal((await fetch(`${h.origin}/api/console/v1/session`, { headers: auth })).status, 401);
   assert.equal(h.logs.some((line) => line.includes(token) || line.includes(code) || line.includes("fixture screen")), false);
   assert.ok(h.runtime.calls.every((call) => ["session.snapshot", "pane.read"].includes(String(call.method))), "no write or arbitrary operation reaches runtime");
+});
+
+test("screen API includes cell geometry from the selected pane's layout", async (t) => {
+  const snapshot = {
+    ...fixtureSnapshot,
+    panes: [
+      { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", focused: true, scroll: { viewport_rows: 38 } },
+      { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", focused: false, scroll: { viewport_rows: 38 } },
+    ],
+    layouts: [{ workspace_id: "w1", tab_id: "w1:t1", zoomed: false, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p1", panes: [
+      { pane_id: "w1:p1", focused: true, rect: { x: 0, y: 0, width: 60, height: 40 } },
+      { pane_id: "w1:p2", focused: false, rect: { x: 60, y: 0, width: 60, height: 40 } },
+    ] }],
+  };
+  const service = createConsoleService({ rpc: {
+    snapshot: async () => snapshot,
+    readPane: async (paneId: string) => ({ pane_id: paneId, text: "screen", truncated: false }),
+  }, assetsDir: assets });
+  await service.start();
+  t.after(() => service.stop());
+  const { response: redeemed } = await login(service.origin, service);
+  const { token } = await redeemed.json() as { token: string };
+  const auth = { authorization: `Bearer ${token}` };
+  const session = await fetch(`${service.origin}/api/console/v1/session`, { headers: auth });
+  const { runtimeGeneration } = await session.json() as { runtimeGeneration: string };
+  for (const paneId of ["w1:p1", "w1:p2"]) {
+    const screen = await fetch(`${service.origin}/api/console/v1/pane/${encodeURIComponent(paneId)}/screen`, { headers: { ...auth, "x-herdgate-runtime-generation": runtimeGeneration } });
+    assert.equal(screen.status, 200);
+    const result = await screen.json() as { cols: number | null; rows: number | null };
+    assert.deepEqual({ cols: result.cols, rows: result.rows }, { cols: 57, rows: 38 });
+  }
 });
 
 test("redeem enforces origin, body bound, one-time code and TTL; viewer expires", async (t) => {

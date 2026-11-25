@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { realpathSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { derivePaneDimensions } from "./console-rpc.mjs";
 
 const API = "/api/console/v1";
 const MAX_API_BYTES = 256 * 1024;
@@ -15,8 +16,12 @@ const ALLOWED_MIME = new Set([
   "text/html; charset=utf-8", "text/css; charset=utf-8", "text/javascript; charset=utf-8",
   "application/javascript; charset=utf-8", "application/json; charset=utf-8", "image/svg+xml",
   "image/png", "image/jpeg", "image/webp", "image/gif", "font/woff2", "font/woff",
+  "text/plain; charset=utf-8", "text/markdown; charset=utf-8",
 ]);
-const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'none'; child-src 'none'; frame-src 'none'; manifest-src 'none'; form-action 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+// xterm 6's DOM renderer creates inline styles/style elements for ANSI colors and emphasis.
+// Allow inline CSS so the mirror retains terminal color, bold, and underline rendering.
+// Keep inline execution forbidden: scripts still load only from this same-origin manifest.
+export const CONSOLE_CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'none'; child-src 'none'; frame-src 'none'; manifest-src 'none'; form-action 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 
 class HttpFault extends Error {
   constructor(status, code, message) { super(message); this.status = status; this.code = code; }
@@ -65,7 +70,7 @@ function loadAssets(assetsDir) {
 function setSecurityHeaders(res) {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "no-referrer");
-  res.setHeader("Content-Security-Policy", CSP);
+  res.setHeader("Content-Security-Policy", CONSOLE_CSP);
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("X-Frame-Options", "DENY");
 }
@@ -222,7 +227,7 @@ export function createConsoleService({ rpc = null, assetsDir, now = Date.now, lo
         res.statusCode = 200;
         res.setHeader("Content-Type", entry.type);
         res.setHeader("Content-Length", body.byteLength);
-        if (/\.[a-f0-9]{6,}\./i.test(path)) res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+        if (/(?:^|\/)[^/]+-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$/.test(path)) res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
         return res.end(body);
       }
     }
@@ -300,9 +305,7 @@ export function createConsoleService({ rpc = null, assetsDir, now = Date.now, lo
           throw new HttpFault(404, "pane_gone", "Pane is no longer in the current snapshot");
         }
         if (!read || read.pane_id !== paneId || typeof read.text !== "string" || typeof read.truncated !== "boolean") throw new HttpFault(502, "invalid_pane_read", "Herdr returned an invalid pane frame");
-        const dimensionOrNull = (value) => Number.isSafeInteger(value) && value > 0 ? value : null;
-        const cols = dimensionOrNull(read.cols ?? currentPane.cols);
-        const rowsCount = dimensionOrNull(read.rows ?? currentPane.rows);
+        const { cols, rows: rowsCount } = derivePaneDimensions(currentSnapshot, paneId, read);
         const capturedAt = new Date(now()).toISOString();
         let ansi = read.text;
         let truncated = read.truncated;
@@ -342,6 +345,10 @@ export function createConsoleService({ rpc = null, assetsDir, now = Date.now, lo
     get runtimeAvailable() { return runtimeAvailable; },
     issueLoginCode,
     invalidateRuntime,
+    async probeRuntime() {
+      try { await refreshSnapshot(); return "online"; }
+      catch { return "unavailable"; }
+    },
     async start({ host = "127.0.0.1", port = 0 } = {}) {
       if (server) return server.address();
       if (host !== "127.0.0.1") throw new Error("Console only binds to 127.0.0.1");
