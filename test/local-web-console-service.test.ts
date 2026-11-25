@@ -95,7 +95,8 @@ test("HTTP service serves manifest allowlist and authenticated read-only API on 
   const auth = { authorization: `Bearer ${token}` };
   const capabilities = await fetch(`${h.origin}/api/console/v1/capabilities`, { headers: auth });
   assert.equal(capabilities.status, 200);
-  assert.deepEqual((await capabilities.json()).features.act, false);
+  const capabilitiesBody = await capabilities.json() as { features: { act: boolean } };
+  assert.deepEqual(capabilitiesBody.features.act, false);
   const sessionResponse = await fetch(`${h.origin}/api/console/v1/session`, { headers: auth });
   assert.equal(sessionResponse.status, 200);
   const session = await sessionResponse.json() as { runtimeGeneration: string; snapshot: typeof fixtureSnapshot };
@@ -133,10 +134,10 @@ test("screen API includes cell geometry from the selected pane's layout", async 
   const snapshot = {
     ...fixtureSnapshot,
     panes: [
-      { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", focused: true, scroll: { viewport_rows: 38 } },
-      { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", focused: false, scroll: { viewport_rows: 38 } },
+      { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", focused: true, scroll: { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 38 } },
+      { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", focused: false, scroll: { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 38 } },
     ],
-    layouts: [{ workspace_id: "w1", tab_id: "w1:t1", zoomed: false, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p1", panes: [
+    layouts: [{ workspace_id: "w1", tab_id: "w1:t1", zoomed: false, area: { x: 0, y: 0, width: 120, height: 40 }, focused_pane_id: "w1:p1", splits: [], panes: [
       { pane_id: "w1:p1", focused: true, rect: { x: 0, y: 0, width: 60, height: 40 } },
       { pane_id: "w1:p2", focused: false, rect: { x: 60, y: 0, width: 60, height: 40 } },
     ] }],
@@ -226,7 +227,8 @@ test("mirror response stays under the JSON cap by truncating whole rows; oversiz
   const { token: secondToken } = await secondLogin.json() as { token: string };
   const oversized = await fetch(`${oversizeService.origin}/api/console/v1/session`, { headers: { authorization: `Bearer ${secondToken}` } });
   assert.equal(oversized.status, 502);
-  assert.equal((await oversized.json()).error.code, "response_too_large");
+  const oversizedBody = await oversized.json() as { error: { code: string } };
+  assert.equal(oversizedBody.error.code, "response_too_large");
 });
 
 test("runtime permission and pane-gone errors map to 403/404 without fallback", async (t) => {
@@ -250,7 +252,8 @@ test("runtime permission and pane-gone errors map to 403/404 without fallback", 
   assert.equal(gone.status, 404);
   assert.equal(vanished.runtimeAvailable, true, "one pane disappearance does not imply runtime loss");
   const refreshed = await fetch(`${vanished.origin}/api/console/v1/session`, { headers: auth });
-  assert.equal((await refreshed.json()).runtimeGeneration, runtimeGeneration);
+  const refreshedGeneration = await refreshed.json() as { runtimeGeneration: string };
+  assert.equal(refreshedGeneration.runtimeGeneration, runtimeGeneration);
 });
 
 test("same-generation refresh removing a pane rejects its pending screen without leaking ANSI", async (t) => {
@@ -279,12 +282,13 @@ test("same-generation refresh removing a pane rejects its pending screen without
   await started;
   const refreshed = await fetch(`${service.origin}/api/console/v1/session`, { headers: auth });
   assert.equal(refreshed.status, 200);
-  assert.deepEqual((await refreshed.json()).snapshot.panes, []);
+  const refreshedSnapshot = await refreshed.json() as { snapshot: { panes: { pane_id: string }[] } };
+  assert.deepEqual(refreshedSnapshot.snapshot.panes, []);
   assert.equal(service.runtimeGeneration, runtimeGeneration, "pane removal does not change runtime identity");
   completeRead("PRIVATE ANSI MUST NOT LEAK\\n");
   const response = await pendingScreen;
   assert.equal(response.status, 404);
-  const body = await response.json();
+  const body = await response.json() as { error: { code: string } };
   assert.equal(body.error.code, "pane_gone");
   assert.equal("ansi" in body, false);
   assert.doesNotMatch(JSON.stringify(body), /PRIVATE ANSI/);
@@ -296,7 +300,7 @@ test("generation invalidation during pane RPC drops the in-flight screen", async
   const started = new Promise<void>((resolve) => { readStarted = resolve; });
   const fakeRpc = {
     snapshot: async () => fixtureSnapshot,
-    readPane: () => { readStarted(); return new Promise((resolve) => { completeRead = resolve; }); },
+    readPane: () => { readStarted(); return new Promise<{ pane_id: string; text: string; truncated: boolean }>((resolve) => { completeRead = resolve; }); },
   };
   const service = createConsoleService({ rpc: fakeRpc, assetsDir: assets });
   await service.start();

@@ -123,7 +123,7 @@ test("packed npm install boots Console from a clean unpacked tarball with only t
   const runtime = await startFixtureRuntime(runtimePath, {
     snapshot: { version: "fixture", protocol: 1, workspaces: [], tabs: [], panes: [], layouts: [], agents: [] },
   });
-  const env = { ...process.env, HERDGATE_CONSOLE_STATE_DIR: state, HERDGATE_CONSOLE_RPC_SOCKET: runtimePath };
+  const env: NodeJS.ProcessEnv = { ...process.env, HERDGATE_CONSOLE_STATE_DIR: state, HERDGATE_CONSOLE_RPC_SOCKET: runtimePath };
   delete env.HERDGATE_CONSOLE_ASSET_DIR;
   const run = (...args: string[]) => spawnSync(process.execPath, [join(packageRoot, "bin/herdgate.mjs"), "console", ...args], { env, encoding: "utf8", timeout: 10_000 });
   const runAsync = (...args: string[]) => new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
