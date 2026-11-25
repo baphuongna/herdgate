@@ -1,5 +1,3 @@
-import type { SessionSnapshot as OvisSessionSnapshot } from "../../../console/vendor/ovis/shared/protocol.ts";
-
 /** Typed boundary for the Herdgate read-only Console frontend adapter. */
 export interface ConsoleSessionSnapshot {
   runtime: 'available' | 'unavailable';
@@ -8,8 +6,8 @@ export interface ConsoleSessionSnapshot {
   tabs: readonly { id: string; workspaceId: string; label: string }[];
   panes: readonly { id: string; tabId: string; workspaceId: string; title: string }[];
   focused: { workspaceId: string | null; tabId: string | null; paneId: string | null };
-  /** Validated source snapshot retained for the isolated Ovis TabStrip/PaneCanvas adapter. */
-  ovisSnapshot?: OvisSessionSnapshot;
+  /** Opaque source object for the isolated Ovis adapter; avoids pulling upstream server protocols into the root TS program. */
+  ovisSnapshot?: Record<string, unknown>;
 }
 
 export interface ConsolePaneScreen {

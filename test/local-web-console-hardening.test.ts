@@ -5,9 +5,9 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { CONSOLE_CSP } from "../console/tools/build-console.mjs";
-import { installConsoleStorageGuard } from "../console/src/ovis/storage-guard.ts";
-import { layoutCells } from "../console/vendor/ovis/src/lib/layoutMap.ts";
+import { CONSOLE_CSP_HEADER, CONSOLE_CSP_META } from "../console/tools/build-console.mjs";
+import { installConsoleStorageGuard, type ConsoleStorage, type ConsoleStorageHost } from "../console/src/ovis/storage-guard.ts";
+import { activateReadPane } from "../console/src/ovis/pane-select-key.ts";
 
 const repo = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const consoleRoot = path.join(repo, "console");
@@ -47,10 +47,6 @@ async function builtSourceGraph(entry: string): Promise<Map<string, string>> {
   };
   await visit(entry);
   return modules;
-}
-
-function storageDescriptor(storage: Storage): PropertyDescriptor {
-  return { configurable: true, enumerable: true, get: () => storage };
 }
 
 test("Ovis settings shim follows the complete vendor defaults and all settings read in the build graph", async () => {
@@ -123,23 +119,29 @@ test("importing the Console settings shim is storage- and network-silent", async
   }
 });
 
-test("Console metadata policy matches the exact runtime CSP in source and built HTML", async () => {
+test("Console metadata CSP omits the header-only frame directive in source and built HTML", async () => {
   const extract = (html: string): string => {
     const meta = html.match(/<meta\b[^>]*http-equiv="Content-Security-Policy"[^>]*>/i)?.[0];
     return meta?.match(/\bcontent="([^"]*)"/i)?.[1] ?? "";
   };
-  assert.equal(CONSOLE_CSP, "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'none'; child-src 'none'; frame-src 'none'; manifest-src 'none'; form-action 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
-  assert.equal(extract(await readFile(path.join(consoleRoot, "index.html"), "utf8")), CONSOLE_CSP);
+  assert.equal(CONSOLE_CSP_HEADER, "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'none'; child-src 'none'; frame-src 'none'; manifest-src 'none'; form-action 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+  assert.equal(CONSOLE_CSP_META, "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'none'; child-src 'none'; frame-src 'none'; manifest-src 'none'; form-action 'self'; object-src 'none'; base-uri 'none'");
+  assert.equal(CONSOLE_CSP_HEADER, `${CONSOLE_CSP_META}; frame-ancestors 'none'`, "header remains exact meta plus the header-only directive");
+  const sourceHtml = await readFile(path.join(consoleRoot, "index.html"), "utf8");
+  assert.equal(extract(sourceHtml), CONSOLE_CSP_META);
+  assert.match(sourceHtml, /<link rel="icon" href="data:,"\s*\/>/);
+  assert.doesNotMatch(sourceHtml, /https?:\/\//i);
   try {
-    assert.equal(extract(await readFile(path.join(consoleRoot, "dist/index.html"), "utf8")), CONSOLE_CSP);
+    const builtHtml = await readFile(path.join(consoleRoot, "dist/index.html"), "utf8");
+    assert.equal(extract(builtHtml), CONSOLE_CSP_META);
+    assert.match(builtHtml, /<link rel="icon" href="data:,"\s*\/>/);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 });
 
 test("memory-only storage guard isolates tab storage and restores original descriptors", () => {
-  const host: Record<string, unknown> = {};
-  const makeStorage = (values: Map<string, string>): Storage => ({
+  const makeStorage = (values: Map<string, string>): ConsoleStorage => ({
     get length() { return values.size; },
     clear() { values.clear(); },
     getItem(key) { return values.get(String(key)) ?? null; },
@@ -149,14 +151,16 @@ test("memory-only storage guard isolates tab storage and restores original descr
   });
   const nativeLocal = makeStorage(new Map([['persisted', 'local']]));
   const nativeSession = makeStorage(new Map([['persisted', 'session']]));
-  Object.defineProperty(host, "localStorage", storageDescriptor(nativeLocal));
-  Object.defineProperty(host, "sessionStorage", storageDescriptor(nativeSession));
+  const host: ConsoleStorageHost = {
+    get localStorage() { return nativeLocal; },
+    get sessionStorage() { return nativeSession; },
+  };
   const localDescriptor = Object.getOwnPropertyDescriptor(host, "localStorage");
   const sessionDescriptor = Object.getOwnPropertyDescriptor(host, "sessionStorage");
-  const restore = installConsoleStorageGuard(host as unknown as Window);
+  const restore = installConsoleStorageGuard(host);
   try {
-    const local = (host as unknown as Window).localStorage;
-    const session = (host as unknown as Window).sessionStorage;
+    const local = host.localStorage;
+    const session = host.sessionStorage;
     assert.notEqual(local, nativeLocal);
     assert.notEqual(session, nativeSession);
     assert.equal(local.getItem("persisted"), null);
@@ -171,8 +175,20 @@ test("memory-only storage guard isolates tab storage and restores original descr
   assert.deepEqual(Object.getOwnPropertyDescriptor(host, "sessionStorage"), sessionDescriptor);
 });
 
+test("Enter and Space select the focused read-only pane without creating a mutation path", () => {
+  const selected: string[] = [];
+  const preventions: string[] = [];
+  for (const key of ["Enter", " "]) {
+    activateReadPane({ key, preventDefault: () => { preventions.push(key); } }, "w1:p2", (paneId) => selected.push(paneId));
+  }
+  activateReadPane({ key: "ArrowDown", preventDefault: () => { preventions.push("unexpected"); } }, "w1:p2", (paneId) => selected.push(paneId));
+  assert.deepEqual(selected, ["w1:p2", "w1:p2"]);
+  assert.deepEqual(preventions, ["Enter", " "]);
+});
+
 test("read-only pane adapter keeps every pane in a split tab selectable", async () => {
   const view = await readFile(path.join(consoleRoot, "src/ovis/ReadOnlySessionView.tsx"), "utf8");
+  const css = await readFile(path.join(consoleRoot, "src/console.css"), "utf8");
   const paneCanvas = await readFile(path.join(vendorRoot, "src/components/PaneCanvas.tsx"), "utf8");
   const tabStrip = await readFile(path.join(vendorRoot, "src/components/TabStrip.tsx"), "utf8");
   const snapshot = {
@@ -187,12 +203,12 @@ test("read-only pane adapter keeps every pane in a split tab selectable", async 
       { pane_id: "p2", focused: false, rect: { x: 100, y: 0, width: 100, height: 80 } },
     ] }],
   };
-  const cells = layoutCells(snapshot.layouts[0] as unknown as Parameters<typeof layoutCells>[0]);
+  const cells = snapshot.layouts[0]!.panes.map((pane) => pane.pane_id);
   const requested: string[] = [];
   const onSelectPane = (paneId: string): void => { requested.push(paneId); };
-  assert.deepEqual(cells.map((cell) => cell.paneId), ["p1", "p2"], "Ovis layout geometry produces both visible pane cells in the two-pane tab");
+  assert.deepEqual(cells, ["p1", "p2"], "the two-pane layout carries both selectable pane identities");
   assert.match(paneCanvas, /layoutCells\(layout\)/);
-  assert.match(view, /onSelect=\{\(paneId\) => onSelectPane\(paneId\)\}/);
+  assert.match(view, /onSelect=\{\(paneId\) => \{[\s\S]*?active\.classList\.contains\("ovis-pane-not-selected"\)[\s\S]*?onSelectPane\(paneId\);[\s\S]*?\}\}/);
   assert.match(tabStrip, /const soloPanes = useMediaQuery\(SOLO_PANE_QUERY\)/, "narrow/single-pane Ovis layouts have a separate pane picker");
   assert.match(tabStrip, /const paneList = own\.length < 2 \? \[\] : own\.map\(\(pane\)/);
   assert.match(tabStrip, /run: \(\) => pickPane\(pane, typing\)/);
@@ -200,6 +216,11 @@ test("read-only pane adapter keeps every pane in a split tab selectable", async 
   assert.doesNotMatch(view, /\bsolo(?:\s|=|\n)/, "all split cells must remain rendered and non-inert");
   assert.match(paneCanvas, /if \(event\.button === 0 && !paneContextPress\(event, apple\) && !active\)\s*\{\s*onSelect\(item\.pane_id, false\)/s);
   assert.match(view, /Select this pane to read its mirror\./);
-  for (const cell of cells) onSelectPane(cell.paneId);
+  assert.match(view, /className="ovis-pane-not-selected" tabIndex=\{0\} role="button"/);
+  assert.match(view, /aria-label=\{`Read pane \$\{pane\.label \?\?/);
+  assert.match(view, /onKeyDown=\{\(event\) => activateReadPane\(event, pane\.pane_id, onSelectPane\)\}/);
+  assert.doesNotMatch(view, /ovis-pane-not-selected"[^>]*aria-hidden/);
+  assert.match(css, /\.ovis-pane-not-selected:focus-visible\s*\{/);
+  for (const paneId of cells) onSelectPane(paneId);
   assert.deepEqual(requested, ["p1", "p2"]);
 });

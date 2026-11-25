@@ -1,7 +1,20 @@
-type StorageHost = Pick<Window, "localStorage" | "sessionStorage">;
+export interface ConsoleStorage {
+  readonly length: number;
+  clear(): void;
+  getItem(key: string): string | null;
+  key(index: number): string | null;
+  removeItem(key: string): void;
+  setItem(key: string, value: string): void;
+}
+
+export interface ConsoleStorageHost {
+  localStorage: ConsoleStorage;
+  sessionStorage: ConsoleStorage;
+}
+
 type StorageProperty = "localStorage" | "sessionStorage";
 
-function memoryStorage(): Storage {
+function memoryStorage(): ConsoleStorage {
   const values = new Map<string, string>();
   return {
     get length() { return values.size; },
@@ -13,13 +26,13 @@ function memoryStorage(): Storage {
   };
 }
 
-function restoreProperty(host: StorageHost, property: StorageProperty, descriptor: PropertyDescriptor | undefined): void {
+function restoreProperty(host: ConsoleStorageHost, property: StorageProperty, descriptor: PropertyDescriptor | undefined): void {
   if (descriptor) Object.defineProperty(host, property, descriptor);
   else Reflect.deleteProperty(host, property);
 }
 
 /** Replace browser-persistent storage with per-tab memory before mounting Ovis components. */
-export function installConsoleStorageGuard(host: StorageHost = window): () => void {
+export function installConsoleStorageGuard(host: ConsoleStorageHost): () => void {
   const descriptors = new Map<StorageProperty, PropertyDescriptor | undefined>([
     ["localStorage", Object.getOwnPropertyDescriptor(host, "localStorage")],
     ["sessionStorage", Object.getOwnPropertyDescriptor(host, "sessionStorage")],

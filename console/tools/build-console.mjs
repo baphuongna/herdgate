@@ -8,7 +8,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repository = path.resolve(root, "..");
 const output = path.join(root, "dist");
 const requiredAssets = ["index.html", "notices/LICENSE", "notices/THIRD_PARTY_NOTICES.md"];
-export const CONSOLE_CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'none'; child-src 'none'; frame-src 'none'; manifest-src 'none'; form-action 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+export const CONSOLE_CSP_HEADER = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'none'; child-src 'none'; frame-src 'none'; manifest-src 'none'; form-action 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+export const CONSOLE_CSP_META = CONSOLE_CSP_HEADER.replace("; frame-ancestors 'none'", "");
 const runtimeMimeTypes = new Set([
   "text/html; charset=utf-8", "text/css; charset=utf-8", "text/javascript; charset=utf-8",
   "application/javascript; charset=utf-8", "application/json; charset=utf-8", "text/plain; charset=utf-8",
@@ -99,7 +100,8 @@ export async function verifyBuildOutput(distDirectory) {
   const html = await readFile(path.join(distDirectory, "index.html"), "utf8");
   const cspMeta = /<meta\b[^>]*http-equiv="Content-Security-Policy"[^>]*>/i.exec(html)?.[0];
   const csp = cspMeta && /\bcontent="([^"]*)"/i.exec(cspMeta)?.[1];
-  if (csp !== CONSOLE_CSP) throw new Error("built shell CSP does not match the Console runtime policy");
+  if (CONSOLE_CSP_HEADER !== `${CONSOLE_CSP_META}; frame-ancestors 'none'`) throw new Error("Console header and metadata CSP policies are inconsistent");
+  if (csp !== CONSOLE_CSP_META) throw new Error("built shell CSP does not match the Console metadata policy");
   if (!html.includes('src="/assets/') || html.includes("/src/pwa.ts") || /https?:\/\//i.test(html)) {
     throw new Error("built shell is not a local root-only Console entrypoint");
   }

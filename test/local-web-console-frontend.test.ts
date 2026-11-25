@@ -41,8 +41,8 @@ test("local React shell uses the Herdgate client and does not boot Ovis App/PWA"
   const html = await readFile(new URL("../console/index.html", import.meta.url), "utf8");
   assert.match(entry, /createRoot/);
   assert.match(entry, /installConsoleNetworkGuard\(\)/);
-  assert.match(entry, /installConsoleStorageGuard\(\)/);
-  assert.ok(entry.indexOf("installConsoleStorageGuard()") < entry.indexOf("createRoot(element).render"), "storage guard is active before React mounts");
+  assert.match(entry, /installConsoleStorageGuard\(window\)/);
+  assert.ok(entry.indexOf("installConsoleStorageGuard(window)") < entry.indexOf("createRoot(element).render"), "storage guard is active before React mounts");
   assert.match(storageGuard, /memoryStorage\(\)/);
   assert.match(entry, /@xterm\/xterm\/css\/xterm\.css/);
   assert.match(ui, /OvisReadOnlySessionView/);

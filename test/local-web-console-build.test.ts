@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { inspectConsolePreflight } from "../console/tools/preflight.mjs";
-import { assertRealNodeModules, CONSOLE_CSP, createAssetAllowlist, sandboxArgs, verifyBuildOutput } from "../console/tools/build-console.mjs";
+import { assertRealNodeModules, CONSOLE_CSP_META, createAssetAllowlist, sandboxArgs, verifyBuildOutput } from "../console/tools/build-console.mjs";
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -71,7 +71,7 @@ test("build emits the Console manifest schema and allowlists only supported asse
   try {
     await mkdir(path.join(temp, "assets"));
     await mkdir(path.join(temp, "notices"));
-    await writeFile(path.join(temp, "index.html"), `<html><meta http-equiv="Content-Security-Policy" content="${CONSOLE_CSP}"><script type="module" src="/assets/app-a1b2c3d4.js"></script></html>`);
+    await writeFile(path.join(temp, "index.html"), `<html><link rel="icon" href="data:," /><meta http-equiv="Content-Security-Policy" content="${CONSOLE_CSP_META}"><script type="module" src="/assets/app-a1b2c3d4.js"></script></html>`);
     await writeFile(path.join(temp, "assets", "app-a1b2c3d4.js"), "console.log('fixture')");
     await writeFile(path.join(temp, "notices", "LICENSE"), "fixture license");
     await writeFile(path.join(temp, "notices", "THIRD_PARTY_NOTICES.md"), "fixture notices");
@@ -92,5 +92,10 @@ test("build emits the Console manifest schema and allowlists only supported asse
     assert.equal(Object.keys((await verifyBuildOutput(temp)).files).length, Object.keys(manifest.files).length);
     await writeFile(path.join(temp, "assets", "app-a1b2c3d4.js"), "navigator.serviceWorker.register('/sw.js')");
     await assert.rejects(verifyBuildOutput(temp), /forbidden upstream\/PWA boot reference/);
+    await writeFile(path.join(temp, "assets", "app-a1b2c3d4.js"), "console.log('fixture')");
+    await writeFile(path.join(temp, "index.html"), `<html><link rel="icon" href="data:," /><meta http-equiv="Content-Security-Policy" content="${CONSOLE_CSP_META}"><script type="module" src="/assets/app-a1b2c3d4.js"></script><a href="https://example.invalid/">external</a></html>`);
+    await assert.rejects(verifyBuildOutput(temp), /built shell is not a local root-only Console entrypoint/);
+    await writeFile(path.join(temp, "index.html"), `<html><link rel="icon" href="data:," /><meta http-equiv="Content-Security-Policy" content="${CONSOLE_CSP_META}; frame-ancestors 'none'"><script type="module" src="/assets/app-a1b2c3d4.js"></script></html>`);
+    await assert.rejects(verifyBuildOutput(temp), /built shell CSP does not match the Console metadata policy/);
   } finally { await rm(temp, { recursive: true, force: true }); }
 });

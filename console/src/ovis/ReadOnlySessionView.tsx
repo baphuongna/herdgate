@@ -1,4 +1,4 @@
-import type { KeyboardEvent, MouseEvent } from "react";
+import { useRef, type KeyboardEvent, type MouseEvent } from "react";
 import type { ConsolePaneScreen, ConsoleSessionSnapshot } from "../../../src/console/web/view-model.ts";
 import { MachineContext } from "./machine-context-shim.tsx";
 import type { SessionSnapshot } from "../../vendor/ovis/shared/protocol.ts";
@@ -6,6 +6,7 @@ import { PaneCanvas } from "../../vendor/ovis/src/components/PaneCanvas.tsx";
 import { TabStrip } from "../../vendor/ovis/src/components/TabStrip.tsx";
 import { SettingsProvider } from "./settings-shim.tsx";
 import { OvisTerminalMirror } from "./TerminalMirror.tsx";
+import { activateReadPane } from "./pane-select-key.ts";
 
 export interface ReadOnlySessionViewProps {
   snapshot: ConsoleSessionSnapshot;
@@ -32,6 +33,7 @@ function blockActionMenuKey(event: KeyboardEvent<HTMLElement>): void {
  * browser-local and all mutation affordances are disabled or blocked here.
  */
 export function OvisReadOnlySessionView({ snapshot, selectedPaneId, screen, stale, onSelectPane }: ReadOnlySessionViewProps) {
+  const pointerPress = useRef(false);
   const source = snapshot.ovisSnapshot as SessionSnapshot | undefined;
   if (!source || snapshot.runtime !== "available") return null;
   const selectedPane = source.panes.find((pane) => pane.pane_id === selectedPaneId) ?? null;
@@ -40,7 +42,12 @@ export function OvisReadOnlySessionView({ snapshot, selectedPaneId, screen, stal
 
   return <SettingsProvider>
     <MachineContext.Provider value="local">
-      <div className="ovis-l1-session" onContextMenuCapture={blockedContextMenu} onKeyDownCapture={blockActionMenuKey}>
+      <div className="ovis-l1-session" onContextMenuCapture={blockedContextMenu} onKeyDownCapture={blockActionMenuKey}
+        onPointerDownCapture={() => {
+          pointerPress.current = true;
+          window.setTimeout(() => { pointerPress.current = false; }, 0);
+        }}
+        onPointerUpCapture={() => { pointerPress.current = false; }} onPointerCancelCapture={() => { pointerPress.current = false; }}>
         <TabStrip
           snapshot={source}
           workspace={workspace}
@@ -56,12 +63,18 @@ export function OvisReadOnlySessionView({ snapshot, selectedPaneId, screen, stal
             snapshot={source}
             pane={selectedPane}
             selectedPaneId={selectedPaneId}
-            onSelect={(paneId) => onSelectPane(paneId)}
+            onSelect={(paneId) => {
+              const active = document.activeElement;
+              if (!pointerPress.current && active instanceof HTMLElement && active.classList.contains("ovis-pane-not-selected")) return;
+              onSelectPane(paneId);
+            }}
             onChanged={() => {}}
             watching
             renderPane={(pane) => pane && pane.pane_id === selectedPaneId
               ? <OvisTerminalMirror screen={screen?.paneId === pane.pane_id ? screen : null} stale={stale} />
-              : <div className="ovis-pane-not-selected" aria-hidden="true">Select this pane to read its mirror.</div>}
+              : pane ? <div className="ovis-pane-not-selected" tabIndex={0} role="button"
+                aria-label={`Read pane ${pane.label ?? pane.terminal_title_stripped ?? pane.terminal_title ?? pane.title ?? pane.pane_id}`}
+                onKeyDown={(event) => activateReadPane(event, pane.pane_id, onSelectPane)}>Select this pane to read its mirror.</div> : null}
           />
         </div>
         <p className="ovis-l1-readonly-note">Ovis layout components · read-only mirror. Input, resize, layout mutation, chat, and inbox are disabled.</p>
