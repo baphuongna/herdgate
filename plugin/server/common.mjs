@@ -5,7 +5,13 @@ import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-const run = promisify(execFile);
+const execFileAsync = promisify(execFile);
+
+// The Windows publisher has no console; a background Herdr CLI child must not
+// allocate a visible one on each snapshot tick.
+export function runHerdr(bin, args, options) {
+  return execFileAsync(bin, args, { ...options, windowsHide: true });
+}
 
 /** A hard upper bound for any single awaited step in a publish chain. The
  *  2026-11-23 laptop wedge: one publish tick hung forever (snapshot spawn or
@@ -90,14 +96,14 @@ export function writeState(path, state) {
 
 /** The Herdr CLI is the plugin API: `HERDR_BIN_PATH` keeps it portable. */
 export async function herdrSnapshot(bin, timeoutMs = 8_000) {
-  const { stdout } = await run(bin, ["api", "snapshot"], { timeout: timeoutMs, maxBuffer: 8 << 20 });
+  const { stdout } = await runHerdr(bin, ["api", "snapshot"], { timeout: timeoutMs, maxBuffer: 8 << 20 });
   const parsed = JSON.parse(stdout);
   return parsed?.result?.snapshot ?? parsed?.snapshot ?? parsed;
 }
 
 /** Live panes — the PWA's terminal picker. One row per pane, grouped by workspace there. */
 export async function herdrPanes(bin, timeoutMs = 8_000) {
-  const { stdout } = await run(bin, ["pane", "list"], { timeout: timeoutMs, maxBuffer: 8 << 20 });
+  const { stdout } = await runHerdr(bin, ["pane", "list"], { timeout: timeoutMs, maxBuffer: 8 << 20 });
   const parsed = JSON.parse(stdout);
   const panes = parsed?.result?.panes ?? parsed?.panes ?? [];
   return panes
@@ -118,11 +124,11 @@ export async function herdrRead(bin, target, lines = 40, timeoutMs = 8_000) {
   // `agent_not_found` and belong to `pane read` — same flags, same formats.
   const argv = (sub) => [sub, "read", String(target), "--source", "visible", "--lines", String(lines), "--format", "ansi"];
   try {
-    const { stdout } = await run(bin, argv("agent"), { timeout: timeoutMs, maxBuffer: 8 << 20 });
+    const { stdout } = await runHerdr(bin, argv("agent"), { timeout: timeoutMs, maxBuffer: 8 << 20 });
     return stdout;
   } catch (e) {
     if (!/agent_not_found|not found/i.test(`${e?.message ?? ""}${e?.stderr ?? ""}`)) throw e;
-    const { stdout } = await run(bin, argv("pane"), { timeout: timeoutMs, maxBuffer: 8 << 20 });
+    const { stdout } = await runHerdr(bin, argv("pane"), { timeout: timeoutMs, maxBuffer: 8 << 20 });
     return stdout;
   }
 }

@@ -6,14 +6,13 @@
  * permissions are checked before dispatching any interactive bridge commands.
  */
 
-import { execFile as execFileCb, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { promisify } from "node:util";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, statSync, realpathSync, renameSync, openSync, closeSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { hostname, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead, pkgVersion, nextPublishDelay, withTimeout } from "./common.mjs";
+import { dirs, readConfig, writeConfig, readState, writeState, herdrSnapshot, summarize, herdrPanes, herdrRead, runHerdr as run, pkgVersion, nextPublishDelay, withTimeout } from "./common.mjs";
 import { gitRead, diffRepoDir } from "./git-safe.mjs";
 import { createSshBridge } from "./ssh.mjs";
 import { findBody, findReceipt, journalBase as receiptJournalBase, publicReceipt, watchReceipts } from "./pi-receipts.mjs";
@@ -33,8 +32,6 @@ const D = dirs();
 // C24 — this file, resolvable as a plain path on every platform:
 // fileURLToPath, never a raw file-URL .pathname (F7, Windows: /C:/, %20).
 const SELF = fileURLToPath(import.meta.url);
-const execFile = promisify(execFileCb);
-const run = execFile; // term.send/term.keys: argv arrays, never a shell
 /** diff.get ships at most 128 KiB of `git show` output, marked truncated beyond. */
 const MAX_DIFF_BYTES = 128 * 1024;
 const MAX_PANES = 200; // pane-carrying replies (term.list, fleet.detail) — a tab storm must not push the reply past the gate's 256KiB frame cap
@@ -177,7 +174,7 @@ function openPublisherLog() {
  *  distinguishable from "no live children". Returns null when the CLI fails. */
 async function paneRowsWithPids() {
   try {
-    const { stdout } = await execFile(D.herdrBin, ["pane", "list"], { timeout: 8_000, maxBuffer: 8 << 20 });
+    const { stdout } = await run(D.herdrBin, ["pane", "list"], { timeout: 8_000, maxBuffer: 8 << 20 });
     const parsed = JSON.parse(stdout);
     const panes = parsed?.result?.panes ?? parsed?.panes ?? [];
     return Array.isArray(panes) ? panes.filter((p) => p && typeof p.pane_id === "string") : [];
@@ -234,7 +231,7 @@ async function paneFocusArgvProbe() {
   if (paneFocusArgv !== undefined) return paneFocusArgv;
   const help = async (...args) => {
     try {
-      const { stdout } = await execFile(D.herdrBin, args, { timeout: 5_000 });
+      const { stdout } = await run(D.herdrBin, args, { timeout: 5_000 });
       return stdout;
     } catch {
       return "";
