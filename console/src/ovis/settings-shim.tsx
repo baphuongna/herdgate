@@ -1,18 +1,14 @@
 import { createContext, useContext, type ReactNode } from "react";
+import { DEFAULT_SETTINGS } from "../../vendor/ovis/src/lib/settings";
 
-const settings = Object.freeze({
-  autoTabNames: false,
-  phoneTabs: false,
-  statusIndicators: "classic",
-  terminalMirrorWrap: false,
-});
-const value = {
+export const settings = Object.freeze({ ...DEFAULT_SETTINGS });
+const value = Object.freeze({
   settings,
   resolvedLanguage: "en",
   update: (_value: unknown): void => {},
   own: () => settings,
   watch: (_changed: () => void) => () => {},
-};
+});
 const context = createContext(value);
 
 /** Read-only, memory-only settings surface for the vendored Ovis layout components. */

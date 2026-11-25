@@ -245,7 +245,7 @@ export function ConsoleApp() {
       {codeError && <p className="notice error" role="alert">{codeError}</p>}
       {apiError && <p className="notice error" role="status">Console status: {apiError}</p>}
     </section>
-    <footer>Local access only · no Ovis account, relay, or remote connection</footer>
+    <footer>Local access only · no Ovis account, relay, or remote connection · <a href="/notices/THIRD_PARTY_NOTICES.md" target="_blank" rel="noreferrer">Third-party notices</a></footer>
   </main>;
 
   const workspaces = snapshot?.workspaces ?? [];
@@ -276,5 +276,6 @@ export function ConsoleApp() {
         {currentPane && model?.state === "selection-required" && <div className="empty-state"><h3>Pane layout unavailable</h3><p>The selected pane is not associated with a verified workspace and tab in this snapshot.</p></div>}
       </section>
     </div>
+    <footer className="console-footer"><a href="/notices/THIRD_PARTY_NOTICES.md" target="_blank" rel="noreferrer">Third-party notices</a></footer>
   </main>;
 }
