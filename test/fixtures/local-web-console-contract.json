@@ -48,6 +48,9 @@
     "assets": {
       "base": "/",
       "runtimeAssetNamespace": "/assets/ (Vite hashed output); source fonts become emitted assets",
+      "applicationBaseMeaning": "local Console app served at the origin root per L1",
+      "futureGateSubpath": "/console/ (Gate S4 only)",
+      "assetPrefixOption": "an independently configured asset URL prefix is not an app mount",
       "externalRuntimeAssets": [],
       "upstreamReferencesToCut": [
         "hosted relay/account shell bootstrap",
@@ -77,6 +80,8 @@
     "paneId": "pane-a",
     "runtimeGeneration": "fixture-generation-1",
     "sequence": 7,
+    "cols": null,
+    "rows": 40,
     "ansi": "\u001b[32mfixture output\u001b[0m",
     "capturedAt": "2026-11-25T00:00:00.000Z",
     "truncated": false

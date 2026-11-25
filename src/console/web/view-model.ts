@@ -12,6 +12,8 @@ export interface ConsolePaneScreen {
   paneId: string;
   runtimeGeneration: string;
   sequence: number;
+  cols: number | null;
+  rows: number | null;
   ansi: string;
   capturedAt: string;
   truncated: boolean;
@@ -27,8 +29,8 @@ export type MirrorViewModel =
       tabLabel: string;
       paneTitle: string;
       mirror:
-        | { kind: 'ansi-snapshot'; sequence: number; capturedAt: string; truncated: boolean; ansi: string }
-        | { kind: 'unavailable'; reason: 'screen-unavailable' | 'screen-pane-mismatch' | 'screen-generation-mismatch' | 'screen-truncated' };
+        | { kind: 'ansi-snapshot'; sequence: number; cols: number | null; rows: number | null; capturedAt: string; truncated: boolean; ansi: string }
+        | { kind: 'unavailable'; reason: 'screen-unavailable' | 'screen-pane-mismatch' | 'screen-generation-mismatch' };
     };
 
 /**
@@ -55,8 +57,15 @@ export function mirrorViewModel(
     if (screen.paneId !== pane.id) mirror = { kind: 'unavailable', reason: 'screen-pane-mismatch' };
     else if (snapshot.runtimeGeneration === null || screen.runtimeGeneration !== snapshot.runtimeGeneration) {
       mirror = { kind: 'unavailable', reason: 'screen-generation-mismatch' };
-    } else if (screen.truncated) mirror = { kind: 'unavailable', reason: 'screen-truncated' };
-    else mirror = { kind: 'ansi-snapshot', sequence: screen.sequence, capturedAt: screen.capturedAt, truncated: false, ansi: screen.ansi };
+    } else mirror = {
+      kind: 'ansi-snapshot',
+      sequence: screen.sequence,
+      cols: screen.cols,
+      rows: screen.rows,
+      capturedAt: screen.capturedAt,
+      truncated: screen.truncated,
+      ansi: screen.ansi,
+    };
   }
 
   return {

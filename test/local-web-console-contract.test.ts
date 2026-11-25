@@ -18,11 +18,11 @@ type ContractFixture = {
       mirrorLimitations: string[];
       unsupportedForHerdgateL1: string[];
     };
-    assets: { base: string; externalRuntimeAssets: string[] };
+    assets: { base: string; externalRuntimeAssets: string[]; futureGateSubpath: string };
     unsupported: string[];
   };
   session: Parameters<typeof mirrorViewModel>[0];
-  screen: NonNullable<Parameters<typeof mirrorViewModel>[2]>;
+  screen: NonNullable<Parameters<typeof mirrorViewModel>[2]> & { cols: number | null; rows: number | null };
 };
 const fixture = JSON.parse(readFileSync(join(import.meta.dirname, 'fixtures/local-web-console-contract.json'), 'utf8')) as ContractFixture;
 
@@ -42,6 +42,8 @@ test('pinned Ovis contract fixture separates normal startup from relay/account b
   assert.equal(fixture.upstream.paneTransport.mirrorPath.stream, 'full repaint or changed-row delta in pty-data frames');
   assert.match(fixture.upstream.paneTransport.mirrorPath.frontendPaint, /xterm\.write/);
   assert.ok(fixture.upstream.paneTransport.mirrorLimitations.includes('output between screen polls can be missed'));
+  assert.equal(fixture.upstream.assets.base, '/');
+  assert.equal(fixture.upstream.assets.futureGateSubpath, '/console/ (Gate S4 only)');
   assert.deepEqual(fixture.upstream.assets.externalRuntimeAssets, []);
   assert.ok(fixture.upstream.unsupported.includes('terminal.attach'));
 });
@@ -55,7 +57,24 @@ test('typed mirror view-model preserves upstream IDs and only paints a matching 
   if (view.mirror.kind === 'ansi-snapshot') assert.equal(view.mirror.ansi, '\u001b[32mfixture output\u001b[0m');
 });
 
-test('typed mirror view-model refuses stale, mismatched, missing and unsupported data instead of faking success', () => {
+test('typed mirror view-model keeps a valid truncated ANSI snapshot and carries its warning and source geometry', () => {
+  const screen = { ...fixture.screen, truncated: true, cols: null, rows: 40 };
+  const view = mirrorViewModel(fixture.session, 'pane-a', screen);
+  assert.equal(view.state, 'ready');
+  if (view.state !== 'ready') return;
+  assert.deepEqual(view.mirror, {
+    kind: 'ansi-snapshot', sequence: 7, capturedAt: fixture.screen.capturedAt,
+    cols: null, rows: 40, truncated: true, ansi: fixture.screen.ansi,
+  });
+});
+
+test('typed mirror view-model reports missing screen without pretending to paint', () => {
+  const view = mirrorViewModel(fixture.session, 'pane-a', undefined);
+  assert.equal(view.state, 'ready');
+  if (view.state === 'ready') assert.deepEqual(view.mirror, { kind: 'unavailable', reason: 'screen-unavailable' });
+});
+
+test('typed mirror view-model refuses stale, mismatched, gone-pane and offline data instead of faking success', () => {
   const wrongPane = mirrorViewModel(fixture.session, 'pane-a', { ...fixture.screen, paneId: 'pane-b' });
   assert.equal(wrongPane.state, 'ready');
   if (wrongPane.state === 'ready') assert.deepEqual(wrongPane.mirror, { kind: 'unavailable', reason: 'screen-pane-mismatch' });
