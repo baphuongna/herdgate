@@ -50,3 +50,17 @@ Tất cả đã sửa; mục 2.5 là của reviewer trên nhánh tích hợp.
 - **Mirror trên viewport điện thoại (390 px) rộng hơn pane thật** — cuộn ngang trong khung mirror; chấp nhận cho L1 chỉ đọc.
 - **Flake có sẵn** `test/loop-status-op.test.ts` (timeout 8 s khi chạy `--test-concurrency=4`), có từ trước khi merge Console.
 - **Thử trên phiên Herdr thật (26/11, sau merge `6518801`):** `console start` với socket thật `~/.config/herdr/herdr.sock`, Chrome có giao diện trên display người dùng: login 233 ms, frame đầu 235 ms, mirror pane thật `w8:p1` đúng geometry thật **253×78**, 7 workspace thật đều chọn được, 0 request ngoài origin, 0 ghi storage, 0 vi phạm CSP; ô mã login `type="text"` + `webkitTextSecurity: disc` (không còn trường password → password manager không liên quan). Ảnh: `/tmp/hg-console-review/real/real-{desktop,phone}.png`.
+
+## 5. Public-host mode (S4-lite) — đo trên tunnel thật 26/11 (release 0.15.2)
+
+Cấu hình: `herdgate-console.service` (systemd user, ghim npm 0.15.2) nghe `127.0.0.1:41280`, `HERDGATE_CONSOLE_PUBLIC_HOST=bom.phuongnb.io.vn`; cloudflared ingress `bom.phuongnb.io.vn → http://127.0.0.1:41280`, thêm bằng SIGHUP (hot-reload, không gián đoạn chân gate/ssh — đo ngay sau HUP: gate healthz 200, banner sshd loopback, laptop auth OK).
+
+Đo qua edge Cloudflare thật (curl, IP công khai thật của người đo):
+
+- Shell `https://bom.phuongnb.io.vn/` 200; `manifest.json` 404; traversal `/%2e%2e/package.json` 400 (chuẩn hoá ở edge); API không token 401; sai code 401.
+- Mã thật (in tại máy chủ, redeem kèm Origin `https://bom.phuongnb.io.vn`) → 200, token 64 hex, `expiresInMs` 30 phút; session đọc 7 workspace/7 pane; `pane w2:pEG` 253×78, ANSI thật, generation fence hoạt động.
+- **Budget theo IP:** lượt redeem 4–10 của IP → 401; lượt 11 → **429** `login_rate_limited` (đúng 10/10 phút/IP).
+- Cửa loopback song song vẫn 200; Host lạ 403; `X-Forwarded-Host` giả 403; `X-Forwarded-For`/`X-Forwarded-Proto` (cloudflared) được dung.
+- Trình duyệt qua HTTPS: login form ~230 ms khi đã ấm (lần đầu qua TLS mới 26 s), ô mã `type=text` + `webkitTextSecurity: disc`.
+- **Cloudflare chèn beacon `static.cloudflareinsights.com`** vào trang; CSP `script-src 'self'` của Console **chặn** nó (1 vi phạm CSP được ghi, beacon không tải). Muốn hết dòng log này: tắt Web Analytics/auto-inject trên zone. Đây là hành vi của zone, không phải của Console.
+- Đã ghi nhận một điểm công cụ: `/tmp/hg-conn/laptop-leg.sh` (probe shell thô kiểu Linux) bị whitelist của publisher Windows từ chối "unsupported Herdr probe" — script cũ, không phải chân SSH hỏng; đường api-bridge chạy lệnh thật trên laptop ngay lúc đó (LEG-OK trong pane).
