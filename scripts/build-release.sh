@@ -11,16 +11,6 @@ if [[ -e "$DEST" || -L "$DEST" ]]; then
   echo "release output already exists: $DEST" >&2
   exit 1
 fi
-node --input-type=module <<'NODE'
-import { validateConsoleAssets } from './bin/console-service.mjs';
-try {
-  validateConsoleAssets('console/dist');
-} catch (error) {
-  const code = error?.code || 'console_assets_invalid';
-  console.error(`${code}: release requires a valid console/dist bundle. Build it with npm run build:console (staged Bun 1.4.4 toolchain required); build-release.sh does not build Console assets.`);
-  process.exit(1);
-}
-NODE
 mkdir -p "$(dirname "$DEST")"
 STAGE=$(mktemp -d "$(dirname "$DEST")/.herdgate-release.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT
@@ -54,20 +44,8 @@ tar -czf "$OUT/$NAME.tar.gz" -C "$STAGE" "$NAME"
 npm run -s build:cloud
 npm pack --ignore-scripts --pack-destination "$OUT"
 PACK=$(find "$OUT" -maxdepth 1 -type f -name '*.tgz' -print -quit)
-[[ -n "$PACK" ]] || { echo 'Console release check failed: npm pack did not produce a .tgz' >&2; exit 1; }
+[[ -n "$PACK" ]] || { echo 'Release check failed: npm pack did not produce a .tgz' >&2; exit 1; }
 tar -tzf "$PACK" > "$STAGE/npm-pack-files.txt"
-node --input-type=module - "$STAGE/npm-pack-files.txt" <<'NODE'
-import { readFileSync } from 'node:fs';
-import { assertConsolePackContents } from './scripts/console-pack.mjs';
-try {
-  const paths = readFileSync(process.argv[2], 'utf8').split(/\r?\n/).filter(Boolean);
-  const result = assertConsolePackContents(paths, 'console/dist');
-  console.log(`Console tarball verified (${result.requiredFiles.length} manifest/notice files).`);
-} catch (error) {
-  console.error(`Console release tarball check failed: ${error?.message || 'invalid package contents'}`);
-  process.exit(1);
-}
-NODE
 ( cd "$OUT" && sha256sum -- *.tar.gz *.tgz *.zip > SHA256SUMS )
 # Move the complete set into place; don't nest or replace an existing release.
 mkdir -- "$DEST"

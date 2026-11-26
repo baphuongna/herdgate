@@ -7,7 +7,6 @@ import test from "node:test";
 const ROOT = join(import.meta.dirname, "..");
 const PLUGIN = join(ROOT, "plugin", "server");
 const WEB = join(ROOT, "src", "web");
-const CONSOLE_DIST = join(ROOT, "console", "dist");
 const ASSET = /\.(html|js|css|webmanifest|svg|png)$/;
 
 // Shipped code must be self-contained: nothing under plugin/server may import
@@ -66,35 +65,6 @@ test("npm files list covers plugin/server", () => {
 
 // The mirror plugin ships its own manifest and server — same self-containment
 // rule, same coverage check. Nothing under plugin/mirror reaches outside.
-test("npm tarball wires Console runtime and excludes vendor/build source", { timeout: 60_000 }, (t) => {
-  const out = execFileSync("npm", ["pack", "--dry-run", "--ignore-scripts", "--json"], {
-    cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
-  });
-  const packed = (JSON.parse(out)[0].files as { path: string }[]).map((file) => file.path);
-  const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
-  assert.ok(pkg.files.includes("console/dist/**"), "the npm allowlist must carry the built Console dist only");
-  assert.equal(pkg.scripts["build:console"], "node console/tools/build-console.mjs");
-  assert.ok(!pkg.files.some((pattern: string) => /^console\/(?:vendor|src|tools)(?:\/|$)/.test(pattern)), "Console sources and tools must not enter the package allowlist");
-  for (const path of ["bin/console.mjs", "bin/console-server.mjs", "bin/console-service.mjs", "bin/console-rpc.mjs"]) {
-    assert.ok(packed.includes(path), `${path} must be present in the tarball`);
-  }
-  assert.ok(!packed.some((path) => /^console\/(vendor|src|tools)(\/|$)/.test(path)), "vendor, source and build tools stay out of the runtime package");
-
-  const manifestPath = join(CONSOLE_DIST, "manifest.json");
-  if (!existsSync(manifestPath)) {
-    t.skip("console/dist is not present in this clean checkout; build:console requires the separately staged Bun 1.4.4 toolchain");
-    return;
-  }
-  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { files: Record<string, { path: string }> };
-  const required = new Set([
-    "console/dist/manifest.json",
-    "console/dist/notices/LICENSE",
-    "console/dist/notices/THIRD_PARTY_NOTICES.md",
-    ...Object.values(manifest.files).map((entry) => `console/dist/${entry.path}`),
-  ]);
-  for (const path of required) assert.ok(packed.includes(path), `${path} from the built Console dist must be in the tarball`);
-});
-
 test("plugin/mirror is self-contained and shipped", () => {
   const pkg = JSON.parse(readFileSync(join(import.meta.dirname, "..", "package.json"), "utf8"));
   assert.match(pkg.files.join("\n"), /plugin\/mirror\/herdr-plugin\.toml/);

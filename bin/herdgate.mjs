@@ -574,8 +574,7 @@ async function connectController() {
 
 const [cmd, ...args] = process.argv.slice(2);
 try {
-  if (cmd === "console") runNode(join(HERE, "console.mjs"), args);
-  else if (cmd === "setup-host") {
+  if (cmd === "setup-host") {
     setupHost();
     trySyncPiSkills();
   } else if (cmd === "pi-skills" && !args.length) trySyncPiSkills();
