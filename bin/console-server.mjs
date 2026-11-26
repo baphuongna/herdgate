@@ -75,8 +75,11 @@ async function main() {
   // Only a host-selected explicit endpoint is accepted; no socket discovery, CLI fallback or pipe-name guessing.
   const socketPath = process.env.HERDGATE_CONSOLE_RPC_SOCKET;
   const rpc = socketPath ? createConsoleRpc({ connect: createUnixConnector(socketPath) }) : null;
-  service = createConsoleService({ rpc, assetsDir, instanceId, log: (line) => process.stderr.write(`${line}\n`) });
-  await service.start({ host: "127.0.0.1", port: 0 });
+  const publicHost = process.env.HERDGATE_CONSOLE_PUBLIC_HOST === "" ? null : (process.env.HERDGATE_CONSOLE_PUBLIC_HOST ?? null);
+  service = createConsoleService({ rpc, assetsDir, instanceId, publicHost, log: (line) => process.stderr.write(`${line}\n`) });
+  const port = Number(process.env.HERDGATE_CONSOLE_PORT ?? 0);
+  if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw Object.assign(new Error("HERDGATE_CONSOLE_PORT must be a TCP port number"), { code: "console_port_invalid" });
+  await service.start({ host: "127.0.0.1", port });
 
   control = net.createServer((socket) => {
     let buffer = "";

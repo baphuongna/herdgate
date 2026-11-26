@@ -143,6 +143,8 @@ It is a second door into the *same* Herdr session, not a replacement for the Her
 - **Lifecycle:** the service ends itself if its private state disappears, and `console stop` only claims "stopped" when the process is really gone.
 - Windows lifecycle stays intentionally blocked until it is verified on the target Herdr App.
 
+- **Optional public host (opt-in):** set `HERDGATE_CONSOLE_PUBLIC_HOST=<hostname>` (plus a fixed `HERDGATE_CONSOLE_PORT`) and route your Cloudflare tunnel to that local port. The service still binds `127.0.0.1`; only that hostname (plus the loopback door) is accepted, `CF-Connecting-IP`-keyed redeem budgets apply, and TLS terminates at Cloudflare. Spec: `docs/specs/2026-11-26-console-public-host.md`.
+
 See `console/README.md` for the vendored-frontend build (offline, sandboxed) and `docs/specs/2026-11-25-local-web-console.md` for the full design. The npm tarball ships the built `console/dist`.
 
 ## The subagent fleet (receipts · wake · observers)

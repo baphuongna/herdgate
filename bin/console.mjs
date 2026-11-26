@@ -168,6 +168,8 @@ async function start() {
       if (process.env[key] !== undefined) childEnv[key] = process.env[key];
     }
     if (process.env.HERDGATE_CONSOLE_RPC_SOCKET) childEnv.HERDGATE_CONSOLE_RPC_SOCKET = process.env.HERDGATE_CONSOLE_RPC_SOCKET;
+    if (process.env.HERDGATE_CONSOLE_PUBLIC_HOST) childEnv.HERDGATE_CONSOLE_PUBLIC_HOST = process.env.HERDGATE_CONSOLE_PUBLIC_HOST;
+    if (process.env.HERDGATE_CONSOLE_PORT) childEnv.HERDGATE_CONSOLE_PORT = process.env.HERDGATE_CONSOLE_PORT;
     const child = spawn(process.execPath, [SERVER, "--state-dir", directory, "--assets-dir", assets, "--instance-id", instanceId], {
       detached: true, stdio: "ignore", shell: false, windowsHide: true, env: childEnv,
     });

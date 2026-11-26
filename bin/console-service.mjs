@@ -12,6 +12,17 @@ const CODE_ATTEMPTS = 5;
 const CODE_ISSUES_PER_MINUTE = 5;
 const IDLE_TTL_MS = 30 * 60_000;
 const ABSOLUTE_TTL_MS = 8 * 60 * 60_000;
+/** Public-host mode: redeem attempts per client IP per window (mirrors the gate's login budget). */
+const PUBLIC_REDEEM_ATTEMPTS = 10;
+const PUBLIC_REDEEM_WINDOW_MS = 10 * 60_000;
+
+/** A hostname only: no scheme, port, path, or userinfo. Anything else fails closed. */
+function normalizePublicHost(value) {
+  if (typeof value !== "string" || !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(value) || value.length > 253) {
+    throw Object.assign(new Error("HERDGATE_CONSOLE_PUBLIC_HOST must be a plain hostname"), { code: "console_public_host_invalid" });
+  }
+  return value;
+}
 const ALLOWED_MIME = new Set([
   "text/html; charset=utf-8", "text/css; charset=utf-8", "text/javascript; charset=utf-8",
   "application/javascript; charset=utf-8", "application/json; charset=utf-8", "image/svg+xml",
@@ -126,12 +137,16 @@ function readJson(req) {
 
 export function validateConsoleAssets(assetsDir) { return loadAssets(assetsDir); }
 
-export function createConsoleService({ rpc = null, assetsDir, now = Date.now, log = () => {}, instanceId = randomUUID() }) {
+export function createConsoleService({ rpc = null, assetsDir, now = Date.now, log = () => {}, instanceId = randomUUID(), publicHost = null }) {
   if (typeof now !== "function" || typeof log !== "function") throw new TypeError("invalid service hooks");
   const assets = loadAssets(assetsDir);
   if (rpc !== null && (typeof rpc?.snapshot !== "function" || typeof rpc?.readPane !== "function")) throw new TypeError("RPC adapter must expose only snapshot and readPane");
+  // Public-host mode (opt-in): the Console stays bound to 127.0.0.1 and a local tunnel (cloudflared)
+  // bridges one HTTPS hostname to it. Only that hostname (plus the loopback door) is accepted.
+  const publicOrigin = publicHost === null ? null : `https://${normalizePublicHost(publicHost)}`;
   const issuedAt = [];
   const sessions = new Map();
+  const redeemByClient = new Map();
   let loginCode = null;
   let loginAttempts = 0;
   let server;
@@ -173,7 +188,32 @@ export function createConsoleService({ rpc = null, assetsDir, now = Date.now, lo
     return key;
   }
   function sameOrigin(req) {
-    if (req.headers.origin !== origin) throw new HttpFault(403, "origin_denied", "Request origin is not this Console");
+    if (req.headers.origin !== origin && req.headers.origin !== publicOrigin) throw new HttpFault(403, "origin_denied", "Request origin is not this Console");
+  }
+  /** Client identity for public-mode budgets: the edge-provided address only (cloudflared adds it on loopback). */
+  function clientAddress(req) {
+    if (!publicOrigin) return null;
+    // CF-Connecting-IP is edge-authoritative. The XFF fallback uses the LAST hop (appended by our
+    // own cloudflared), never a client-supplied first value.
+    const connecting = String(req.headers["cf-connecting-ip"] ?? "").trim();
+    if (connecting) return connecting;
+    const hops = String(req.headers["x-forwarded-for"] ?? "").split(",").map((h) => h.trim()).filter(Boolean);
+    return hops.length ? hops[hops.length - 1] : null;
+  }
+  function redeemBudget(req) {
+    if (!publicOrigin) return; // loopback door: no per-client budget needed
+    const client = clientAddress(req) ?? "loopback";
+    const time = now();
+    const attempts = (redeemByClient.get(client) ?? []).filter((at) => time - at < PUBLIC_REDEEM_WINDOW_MS);
+    attempts.push(time);
+    redeemByClient.set(client, attempts);
+    if (redeemByClient.size > 64) {
+      for (const key of redeemByClient.keys()) {
+        redeemByClient.delete(key);
+        if (redeemByClient.size <= 64) break;
+      }
+    }
+    if (attempts.length > PUBLIC_REDEEM_ATTEMPTS) throw new HttpFault(429, "login_rate_limited", "Too many login attempts from this address");
   }
   async function refreshSnapshot() {
     if (!rpc || typeof rpc.snapshot !== "function") throw new HttpFault(503, "runtime_unavailable", "Herdr runtime is unavailable");
@@ -197,11 +237,17 @@ export function createConsoleService({ rpc = null, assetsDir, now = Date.now, lo
 
   async function route(req, res) {
     setSecurityHeaders(res);
-    if (Object.keys(req.headers).some((name) => name.startsWith("x-forwarded-") || name === "forwarded" || name === "x-original-host" || name === "x-original-url")) {
+    // Loopback mode stays strict: no forwarding headers at all. Public-host mode tolerates only
+    // the address headers our own edge tunnel (cloudflared on this host, connecting over loopback)
+    // legitimately adds; host-spoofing forwarded headers are still rejected everywhere.
+    const forwardedNames = Object.keys(req.headers).filter((name) => name.startsWith("x-forwarded-") || name === "forwarded" || name === "x-original-host" || name === "x-original-url");
+    const tolerated = publicOrigin ? ["x-forwarded-for", "x-forwarded-proto"] : [];
+    if (forwardedNames.some((name) => !tolerated.includes(name))) {
       throw new HttpFault(403, "host_denied", "Forwarded host headers are not accepted");
     }
     const expectedHost = new URL(origin).host;
-    if (req.headers.host !== expectedHost) throw new HttpFault(403, "host_denied", "Host is not this Console");
+    const host = String(req.headers.host ?? "").toLowerCase();
+    if (host !== expectedHost && host !== (publicOrigin ? new URL(publicOrigin).host : "")) throw new HttpFault(403, "host_denied", "Host is not this Console");
     const url = new URL(req.url ?? "/", origin);
     if (url.origin !== origin) throw new HttpFault(403, "host_denied", "Request authority is not this Console");
 
@@ -234,6 +280,7 @@ export function createConsoleService({ rpc = null, assetsDir, now = Date.now, lo
 
     if (url.pathname === `${API}/auth/redeem` && req.method === "POST") {
       sameOrigin(req);
+      redeemBudget(req);
       const body = await readJson(req);
       const time = now();
       const code = typeof body.code === "string" && /^[0-9a-f]{64}$/.test(body.code) ? body.code : "";

@@ -319,3 +319,97 @@ test("generation invalidation during pane RPC drops the in-flight screen", async
   const stale = await screenRequest;
   assert.equal(stale.status, 409);
 });
+
+test("public-host mode: only the configured host and the loopback door are accepted", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "hg-console-service-"));
+  const runtimePath = join(dir, "runtime.sock");
+  const runtime = await startFixtureRuntime(runtimePath, { snapshot: fixtureSnapshot, readText: "fixture screen" });
+  const service = createConsoleService({ assetsDir: assets, publicHost: "bom.phuongnb.io.vn" });
+  await service.start();
+  const origin = service.origin;
+  t.after(async () => { await service.stop(); await runtime.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  // Raw http.request: undici overwrites the Host header, so fetch() cannot exercise Host checks.
+  const hit = (path: string, headers: Record<string, string>, method: "GET" | "POST" = "GET", body?: string) => new Promise<{ status: number; text: string }>((resolve, reject) => {
+    const target = new URL(origin);
+    const req = http.request({ host: target.hostname, port: Number(target.port), path, method, headers }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.on("end", () => resolve({ status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") }));
+    });
+    req.once("error", reject);
+    if (body) req.end(body); else req.end();
+  });
+  const publicHost = "bom.phuongnb.io.vn";
+  assert.equal((await hit("/", { host: publicHost, "cf-connecting-ip": "203.0.113.9" })).status, 200, "public host serves the shell");
+  assert.equal((await hit("/_console/health", { host: publicHost })).status, 200);
+  assert.equal((await hit("/", { host: "127.0.0.1:9999" })).status, 403, "loopback Host with the wrong port is refused");
+  assert.equal((await hit("/", { host: "evil.invalid", "cf-connecting-ip": "203.0.113.9" })).status, 403, "wrong public Host is refused");
+  assert.equal((await hit("/", {})).status, 200, "the loopback door keeps working with the real Host");
+  assert.equal((await hit("/", { host: publicHost, "x-forwarded-for": "203.0.113.9, 127.0.0.1", "x-forwarded-proto": "https" })).status, 200, "cloudflared address headers are tolerated");
+  assert.equal((await hit("/", { host: publicHost, "x-forwarded-host": "evil.invalid" })).status, 403, "forwarded host spoofing is refused");
+  assert.equal((await hit("/", { host: publicHost, "x-original-url": "http://evil/" })).status, 403, "exotic forwarded headers are refused");
+  assert.equal((await hit("/", { host: publicHost, forwarded: "for=203.0.113.9" })).status, 403, "RFC forwarded is refused");
+});
+
+test("public-host mode: redeem needs the https public origin and is budgeted per client address", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "hg-console-service-"));
+  const runtimePath = join(dir, "runtime.sock");
+  const runtime = await startFixtureRuntime(runtimePath, { snapshot: fixtureSnapshot, readText: "fixture screen" });
+  let now = 1_000_000;
+  const service = createConsoleService({ assetsDir: assets, now: () => now, publicHost: "bom.phuongnb.io.vn" });
+  await service.start();
+  const origin = service.origin;
+  const loopbackHost = new URL(origin).host;
+  t.after(async () => { await service.stop(); await runtime.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  const junk = "0".repeat(64);
+  const redeem = (headers: Record<string, string>, codeOverride?: string) => {
+    const code = codeOverride ?? service.issueLoginCode();
+    return new Promise<{ status: number; text: string }>((resolve, reject) => {
+      const target = new URL(origin);
+      const body = JSON.stringify({ code });
+      const req = http.request({ host: target.hostname, port: Number(target.port), path: "/api/console/v1/auth/redeem", method: "POST", headers: { "content-type": "application/json", ...headers } }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => resolve({ status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") }));
+      });
+      req.once("error", reject);
+      req.end(body);
+    });
+  };
+  const publicHeaders = { origin: "https://bom.phuongnb.io.vn", host: "bom.phuongnb.io.vn", "cf-connecting-ip": "203.0.113.9" };
+
+  assert.equal((await redeem({ origin: "https://evil.invalid", host: "bom.phuongnb.io.vn", "cf-connecting-ip": "203.0.113.9" })).status, 403, "cross-site origin is refused");
+  assert.equal((await redeem({ origin, host: loopbackHost, "cf-connecting-ip": "203.0.113.9" })).status, 200, "the loopback origin still works");
+  const budgeted = { ...publicHeaders, "cf-connecting-ip": "192.0.2.50" };
+  for (let attempt = 0; attempt < 10; attempt++) {
+    assert.equal((await redeem(budgeted, junk)).status, 401, `wrong-code attempt ${attempt + 1} stays within the budget (401, not 429)`);
+  }
+  const limited = await redeem(budgeted, junk);
+  assert.equal(limited.status, 429, "the 11th redeem from one address is rate limited");
+  assert.ok(limited.text.includes("login_rate_limited"), limited.text.slice(0, 120));
+  assert.equal((await redeem({ ...publicHeaders, "cf-connecting-ip": "198.51.100.7" })).status, 200, "another address has its own budget");
+  now += 10 * 60_000 + 1;
+  assert.equal((await redeem(publicHeaders)).status, 200, "the window rolls over");
+});
+
+test("public-host mode: an invalid public host value fails closed at construction", async () => {
+  for (const bad of ["https://bom.phuongnb.io.vn", "bom.phuongnb.io.vn:443", "bom.phuongnb.io.vn/path", "bom phuongnb", "", "localhost"]) {
+    assert.throws(() => createConsoleService({ assetsDir: assets, publicHost: bad }), /PLAIN HOSTNAME/i, `rejects ${JSON.stringify(bad)}`);
+  }
+});
+
+test("server honors HERDGATE_CONSOLE_PORT for a fixed local port", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "hg-console-port-"));
+  const runtimePath = join(dir, "runtime.sock");
+  const runtime = await startFixtureRuntime(runtimePath, { snapshot: fixtureSnapshot, readText: "fixture screen" });
+  const service = createConsoleService({ assetsDir: assets });
+  const port = 41281;
+  const address = await service.start({ port });
+  t.after(async () => { await service.stop(); await runtime.close(); rmSync(dir, { recursive: true, force: true }); });
+  assert.equal(address.port, port);
+  const response = await fetch(`http://127.0.0.1:${port}/`);
+  await response.arrayBuffer();
+  assert.equal(response.status, 200);
+});

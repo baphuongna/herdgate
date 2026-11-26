@@ -25,6 +25,8 @@ export interface ConsoleServiceOptions {
   now?: () => number;
   log?: (line: string) => void;
   instanceId?: string;
+  /** Opt-in public hostname (plain hostname, HTTPS assumed). When set, that Host (plus the loopback door) is accepted, edge address headers are tolerated, and redeem is budgeted per client address. */
+  publicHost?: string | null;
 }
 
 export interface ConsoleService {
