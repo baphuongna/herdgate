@@ -1,0 +1,217 @@
+{
+ "A": {
+  "name": "A-demo-healthy",
+  "state": {
+   "title": "Idempotent payments · Ovis",
+   "body": "Idempotent payments Idempotent payments claude · DONE release Shell Chat Terminal live Connected checkout-api claude READY export-guard codex ? INPUT flaky-retry-test claude READY cli-tools omp READY retry-flag pi READY changelog hermes READY Agents workstatio",
+   "rootChildren": 1
+  },
+  "problems": [],
+  "rest": [
+   {
+    "first": 259,
+    "key": "GET /api/health",
+    "count": 2,
+    "status": "200",
+    "ms": 7,
+    "resBytes": 442
+   },
+   {
+    "first": 264,
+    "key": "GET /api/machines",
+    "count": 1,
+    "status": "200",
+    "ms": 11,
+    "resBytes": 12143
+   },
+   {
+    "first": 267,
+    "key": "GET /api/telemetry",
+    "count": 2,
+    "status": "404",
+    "ms": 41,
+    "resBytes": null
+   },
+   {
+    "first": 521,
+    "key": "GET /api/herdr-ui",
+    "count": 1,
+    "status": "200",
+    "ms": 180,
+    "resBytes": 512
+   },
+   {
+    "first": 531,
+    "key": "GET /api/fs/favicon",
+    "count": 2,
+    "status": "404",
+    "ms": 171,
+    "resBytes": null
+   },
+   {
+    "first": 533,
+    "key": "GET /api/worktree/inventory",
+    "count": 1,
+    "status": "200",
+    "ms": 223,
+    "resBytes": 1726
+   },
+   {
+    "first": 551,
+    "key": "GET /api/updates",
+    "count": 1,
+    "status": "200",
+    "ms": 152,
+    "resBytes": 218
+   },
+   {
+    "first": 552,
+    "key": "GET /api/preferences",
+    "count": 2,
+    "status": "200",
+    "ms": 152,
+    "resBytes": 45
+   },
+   {
+    "first": 669,
+    "key": "GET /api/pane/commands",
+    "count": 1,
+    "status": "200",
+    "ms": 36,
+    "resBytes": 4902
+   },
+   {
+    "first": 671,
+    "key": "GET /api/pane/conversation",
+    "count": 5,
+    "status": "200",
+    "ms": 10,
+    "resBytes": 3554
+   },
+   {
+    "first": 672,
+    "key": "GET /api/pane/omo-tasks",
+    "count": 4,
+    "status": "200",
+    "ms": 9,
+    "resBytes": 63
+   },
+   {
+    "first": 779,
+    "key": "GET /api/pane/prompt",
+    "count": 12,
+    "status": "200",
+    "ms": 1,
+    "resBytes": 29
+   },
+   {
+    "first": 1002,
+    "key": "GET /assets/ghostty-vt-Dg_iujpy.wasm",
+    "count": 1,
+    "status": "200",
+    "ms": 5,
+    "resBytes": null
+   },
+   {
+    "first": 4606,
+    "key": "POST /api/seen",
+    "count": 1,
+    "status": "204",
+    "ms": 6,
+    "resBytes": null
+   }
+  ],
+  "sockets": [
+   {
+    "first": 526,
+    "path": "/ws",
+    "open": 758,
+    "close": null,
+    "sentCount": 4,
+    "sentFirst": [
+     "758ms role {\"type\":\"role\",\"mode\":\"interact\"}",
+     "763ms presence {\"type\":\"presence\",\"active\":true}",
+     "807ms attach {\"type\":\"attach\",\"pane_id\":\"w1C:p1\",\"cols\":141,\"rows\":41,\"flow_control\":\"ack\",\"receipt_resume_id\":\"00be320a-48e6-4a39-8159-0afe791deee3\",\"ke",
+     "809ms conversation-watch {\"type\":\"conversation-watch\",\"pane_id\":\"w1C:p1\",\"enabled\":true}"
+    ],
+    "receivedCount": 8,
+    "receivedTypes": [
+     "role-ack:1",
+     "snapshot:1",
+     "pending-messages:1",
+     "input-ready:1",
+     "pane-geometry:1",
+     "pty-data:1",
+     "conversation-changed:1",
+     "pane-status:1"
+    ],
+    "receivedFirst": [
+     "759ms role-ack {\"type\":\"role-ack\",\"mode\":\"interact\"}",
+     "764ms snapshot {\"type\":\"snapshot\",\"snapshot\":{\"version\":\"0.9.0\",\"protocol\":22,\"focused_workspace_id\":\"w1C\",\"focused_tab_id\":\"w1C:t1\",\"focused_pane_id\":\"w1C",
+     "807ms pending-messages {\"type\":\"pending-messages\",\"pane_id\":\"w1C:p1\",\"messages\":[]}",
+     "808ms input-ready {\"type\":\"input-ready\",\"pane_id\":\"w1C:p1\"}",
+     "808ms pane-geometry {\"type\":\"pane-geometry\",\"pane_id\":\"w1C:p1\",\"cols\":80,\"rows\":24}",
+     "962ms pty-data {\"type\":\"pty-data\",\"pane_id\":\"w1C:p1\",\"data\":\"\\u001b[?2026h\\u001b[0m\\u001b[2J\\u001b[1;1H\\u001b[2K\\u001b[38;5;214m┌──────────────────────────",
+     "4484ms conversation-changed {\"type\":\"conversation-changed\",\"pane_id\":\"w1C:p1\",\"signature\":\"demo:1\"}",
+     "4488ms pane-status {\"type\":\"pane-status\",\"pane_id\":\"w1C:p1\",\"agent_status\":\"done\",\"finish_id\":1,\"finish_epoch\":\"3b43c7ee-2671-4800-bc43-66981974024a\"}"
+    ]
+   }
+  ],
+  "sse": [
+   {
+    "first": "{\"type\":\"machines\",\"machines\":[{\"id\":\"local\",\"name\":\"workstation\",\"kind\":\"local\",\"enabled\":true,\"state\":\"connected\",\"error\":null,\"snapshot\":",
+    "path": "/api/machines/events",
+    "open": null,
+    "error": null,
+    "messages": 3
+   }
+  ],
+  "other": [],
+  "totalRecords": 38
+ },
+ "B": {
+  "name": "B-fail-503",
+  "state": {
+   "title": "Ovis",
+   "body": "Ovis Connecting… Connecting to Ovis…",
+   "rootChildren": 1
+  },
+  "problems": [],
+  "rest": [
+   {
+    "first": 397,
+    "key": "GET /api/health",
+    "count": 6,
+    "status": "503",
+    "ms": 0,
+    "resBytes": null
+   },
+   {
+    "first": 398,
+    "key": "GET /api/machines",
+    "count": 3,
+    "status": "503",
+    "ms": 0,
+    "resBytes": null
+   },
+   {
+    "first": 400,
+    "key": "GET /api/telemetry",
+    "count": 1,
+    "status": "503",
+    "ms": 0,
+    "resBytes": null
+   }
+  ],
+  "sockets": [],
+  "sse": [],
+  "other": [
+   {
+    "t": 0,
+    "k": "sw-register",
+    "path": "/sw.js"
+   }
+  ],
+  "totalRecords": 11
+ }
+}

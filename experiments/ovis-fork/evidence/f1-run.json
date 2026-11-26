@@ -1,0 +1,63 @@
+{
+ "elapsedMs": 12010,
+ "state": {
+  "title": "π - source · Ovis",
+  "visibility": "visible",
+  "viewOnly": true,
+  "header": "Tab 1 pi · RUN Chat Terminal live"
+ },
+ "tabs": [
+  "Tab 1"
+ ],
+ "problems": [],
+ "netFail": [],
+ "source": {
+  "session": 18,
+  "pane": 28,
+  "errors": 0
+ },
+ "sidebar": {
+  "workspaceRows": 20,
+  "hasAgentsList": true
+ },
+ "terminalLens": {
+  "button": {
+   "x": 1309.5859375,
+   "y": 20.5
+  },
+  "header": "Tab 1 pi · RUN Chat Terminal live",
+  "rows": "<nội dung phiên thật — không commit>",
+  "stats": {
+   "rows": 78,
+   "nonEmpty": 0,
+   "chars": 0,
+   "spans": 0
+  }
+ },
+ "restByPath": {
+  "/api/pane/scroll": 12,
+  "/api/fs/favicon": 7,
+  "/api/health": 6,
+  "/api/machines": 3,
+  "/api/telemetry": 2,
+  "/api/preferences": 2,
+  "/api/herdr-ui": 1,
+  "/api/pane/commands": 1,
+  "/api/updates": 1,
+  "/api/machines/events": 1,
+  "/assets/ghostty-vt-Dg_iujpy.wasm": 1
+ },
+ "ws": [
+  {
+   "path": "/ws",
+   "sent": "sent:role,presence,attach",
+   "receivedTypes": {
+    "role-ack": 1,
+    "snapshot": 1,
+    "pane-geometry": 12,
+    "pty-data": 12
+   },
+   "openAtMs": "open@686"
+  }
+ ]
+}
